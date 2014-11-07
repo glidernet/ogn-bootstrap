@@ -62,7 +62,7 @@ Making your own image
     - curl http://ognconfig.onglide.com/files/v1.4/first-install -o /etc/init.d/first-install
     - /usr/bin/sudo /usr/sbin/update-rc.d first-install defaults
     - /usr/bin/sudo /usr/sbin/update-rc.d rtlsdr-flarm remove
-    - 
+
 ### Shrinking the image for distribution
  From here on down is optional if you want to shrink the image size:
  1. delete old logs files, ~/.history etc
