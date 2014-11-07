@@ -56,7 +56,7 @@ use File::stat;
 use Cwd;
 
 # to make sure the file was downloaded properly, this needs to be signed before it is valid
-# md5sum 
+# md5sum f3b0479f39b9b5913996bcd68b6e2823 NQkHZru34p03Op0r+bUjw1UqQtBwPG4g0uY+Izhmf2v1JxLI0UDqS9o6a9+oWQcYrRmWJISjd6+UFhtBkCcR6RiKdqOXp324Cu/hhMdInn8jx9RuhjfeuAajrdlLEE81RL4ti0bQBWfvNoqrf7/YeiprbyUkp4cYpQw4gj+3xZcduE32HjTo/pBUqjzXSCFOENW+7DgtJwRW2Fk/GL4lbDLpb6X5+WpMUc0SkA9NvrW20QvgcHLpJoJL5Om3/HfVWZLR/3wJqsuVeC3lhPEw0mdkUK2H9S/e17sNU0zVImZzDr1OcRhbgVpS5GewkYXcf0tfzAOZkOLbw/srlCo28Q==
 
 my $version='1.4d';
 
