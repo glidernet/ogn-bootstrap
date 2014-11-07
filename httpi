@@ -1,0 +1,454 @@
+#!/usr/bin/perl
+use POSIX qw(SIGALRM SIGTERM SIGPIPE SIGHUP sigaction);
+$VERSION = "1.7.1 (Demonic/Linux)";
+
+# HTTPi Hypertext Tiny Truncated Process Implementation
+# Copyright 1999-2012 Cameron Kaiser and Contributors # All rights reserved
+# Please read LICENSE # Do not strip this copyright message.
+
+###############################################################
+# WHITE HATS ONLY BELOW THIS POINT -- SEE DOCUMENTATION FIRST #
+###############################################################
+
+%system_content_types =
+	("html" => "text/html",
+	 "htm" => "text/html",
+	 "txt" => "text/plain",
+	 "xml" => "text/xml",
+	 "xsl" => "text/xml",
+	 "xhtml" => "application/xhtml+xml",
+	 "css" => "text/css",
+	 "wml" => "text/vnd.wap.wml",
+	 "gif" => "image/gif",
+	 "jpeg" => "image/jpeg",
+	 "jpg" => "image/jpeg",
+	 "bmp" => "image/bmp",
+	 "png" => "image/png",
+	 "tif" => "image/tiff",
+	 "tiff" => "image/tiff",
+	 "ico" => "image/x-icon",
+	 "svg" => "image/svg+xml",
+	 "svgz" => "image/svg+xml",
+	 "wbmp" => "image/vnd.wap.wbmp",
+	 "wbm" => "image/vnd.wap.wbmp",
+	 "xbm" => "image/x-xbitmap",
+	 "mp3" => "audio/x-mpeg",
+	 "wma" => "audio/x-ms-wma",
+	 "wav" => "audio/x-wav",
+	 "au" => "audio/basic",
+	 "aif" => "audio/x-aiff",
+	 "aiff" => "audio/x-aiff",
+	 "ogg" => "audio/x-ogg",
+	 "oga" => "audio/x-ogg",
+	 "mid" => "audio/midi",
+	 "wma" => "audio/x-ms-wma",
+	 "mpeg" => "video/mpeg",
+	 "mpg" => "video/mpeg",
+	 "aac" => "audio/aac",
+	 "ogv" => "video/x-ogg",
+	 "ogx" => "application/x-ogg",
+	 "avi" => "video/x-msvideo",
+	 "wmv" => "video/x-ms-wmv",
+	 "asf" => "video/x-ms-asf",
+	 "mov" => "video/quicktime",
+	 "mp4" => "video/mp4",
+	 "rv" => "video/vnd.m-realvideo",
+	 "rm" => "application/vnd.m-realmedia",
+	 "ra" => "audio/vnd.m-realaudio",
+	 "ram" => "audio/vnd.m-realaudio",
+	 "pdf" => "application/pdf",
+	 "fdf" => "application/vnd.fdf",
+	 "class" => "application/octet-stream",
+	 "jar" => "application/octet-stream",
+	 "js" => "application/x-javascript",
+	 "lnk" => "application/x-hyperlink",
+	 "prg" => "application/x-c64-prg-binary",
+	 "d64" => "application/x-c64-disk-image",
+	 "tar" => "application/x-tar",
+	 "sit" => "application/x-stuffit",
+	 "Z" => "application/x-compress",
+	 "gz"  => "application/x-gzip",
+	 "apk" => "application/vnd.android.package-archive",
+	 "dmg" => "application/octet-stream",
+	 "img" => "application/octet-stream",
+	 "lzh" => "application/octet-stream",
+	 "lha" => "application/octet-stream",
+	 "exe" => "application/octet-stream",
+	 "com" => "application/octet-stream",
+	 "zip" => "application/x-zip-compressed",
+	 "hqx" => "application/x-binhex",
+	 "swf" => "x-shockwave-flash",
+	 "flv" => "video/x-flv",
+
+	 "bin" => "application/octet-stream");
+
+$logfile = "/dev/null";
+$path = "/tmp/htdocs";
+$sockaddr = 'S n a4 x8';
+$server_host = "ogn-flarm-receiver";
+$server_port = "8080";
+
+
+%content_types =
+	("html" => "text/html",
+	 "htm" => "text/html");
+
+$headers = <<"EOF";
+Server: HTTPi/$VERSION
+MIME-Version: 1.0
+EOF
+
+
+%content_types = (%system_content_types, %content_types);
+undef %system_content_types;
+
+if ($pid = fork()) { exit; }
+$0 = "dhttpi: binding port ...";
+$bindthis = pack($sockaddr, 2, 8080, pack('C4', 0, 0, 0, 0));
+socket(S, 2, 1, 6);
+setsockopt(S, 1, 2, 1);
+bind(S, $bindthis) || die("$0: while binding port 8080:\n\"$!\"\n");
+listen(S, 128);
+$0 = "dhttpi: connected and waiting ANY:8080";
+
+$statiosuptime = time();
+
+sub sock_to_host {
+	return ($cache_hn, $cache_port, $cache_ip)
+		if (length($cache_ip));
+
+	return (undef, undef, undef) if (!$sock);
+	my($AFC, $cache_port, $thataddr, $zero) = unpack($sockaddr, $sock);
+	$cache_ip = join('.', unpack("C4", $thataddr));
+	$cache_hn =
+		$cache_ip;
+	return ($cache_hn, $cache_port, $cache_ip);
+}
+
+
+sub htsponse {
+	($currentcode, $currentstring) = (@_);
+	return if (0+$httpver < 1);
+	my($what) = <<"EOF";
+HTTP/$httpver $currentcode $currentstring
+${headers}Date: $rfcdate
+EOF
+	$what =~ s/\n/\r\n/g;
+	print STDOUT $what;
+	&hthead("Connection: close") if (0+$httpver > 1);
+}
+
+sub hthead {
+	my($header, $term) = (@_);
+	return if (0+$httpver < 1);
+	print STDOUT "$header\r\n" , ($term) ? "\r\n" : "";
+}
+
+sub htcontent {
+	my($what, $ctype, $mode) = (@_);
+	($contentlength) = $mode || length($what);
+	&hthead("Content-Length: $contentlength");
+	&hthead("Content-Type: $ctype", 1);
+	return if ($method eq 'HEAD' || $mode);
+	print STDOUT $what;
+}
+
+sub log {
+ 	if (open(J, ">>$logfile")) {
+		my $q = $address . (($variables) ? "?$variables" : "");
+		$contentlength += 0;
+		$contentlength = 0 if ($method eq 'HEAD');
+		my ($hostname, $port, $ip) = &sock_to_host();
+		$hostname ||= "-";
+		$httpuser ||= "-";
+		print J <<"EOF";
+$hostname - $httpuser [$date] "$method $q HTTP/$httpver" $currentcode $contentlength "" ""
+EOF
+		close(J);
+	}
+}
+
+
+sub bye { exit; }
+sub byebye { kill(9,$secondary_pid) if ($secondary_pid); exit; }
+
+sub dead {
+	&htsponse(500, "Server Error");
+	&hterror("Server Error", <<"EOF");
+The server cannot comply with your request for resource <tt>$::address</tt>.
+Please attempt to notify the administrators.
+<p>Useful(?) debugging information:
+<pre>
+@_
+</pre>
+EOF
+	&log; exit;
+}
+
+sub generic_signal {
+	# this is just a stub, and effectively IGNORE in this version.
+}
+
+sub defaultsignals {
+	$SIG{'__DIE__'} = \&dead;
+	sigaction SIGALRM, new POSIX::SigAction \&bye
+		or die "sigalrm failed: $!\n";
+	sigaction SIGTERM, new POSIX::SigAction \&byebye
+		or die "sigterm failed: $!\n";
+	sigaction SIGPIPE, new POSIX::SigAction \&generic_signal
+		or die "sigterm failed: $!\n";
+	sigaction SIGHUP, new POSIX::SigAction \&generic_signal
+		or die "sigterm failed: $!\n";
+}
+&defaultsignals;
+
+sub alarmsignals {
+	undef $SIG{'__DIE__'};
+	sigaction SIGALRM, new POSIX::SigAction sub { die; }
+		or die "sigalrm failed: $!\n";
+}
+
+sub master {
+	$0 = "dhttpi: handling request";
+$sock = getpeername(STDIN);
+$rfcdate = &rfctime(scalar gmtime, 1);
+$date = scalar localtime;
+($dow, $mon, $dt, $tm, $yr) = ($date =~
+	m/(...) (...) (..) (..:..:..) (....)/);
+$dt += 0;
+$dt = substr("0$dt", length("0$dt") - 2, 2);
+$date = "$dt/$mon/$yr:$tm +0000";
+
+select(STDOUT); $|=1; $address = 0; 
+alarm 5;
+while (<STDIN>) {
+	if(/^([A-Z]+)\s+([^\s]+)\s+([^\s\r\l\n]*)/) {
+		$method = $1;
+		$address = $2;
+		$httpver = $3;
+		$httpref = '';
+		$httpua = '';
+		$httpver = ($httpver =~ m#HTTP/([0-9]\.[0-9]+)#) ?
+			($1) : (0.9);
+		$address =~ s#^http://[^/]+/#/#;
+		$0 = $execstring = "dhttpi: $method $address $httpver";
+		next unless ($httpver < 1);
+	} else {
+		s/[\r\l\n\s]+$//;
+		(/^Host:\s+(.+)/i) && ($httphost = substr($1, 0, 255))
+			&& ($httphost =~ s/:\d+$//);
+		(/^Referer:\s+(.+)/i) && ($httpref = substr($1, 0, 1024));
+		(/^User-agent:\s+(.+)/i) && ($httpua = substr($1, 0, 1024));
+		(/^Content-length:\s+(\d+)/i) &&
+			($ENV{'CONTENT_LENGTH'} = $httpcl = 0+$1);
+		(/^Content-type:\s+(.+)/i) &&
+			($ENV{'CONTENT_TYPE'} = $httpct = substr($1, 0, 255));
+		(/^Expect:\s+/) && ($expect = 1);
+		(/^Cookie:\s+(.+)/i) &&
+			($ENV{'HTTP_COOKIE'} = substr($1, 0, 16384));
+		(/^Range:\s+(.+)/i) &&
+			($ENV{'CONTENT_RANGE'} = substr($1, 0, 255));
+		(/^If-Modified-Since:\s+(.+)/i) &&
+			($modsince = $ENV{'HTTP_IF_MODIFIED_SINCE'} =
+				substr($1, 0, 255));
+		(/^Accept:\s+(.+)/i) &&
+			($ENV{'HTTP_ACCEPT'} = substr($1, 0, 255));
+		(/^Accept-([a-zA-Z0-9]+):\s+(.+)/i) &&
+			($ENV{'HTTP_ACCEPT_'.uc(substr($1, 0, 16))} =
+				substr($2, 0, 255));
+		(/^X-Requested-With:\s+(.+)/i) &&
+			($ENV{'HTTP_X_REQUESTED_WITH'} = substr($1, 0, 1024));
+		next unless (/^$/);
+	}
+	if ($expect) {
+		&htsponse(417, "Expectation Failed");
+		&hterror("Expectation Failed",
+			"The server does not support this method.");
+		&log; exit;
+	}
+	if (!length($address) || (0+$httpver > 1 && !$httphost)) {
+		&htsponse(400, "Bad Request");
+		&hterror("Bad Request",
+			"The server cannot understand your request.");
+		&log; exit;
+	}
+	if ($method !~ /^(GET|HEAD|POST)$/) {
+		&htsponse(501, "Not Implemented");
+		&hterror("Not Implemented",
+			"Only GET, HEAD and POST are supported.");
+		&log; exit;
+	}
+	($address, $variables) = split(/\?/, $address);
+	$address =~ s/%([0-9a-fA-F]{2})/pack("H2", $1)/eg;
+	$address=~ s#^/?#/#;
+	1 while $address =~ s#/\.(/|$)#\1#;
+        1 while $address =~ s#/[^/]*/\.\.(/|$)#\1#;
+	1 while $address =~ s#^/\.\.(/|$)#\1#;
+
+	alarm 0;
+
+
+
+
+	$raddress = "$path$address"
+	;
+	1 while ($raddress =~ s#//#/#);
+	&hterror301("http://ogn-flarm-receiver:8080$address/")
+		if ($address !~ m#/$# && -d $raddress);
+	$raddress = (-r "${raddress}index.shtml") ?
+		"${raddress}index.shtml" : "${raddress}index.html"
+			if (-d $raddress);
+	$ENV{'REQUEST_URI'} = $address . (($variables) ? "?$variables" : "");
+	delete($ENV{'PATH_INFO'});
+	IRED: ($hostname, $port, $ip) = &sock_to_host();
+	if(!sysopen(S, $raddress, 0)) { &hterror404; } else {
+		if ((-x $raddress)
+			) {
+			$currentcode = 100; &nsecmodel;
+			$ENV{'REQUEST_METHOD'} = $method;
+			$ENV{'SERVER_NAME'} = "ogn-flarm-receiver";
+			$ENV{'SERVER_PROTOCOL'} = "HTTP/$httpver";
+			$ENV{'SERVER_SOFTWARE'} = "HTTPi/$VERSION";
+			$ENV{'SERVER_PORT'} = "8080";
+			$ENV{'SERVER_URL'} = "http://ogn-flarm-receiver:8080/";
+			$ENV{'DOCUMENT_ROOT'} = $path;
+			$ENV{'PATH_TRANSLATED'} =
+				$ENV{'DOCUMENT_ROOT'} . $ENV{'PATH_INFO'}
+				if (length($ENV{'PATH_INFO'}));
+			$ENV{'SCRIPT_FILENAME'} = $raddress;
+			$ENV{'SCRIPT_NAME'} = $address;
+			$ENV{'REMOTE_HOST'} = $hostname;
+			$ENV{'REMOTE_ADDR'} = $ip;
+			$ENV{'REMOTE_PORT'} = $port;
+			$ENV{'QUERY_STRING'} = $variables;
+			$ENV{'HTTP_USER_AGENT'} = $httpua;
+			$ENV{'HTTP_REFERER'} = $httpref;
+			undef $pid;
+			if ($pid = fork()) { kill 15, $$; exit; }
+			elsif (!defined($pid)) {
+				die
+			"temporary(?) fork error, please retry request: $!\n";
+			} else {
+				$ENV{'PATH'} = '';
+				($raddress =~ /^(.+)$/) && ($raddress = $1);
+				if ($method eq 'POST') {
+					open(W, "|$raddress") || die
+						"can't POST to $raddress";
+					read(STDIN, $buf, $httpcl);
+					print W $buf;
+					exit;
+				}
+				exec "$raddress", "$variables";
+				die "exec() returned -1";
+			}
+		}
+		($x,$x,$x,$x,$x,$x,$x,$length,$x,$mtime) = stat(S);
+		$ctype = 0;
+		foreach(keys %content_types) {
+			if ($raddress =~ /\.$_$/i) {
+				$ctype = $content_types{$_};
+			}
+		}
+		$mtime = &rfctime($mtime);
+SERVEIT:
+		if ($mtime eq $modsince) {
+			&htsponse(304, "Not Modified");
+			&hthead("Last-Modified: $mtime", 1);
+			&log; exit;
+		}
+		$ctype ||= 'text/plain';
+		if ($pid = fork()) { kill 15, $$; exit; }
+		$contentlength ||= $length;
+			&htsponse(200, "OK");
+			&hthead("Last-Modified: $mtime");
+			&htcontent("", $ctype, $length);
+			&nsecmodel;
+			$bytecount = 0;
+			unless ($method eq 'HEAD') {
+				while(!eof(S)) {
+					read(S, $q, 32768);
+					print STDOUT $q;
+					$bytecount += 32768;
+					$0 = $execstring .
+						" ($bytecount bytes sent)";
+				}
+			}
+		alarm 0;
+	}
+	exit;
+}
+
+exit;
+}
+
+
+sub nsecmodel {
+	&log;
+	($x,$x,$x,$x,$uid,$gid) = stat(S);
+	(!$uid || !$gid || $uid < 1000) &&
+		die "resource is root-owned, secured or not stat-able\n";
+	if (!$<) {
+		($) = "$gid $gid") || die "can't set egid to $gid";
+		($> = $uid) || die "can't set euid to $uid";
+		($( = "$gid $gid") || die "can't set rgid to $gid";
+		($< = $uid) || die "can't set ruid to $uid";
+	}
+}
+
+sub rfctime {
+	my $mtime = shift;
+	$mtime = (scalar gmtime $mtime) if (!(shift));
+	my ($dow, $mon, $dt, $tm, $yr) =
+		($mtime =~ m/(...) (...) (..) (..:..:..) (....)/);
+	$dt += 0; $yr += 0;
+	return "$dow, $dt $mon $yr $tm GMT";
+}
+
+sub hterror {
+	my($errstr, @expl) = (@_);
+	&htcontent(<<"EOF", "text/html");
+<html>
+<body>
+<h1>$errstr</h1>
+@expl
+<hr>
+<address><a href = "http://httpi.floodgap.com/">httpi/$VERSION</a>
+by Cameron Kaiser</address>
+</body>
+</html>
+EOF
+	}
+
+sub hterror404 {
+	&htsponse(404, "Not Found");
+	&hterror("Not Found",
+		"The resource <tt>$address</tt> was not found on this system.");
+	&log; exit;
+}
+
+sub hterror301 {
+	&htsponse(301, "Moved Permanently");
+	&hthead("Location: @_");
+	&hterror("Resource Moved Permanently",
+		"This resource has moved <a href = \"@_\">here</a>.");
+	&log; exit;
+}
+
+
+$0 = "dhttpi: on ANY:8080, ready!";
+$master_pid = $$;
+for (;;) {
+	if ($secondary_pid = fork()) {
+		waitpid($secondary_pid, 0);
+		$0 = "dhttpi: on ANY:8080, last request " .
+			scalar localtime;
+	} else {
+		$0 = "dhttpi (child of $master_pid): waiting for connect";
+		$addr=accept(NS,S);
+		open(STDIN, "<&NS");
+		open(STDOUT, ">&NS");
+		&defaultsignals;
+		&master;
+		exit;
+	}
+}

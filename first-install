@@ -1,0 +1,73 @@
+#!/bin/bash
+
+# chkconfig: 2345 98 2
+# description: shellbox service for spawning programs
+
+export PATH=$PATH:/usr/local/bin
+
+export HOSTNAME=$(hostname -s)
+
+
+fail () {
+  echo $@
+  exit 1
+}
+
+echo_failure () {
+  echo " [failed]"
+}
+
+launch () {
+  if [ "$1" = "-reload" ]
+  then
+    reload=YES
+    shift
+  fi
+
+  /usr/local/bin/httpi 2>/dev/null
+
+  configurelocation="http://ognconfig.onglide.com/files/v1.4/configure"
+
+# remove any previous data from the webpage in case things break
+   mkdir /tmp/htdocs 2>/dev/null
+   touch /tmp/htdocs/index.html 2>/dev/null
+
+   chown -R flarm:flarm /tmp/htdocs
+   count=0
+
+  /usr/bin/curl -R -z /home/flarm/configure  ${configurelocation} -o /home/flarm/configure  2>/dev/null
+  while [ $? -ne 0 -a $count -le 3 ];    
+  do
+	count=$((count +1))
+        date >> /tmp/htdocs/index.html
+        echo " - unable to reach ognconfig.onglide.com<br/>" >> /tmp/htdocs/index.html
+	echo " - unable to reach ognconfig.onglide.com (retry # $count of 3)"
+        sleep 10
+        /usr/bin/curl -R -z /home/flarm/configure ${configurelocation} -o /home/flarm/configure  2>/dev/null
+  done
+
+  chmod +x /home/flarm/configure
+  chown flarm /home/flarm/configure
+
+# make sure we don't litter root directory with junk
+  cd /home/flarm/rtlsdr-flarm
+  
+# run the configuration script
+  /usr/bin/perl /home/flarm/configure
+
+}
+
+start () {
+  launch $*
+}
+
+
+
+CMD=$1
+shift
+case "$CMD" in
+  (start)         start $*;;
+  (stop)          echo $*;;
+  (*)             echo "Usage: $0 {start}";;
+esac
+

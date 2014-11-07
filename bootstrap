@@ -1,0 +1,240 @@
+#!/bin/bash
+#
+# This script is for use with the Open Glider Network FLARM Detection System only
+# Any other uses are NOT authorised
+# 
+# Copyright (c) 2014, Melissa Jenkins, Temeletry Limited (melissa-ogn@temeletry.co.uk)
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+#
+# - Redistributions of source code must retain the above copyright
+#   notice, this list of conditions and the following disclaimer.
+#
+# - Redistributions in binary form must reproduce the above copyright
+#   notice, this list of conditions and the following disclaimer in
+#   the documentation and/or other materials provided with the
+#   distribution.
+#
+# - This code must only be used as part of OGN (Open Glider Network)
+#
+# - Neither the name of Temeletry Limited nor the names of its
+#   contributors may be used to endorse or promote products derived
+#   from this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+# FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+# COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+# INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+# (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+# HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
+# STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED
+# OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+# Code has been sponsored by Temeletry Limited (http://www.temeletry.co.uk)
+#
+
+#
+# This is a bootstrap script.  It is designed to install the OGN
+# software on any operating system installation.  It has been tested
+# on BPI and RPI and is believe to work on generic Linux installations
+#
+
+progress() {
+    echo ""
+    echo -e "\033[32m * $1\033[0m"
+}
+
+error() {
+    echo "#####################################################"
+    echo -e "\033[31m\033[1m ! $2 \033[0m"
+}
+echo "starting..."
+
+sudo="sudo"
+which sudo || {
+    if [ `whoami` == 'root' ] ; then
+	sudo () {
+	    $@
+	}
+	sudo=""
+	progress "Not using sudo - running as root"
+    else
+	error "Please install sudo or run this script as root"
+	exit 1
+    fi
+}
+
+	
+
+if [ "$1" == "" ] ; then
+    progress "Adding flarm user and installing as that"
+
+    if [ ! -e /home/flarm ]; then
+
+	sudo useradd -m -G `groups|tr ' ' ,` flarm || {
+	    progress "unable to add flarm user?!"
+	    exit
+	}
+
+	echo "flarm:flarm" | chpasswd
+
+    else
+
+	progress "using existing flarm user"
+
+    fi
+
+    progress "Updating package information"
+#    sudo apt-get update
+
+    progress "Installing menu helper"
+    sudo apt-get -y install dialog 
+    dialog --yesno "Do you wish to use online configuration" 0 0
+    online=$?
+
+    dialog --yesno "Do you wish to upgrade the operating system (highly recommended, but not available on all platforms)" 0 0
+    upgrade=$?
+
+    progress "relaunching script"
+    abs_path="$(readlink -f `dirname $0`)/$(basename $0)"
+    exec $sudo su -c "/bin/bash $abs_path $online $upgrade $@" root
+    exit 0
+fi
+
+upgrade=$2
+
+progress "Updating install packages"
+apt-get -y upgrade
+
+if [ "$upgrade" != "1" ] ; then
+
+    if [ -e /usr/bin/rpi-update ] ; then
+	progress "Updating Operating System (rpi-update)"
+	rpi-update
+	
+	progress "Blocking unwanted SDR stuff"
+	
+	touch /etc/modprobe.d/rtl-glidernet-blacklist.conf
+	echo "blacklist rtl2832" >> /etc/modprobe.d/rtl-glidernet-blacklist.conf
+	echo "blacklist r820t"  >> /etc/modprobe.d/rtl-glidernet-blacklist.conf
+	echo "blacklist rtl2830"  >> /etc/modprobe.d/rtl-glidernet-blacklist.conf
+	echo "blacklist dvb_usb_rtl28xxu"  >> /etc/modprobe.d/rtl-glidernet-blacklist.conf
+	
+	updated=1
+    fi
+    
+    if [ `which do-release-upgrade` != "" ] ; then
+	
+	progress "Updating Operating System (do-release-upgrade)"
+	do-release-upgrade
+	
+	updated=1
+    fi
+fi
+
+
+## capture if we are doing online config or not
+online=$1
+
+## dependencies
+progress "Installing dependencies"
+apt-get -y install git cmake libusb-1.0-0-dev libconfig-dev fftw3-dev libjpeg-dev libconfig9 procserv telnet ntp curl dialog openssl sudo make gcc
+
+progress "Installing rtlsdr"
+cd /home/flarm
+git clone git://git.osmocom.org/rtl-sdr.git
+cd rtl-sdr/
+mkdir build
+cd build
+
+if [ -e /dev/udev ]; then
+    cmake ../ -DCMAKE_INSTALL_PREFIX=/usr -DINSTALL_UDEV_RULES=ON
+else
+    cmake ../ -DCMAKE_INSTALL_PREFIX=/usr
+fi
+
+make
+ make install
+ ldconfig
+cd ../..
+
+# make sure the mod probe stuff is blocked properly on the pi
+if [ -e /usr/bin/rpi-update ] ; then
+    progress "Blocking unwanted SDR stuff"
+    
+    touch /etc/modprobe.d/rtl-glidernet-blacklist.conf
+    echo "blacklist rtl2832" >> /etc/modprobe.d/rtl-glidernet-blacklist.conf
+    echo "blacklist r820t"  >> /etc/modprobe.d/rtl-glidernet-blacklist.conf
+    echo "blacklist rtl2830"  >> /etc/modprobe.d/rtl-glidernet-blacklist.conf
+    echo "blacklist dvb_usb_rtl28xxu"  >> /etc/modprobe.d/rtl-glidernet-blacklist.conf
+fi
+
+progress "Adding system startup scripts"
+ curl 'http://ognconfig.onglide.com/files/v1.4/rtlsdr-flarm' -R -# -o /etc/init.d/rtlsdr-flarm
+ curl 'http://ognconfig.onglide.com/files/v1.4/rtlsdr-flarm.conf' -R -# -o /etc/rtlsdr-flarm.conf
+ chmod +x /etc/init.d/rtlsdr-flarm
+
+progress "Installing updater and using it to install RTLSDR"
+ curl 'http://ognconfig.onglide.com/files/v1.4/update' -R -# -o /home/flarm/update
+ chmod +x /home/flarm/update
+ # if we don't have a configuration file then make a dummy one, we also need to make the rtlsdr-flarm
+ # symlink or it will get confused
+ if [ ! -e /home/flarm/rtlsdr-flarm ] ; then
+     mkdir /home/flarm/rtlsdr-flarm-bootstrap
+     ln -s /home/flarm/rtlsdr-flarm-bootstrap /home/flarm/rtlsdr-flarm
+ fi;
+ if [ ! -e /home/flarm/rtlsdr-flarm.conf ] ; then 
+     echo "APRS:\n{ Call = \"Bootstrap\";\n" > /home/flarm/rtlsdr-flarm.conf
+ fi;
+# this is until we actually have a file that we can install... we copy the correct one later on
+ /home/flarm/update -i
+
+# and remove it if we made it - not necessary
+if [ -e /home/flarm/rtlsdr-flarm-bootstrap ] ; then
+    rm -rf /home/flarm/rtlsdr-flarm-bootstrap
+fi;
+
+progress "Adding startup scripts - this will produce warnings about LSB tabs"
+
+ curl 'http://ognconfig.onglide.com/files/v1.4/rtlsdr-flarm' -R -# -o /etc/init.d/rtlsdr-flarm
+ curl 'http://ognconfig.onglide.com/files/v1.4/rtlsdr-flarm.conf' -R -# -o /etc/rtlsdr-flarm.conf
+ chmod +x /etc/init.d/rtlsdr-flarm
+ cp rtlsdr-flarm/Example.conf /home/flarm/rtlsdr-flarm.conf
+ chown flarm /home/flarm/rtlsdr-flarm.conf
+
+if [ "$online" != "1" ] ; then
+     curl 'http://ognconfig.onglide.com/files/v1.4/httpi' -R -# -o /usr/local/bin/httpi
+     curl 'http://ognconfig.onglide.com/files/v1.4/first-install' -R -# -o /etc/init.d/first-install
+     chmod +x /etc/init.d/first-install /usr/local/bin/httpi
+     update-rc.d first-install defaults
+     update-rc.d rtlsdr-flarm remove
+     touch /etc/ssh/ssh_host_keyswrong    
+
+    progress "Done.  Please reboot your device.  You will be able to configure it at http://ognconfig.onglide.com when it reboots"
+    progress "Also, you may wish to update your operating system"
+
+    if [ "$updated" != "1" ] ; then
+	error "You may need to upgrade your operating system as well"
+    fi
+
+    exit
+fi
+
+update-rc.d rtlsdr-flarm defaults
+update-rc.d first-install remove
+
+progress "You device is ready for configuration.  Please edit the configuration file: /home/flarm/rtlsdr-flarm.conf"
+progress "And then reboot"
+
+if [ $updated != "1" ] ; then
+    error "You may need to upgrade your operating system as well"
+fi
+
+

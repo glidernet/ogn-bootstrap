@@ -1,0 +1,471 @@
+#!/usr/bin/perl 
+#
+# This script is for use with the Open Glider Network FLARM Detection System only
+# Any other uses are NOT authorised
+# 
+# Copyright (c) 2014, Melissa Jenkins, Temeletry Limited (melissa-ogn@temeletry.co.uk)
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+#
+# - Redistributions of source code must retain the above copyright
+#   notice, this list of conditions and the following disclaimer.
+#
+# - Redistributions in binary form must reproduce the above copyright
+#   notice, this list of conditions and the following disclaimer in
+#   the documentation and/or other materials provided with the
+#   distribution.
+#
+# - This code must only be used as part of OGN (Open Glider Network)
+#
+# - Neither the name of Temeletry Limited nor the names of its
+#   contributors may be used to endorse or promote products derived
+#   from this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+# FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+# COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+# INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+# (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+# HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
+# STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED
+# OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+# Code has been sponsored by Temeletry Limited (http://www.temeletry.co.uk)
+#
+
+#
+# This script will check the OGN download servers for updates 
+# to the software and automatically update the device with the newest
+# version.
+#
+# This script will install itself (if not already installed) as a 
+# crontab at a random time. If you wish the device to reboot after
+# checking add a -r to the command line.
+#
+
+use strict;
+use File::Copy;
+use File::stat;
+use Cwd;
+
+# to make sure the file was downloaded properly, this needs to be signed before it is valid
+# md5sum 
+
+my $version='1.4d';
+
+my $old_handle = select (STDOUT);
+$| = 1; # perform flush after each write to STDOUT
+select ($old_handle);
+
+my $scriptname = $0;
+if( ! ($scriptname =~ m|^/| )) {
+    $scriptname = cwd() . "/".$0;
+    $scriptname =~ s|/./|/|;
+}
+
+# do they want help?
+if( $ARGV[0] =~ '[-]+h' ) {
+    print "$scriptname - OGN Updater v$version\n\n".
+	"    -r      reboot after running.  If installing this will tell the crontab to issue a reboot \n".
+	"            after it has checked for updates.  Service will not be restarted till after it boots.\n".
+	"    -i      Do not start the service when done.\n".
+	"    -t      Test, print what path, user and configuration file is being worked on.\n";
+    exit 1;
+}
+
+if( $> != 0 ) {
+    die "You need to run this as root, or use sudo";
+}
+
+# old style tokens
+if( -e '/home/pi/sitetoken.txt' ) {
+    move( '/home/pi/sitetoken.txt', '/etc/sitetoken.txt' );
+}
+
+# keep the same site id for the whole thing
+my $token; my $aprscall = '*early';
+if( ! -e "/etc/sitetoken.txt" ) {
+    my $code = qx( /bin/dd if=/dev/urandom bs=1 count=8 status=noxfer 2>/dev/null );
+    ($token) = join('-',unpack('H4 H4 H4', $code ));
+    qx( echo $token > /etc/sitetoken.txt );
+}
+else {
+    $token = qx( cat /etc/sitetoken.txt );
+    chomp $token;
+}
+
+## exit when a script update is found
+print "Checking for updates to update script ($scriptname)... ";
+die "Unable to identify script name ($scriptname)" if( ! -e $scriptname );
+{
+    my $lasttime = stat($scriptname)->mtime;
+    my $currenttime;
+    my $tempname = '/tmp/update.'.date(time());
+    system( "/usr/bin/curl -s -R -z $scriptname http://ognconfig.onglide.com/files/v1.4/update -# -o $tempname" );
+
+    if( -e $tempname ) {
+	$currenttime = stat($tempname)->mtime;
+    }
+
+    if( defined( $currenttime ) && $lasttime != $currenttime ) {
+
+	my ($md5sum_calculated,$md5sum_expected,$signature);
+	if( qx( /bin/grep -v '^# md5sum' $tempname | /usr/bin/md5sum ) =~ /^([0-9a-f]+) / ) {
+	    $md5sum_calculated = $1;
+	}
+
+	if( qx( /bin/grep -e '^# md5sum' $tempname ) =~ /md5sum ([0-9a-f]+) (.*)/ ) {
+	    $md5sum_expected = $1;
+	    $signature = $2;
+	}
+	
+	# if they are defined and the same
+	if( defined( $md5sum_expected ) && $md5sum_expected eq $md5sum_calculated ) {
+
+	    # we need to check to make sure we have our public key saved away, without this 
+	    # we can't validate the identify
+	    {
+		open( OUT, '>', '/etc/flarmupdatekey.pem' ) || die "unable to write public key";
+		print OUT "-----BEGIN PUBLIC KEY-----\n".
+		    "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArG/od7cdIuhSvKXNbO80\n".
+		    "tFncaCfwuKUrBGxGE6uxzXRfwcCIn8UukGTnzdMEErh441K+itC69KhgkEhY809K\n".
+		    "sxKMJqZ2FL6lXdin7eIMpOKLIXKmwwRYyTYdChXbnrd3Y5e9BXOWEUJVsg2PYrDt\n".
+		    "xQnm20PiUgQXVCoW0xuxCnltj69nWGdXWPwhvFYT2ulhIXfVivJmUvHESK2GbYTo\n".
+		    "h2Fv7aIQACv4EK7UpPb9zPqBrV4MmwqAKP2LzycIdmlH9D1ebB9T2hK31MIegKuV\n".
+		    "VWQFQyqzxnFou3n1WYN3RBe5VdPuabQGXe4VQGmJVR1/1GQ+rPLRaQYU2zDYdLi1\n".
+		    "EQIDAQAB\n".
+		    "-----END PUBLIC KEY-----\n";
+		close( OUT );
+	    }
+
+	    # execute openssl to 
+	    my $md5sum_signed = qx( echo "$signature" | /usr/bin/base64 -d | /usr/bin/openssl rsautl -verify -inkey /etc/flarmupdatekey.pem -keyform PEM -pubin );
+	    chomp( $md5sum_signed );
+
+	    if( defined( $md5sum_signed ) && $md5sum_signed eq $md5sum_calculated ) {
+		copy( $tempname, $scriptname );
+		unlink( $tempname );
+		qx( /bin/chmod +x $scriptname );
+		status( "scriptupdate" );
+		print "an update has been found, restarting script.\n";
+		exec $scriptname, @ARGV ;
+	    }
+	    else {
+		print "invalid signature, not signed by correct key? ($md5sum_signed != $md5sum_calculated), not updating script.\n";
+		status( "sig_problem,".($md5sum_signed||'?').','.($md5sum_expected||'?') );
+	    }
+	}
+	else {
+	    print "invalid checksum ($md5sum_expected != $md5sum_calculated), not updating script.\n";
+	    status( "checksum_problem,".($md5sum_calculated||'?').','.($md5sum_expected||'?') );
+	}
+    }
+    else {
+	print "up to date.\n";
+    }
+}
+
+## Make sure we have the correct procServer configuration file before we do anything as it 
+# won't work without it!
+if( ! -e '/etc/rtlsdr-flarm.conf' ) {
+    status( 'noconfig' );
+    die "Unable to find /etc/rtlsdr-flarm.conf\n";
+}
+
+if( $ARGV[0] eq '-t' ) {
+    status( "testing" );
+}
+
+
+print "Checking automatic updater is installed...";
+my $check = qx( /usr/bin/crontab -u root -l );
+if( $check =~ /update/ ) {
+    print "yes.\n";
+}
+elsif( $ARGV[0] eq '-t' ) {
+    print "no. testing only\n";
+}
+else {
+    # if we are installing and have been asked to do a reboot after running
+    # then we will add the -r flag to the crontab
+    my $reboot = '';
+    if( $ARGV[0] eq '-r' ) {
+	$reboot = '-r';
+    }
+    my $when = sprintf( "%d %d", int(rand(59)), (int(rand(7))+23)%24 );
+    open( OUT, "| /usr/bin/crontab -u root -" ) || die "unable to write to crontab to install";
+    print OUT $check;
+    print OUT "$when * * * $scriptname $reboot\n";
+    close( OUT );
+    $when =~ s/ /:/;
+    status( "crontab/$when" );
+    print "installed.\n";
+}
+
+# what we read from the configuration file
+my %config;
+my @config_order;
+my %config_description;
+
+# next check for daemon startup script and extra details from that
+my $installdirectory;
+my $username;
+my $configfile;# if you need to copy it from /tmp/rtlsdr-flarm.site.conf after the upgrade
+
+my $os; my $processor;
+
+{
+    open( my $fh, '<', "/etc/rtlsdr-flarm.conf" ) || die "Unable to read /etc/rtlsdr-flarm.conf";
+    while( <$fh> ) {
+        my $line = $_;
+        chomp $line;
+        if( $line =~ m|^50000\s+([a-z0-9_-]+)\s+([a-z0-9/._-]+)\s+([a-z0-9/._-]+)\s+([a-z0-9/._-]+)|i ) {
+            $installdirectory = $2;
+            $username = $1;
+            $configfile = $4;
+        }
+    }
+
+    # sanity check
+    if( ! ($installdirectory =~ m|/rtlsdr-flarm$|) ) {
+	status('failed/idir');
+	die "Please change your /etc/rtlsdr-flarm.conf to point to the rtlsdr-flarm directory rather than a version specific directory.";
+    }
+
+    # remove the rtlsdr as this is included in the original distributions
+    my $installeddirectory = $installdirectory;
+    $installdirectory =~ s/rtlsdr-flarm$//;
+    $installdirectory =~ s|/$||;
+
+    # exactly where is the config file, find it the same way the flarm process would - change into the directory
+    # and then convert to an absolute path
+    chdir $installeddirectory;
+    my $expandedconfigfile = Cwd::abs_path( $configfile );
+    copy( $expandedconfigfile, "/tmp/rtlsdr-flarm.site.conf" );
+    chdir $installdirectory;
+
+    read_config();
+    $aprscall = $config{APRS_Call}||'unknown';
+    $aprscall =~ s/"//g;
+
+    # make sure the device has been configured, if not then don't do anything
+    if( $aprscall eq 'Example' || $aprscall eq 'unknown' ) {
+	status( "failed/unconfigured" );
+	die "This device has not yet been configured.\nPlease edit $expandedconfigfile\n".
+	    "If you are using an image from http://ognconfig.onglide.com or the bootstrap you should complete configuration before running this.\n".
+	    "If the update script has been installed then it will automatically retry the update every night.\n";
+    }
+
+    # next step is to check which install it is
+    $processor = qx( /bin/uname -p );
+    $os = qx( /bin/uname -a );
+    my $download;
+    my $filename;
+    my $dist;
+
+    if( -e '/etc/init.d/flarm-update' ) {
+	print "Disabling old updater...";
+	if( $ARGV[0] ne '-t' ) {
+	    status("old_disabled");
+	    qx( /usr/sbin/update-rc.d flarm-update remove 2>/dev/null);
+	    unlink "/etc/init.d/flarm-update";
+	    print "done.\n";
+	}
+	else {
+	    print "skipped... testing\n";
+	}
+    }
+
+    if( $os =~ /raspberry/i || $os =~ /ogn-flarm-receiver/ || ( $os =~ /arm/ && -e "$installdirectory/rtlsdr-flarm/gpu_dev") ) {
+        $download = "http://download.glidernet.org/rpi-gpu/rtlsdr-flarm-bin-RPI-GPU-latest.tgz";
+        $filename = "rtlsdr-flarm-bin-RPI-GPU-latest.tgz";
+	$dist = 'RPI-GPU';
+	$os = 'raspberry';
+    }
+#    elsif( $os =~ /bananapi/i || $processor =~ /arm/ || ($processor eq 'unknown' && $os =~ /arm/) ) {
+    elsif( $processor =~ /arm/ || ($processor eq 'unknown' && $os =~ /arm/) || $os =~ /armv7/ ) {
+        $download = "http://download.glidernet.org/arm/rtlsdr-flarm-bin-ARM-latest.tgz";
+        $filename = "rtlsdr-flarm-bin-ARM-latest.tgz";
+	$dist = 'ARM';
+    }
+    elsif( $processor =~ /32/ || $processor =~ /i[0-9]86/ ) {
+        $download = "http://download.glidernet.org/x86/rtlsdr-flarm-bin-x86-latest.tgz";
+        $filename = "rtlsdr-flarm-bin-x86-latest.tgz";
+	$dist = 'x86';
+    }
+    elsif( $processor =~ /64/ ) {
+        $download = "http://download.glidernet.org/x64/rtlsdr-flarm-bin-x64-latest.tgz";
+        $filename = "rtlsdr-flarm-bin-x64-latest.tgz";
+	$dist = 'x64';
+    }
+    else {
+	my $sstring = "unidentified,$os,$processor,".qx( uname -a ).",".qx( uname -m );
+	$sstring =~ s/[^A-Za-z0-9_.]/_/g;
+	status( $sstring );
+	die "Unable to identify installation type :(\n".
+	    "os: $os\n".
+	    "processor: $processor\n".
+	    "uname -m: ". qx( uname -m ). "\n".
+	    "Please email melissa-ognconfig\@littlebluecar with the above output for help!\n";
+    }
+
+    # identify the existing version
+    my $existingversion = readlink( $installdirectory."/rtlsdr-flarm" );
+    status( $installdirectory.','.($existingversion||'?').','.$dist );
+    status( "iedd,".$installeddirectory );
+
+
+    print "Source: $download\n".
+	"Installation Directory: $installdirectory\n";
+    print "Configuration file: $configfile ($expandedconfigfile)\n";
+
+    print "Callsign: $aprscall\n";
+    print "\nExisting version: $existingversion\n";
+
+    if( $ARGV[0] eq '-t' ) {
+	print "\n Testing only - no changes made\n";
+	exit;
+    }
+
+    # check for a new download and that the dates are different from before
+    my $lasttime = -e "$installdirectory/$filename" ? stat("$installdirectory/$filename")->mtime : 0;
+    qx( /usr/bin/curl -s -z $installdirectory/$filename $download -o $installdirectory/$filename );
+    my $currenttime = stat("$installdirectory/$filename")->mtime;
+    
+    # check what version is in the archive
+    my $symlinkdetails = qx( /bin/tar tvf $installdirectory/$filename rtlsdr-flarm );
+    my $archiveversion;
+    chomp( $symlinkdetails );
+    if( $symlinkdetails =~ /rtlsdr-flarm -> (rtlsdr-flarm-[0-9.]+)$/ ) {
+	$archiveversion = $1;
+	print "Archive version: $archiveversion\n";
+    }
+    else {
+	# if the file downloaded is not valid then rename it and remove the temporary copy
+	copy( "$installdirectory/$filename", "$installdirectory/$filename.".date(time()) );
+	unlink( "$installdirectory/$filename" );
+
+	status("invalid,$download,$!,$?");
+	print "Unable to identify archive version or archive missing symlink for rtlsdr-flarm\n".
+	    "File saved in $installdirectory/$filename.".date(time())."\n";
+
+	exit;
+    }
+
+    print "\n";
+
+    # if they are then we are upgrading
+    if( $lasttime != $currenttime || $archiveversion ne ($existingversion||'') ) {
+        print "Upgrade from ".($existingversion||'no symlink found')." to $archiveversion found. installing\n";
+        status( "upgrading/$archiveversion" );
+    }
+    else {
+        status( "up2date$ARGV[0]" );
+        print "Up to date. (version $existingversion)\n";
+
+	# if we have been asked to reboot then do it upon completion
+	if( $ARGV[0] eq '-r' ) {
+	    qx( /sbin/reboot );
+	}
+        exit;
+    }
+
+    # perform the upgrade, first stop the service so we don't get any conflicts
+    print "Stopping flarm service: ";
+    qx( /usr/sbin/service rtlsdr-flarm stop );
+    print "done.\n";
+
+    # then uncompress it
+    qx( cd $installdirectory ; /bin/tar xzf $installdirectory/$filename );
+
+    # then make sure it is executable and can run as root
+    qx( cd $installdirectory/rtlsdr-flarm ; /bin/chown root gsm_scan rtlsdr-flarm; /bin/chmod a+s gsm_scan rtlsdr-flarm );
+
+    # if it is a pi then make the gpu_dev
+    if( $os =~ /raspberry/ ) {
+	qx( cd $installdirectory/rtlsdr-flarm; /bin/mknod gpu_dev c 100 0 );
+    }
+
+    ###################
+    # make sure we have the configuration file in the right directory
+    chdir( $installeddirectory );
+    my $newexpandedconfigfile = Cwd::abs_path( $configfile );
+    
+    # check if anything has changed... if it has then we need to copy the file
+    if( $newexpandedconfigfile ne $expandedconfigfile ) {
+	if( ! copy( '/tmp/rtlsdr-flarm.site.conf', "$newexpandedconfigfile" ) ) {
+	    print "unable to copy $!\n";
+	}
+	status("mvconfig,f,$expandedconfigfile" );
+	status("mvconfig,t,$newexpandedconfigfile" );
+	print "Copied configuration file to $configfile ($newexpandedconfigfile)\n";
+    }
+    else {
+	status("config,$expandedconfigfile");
+	print "Configuration file path has not changed, not copying.  Backup in /tmp/rtlsdr-flarm.site.conf if needed\n";
+    }
+
+    # and if we are allowed to start the flarm service
+    if( $ARGV[0] ne '-i' && $ARGV[0] ne '-r' ) {
+	print "Restarting flarm service: ";
+	qx( /usr/sbin/service rtlsdr-flarm start );
+	print "done.\n";
+    }
+
+    $existingversion = readlink( $installdirectory."/rtlsdr-flarm" );
+    status( "done/$existingversion/$ARGV[0]" );
+    print "Upgrade completed ($existingversion)\n";
+
+    # if we have been asked to reboot then do it upon completion
+    if( $ARGV[0] eq '-r' ) {
+	qx( /sbin/reboot );
+    }
+}
+
+sub read_config {
+    my @sections;
+
+    # read it into the hash
+    open( my $fh, '<', "/tmp/rtlsdr-flarm.site.conf" ) || return;
+    while( <$fh> ) {
+        my $line = $_;
+        chomp $line;
+        if( $line =~ /^\s*([A-Za-z]+):/ ) {
+            push @sections, $1;
+            push @config_order, "+$1";
+        }
+
+        if( $line =~ /^\s*}/ ) {
+            pop @sections;
+            push @config_order, "-$1";
+        }
+
+        if( $line =~ /([A-Za-z]+)\s*=\s*([^;]+)(.*)/ ) {
+            my $key = join('_',@sections,$1);
+            $config{$key} = $2;
+            $config_description{$key} = $3;
+            push @config_order, "=$key,$1"; # so we know what order to write in
+        }
+    }
+    close ($fh);
+}
+
+
+sub status {
+    my ($status) = @_;
+    qx( /usr/bin/curl -s http://ognconfig.onglide.com/perl/startupgrade.pl?token=$token/v$version\\&status=$status\\&call=$aprscall );
+}
+
+
+sub date {
+    my @t = gmtime($_[0]);
+    return sprintf( "%04d-%02d-%02dT%02d-%02d-%02d", ($t[5]+1900),($t[4]+1),$t[3],$t[2],$t[1],$t[0]);
+}
+
