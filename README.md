@@ -45,23 +45,16 @@ Making your own image
      - sudo apt-get install wicd-curses
      - sudo echo "/usr/bin/wicd-curses" >> /etc/shells
      - sudo chsh -s /usr/bin/wicd-curses wifi
-     - sudo vipw & set shell for wifi to /usr/bin/wicd-curses
      - test, and configure it to prefer LAN vs WiFi as it makes it much easier to use!
      - update the password dates use (passwd -S pi to get them) in the password change check grep in the configure script
- 2. sudo touch /etc/ssh/ssh_host_keyswrong 
+ 2. use the bootstrap script to install everything ready to go
+     - curl http://ognconfig.onglide.com/files/v2.0/bootstrap -o bootstrap
+     - chmod +x bootstrap
+     - ./bootstrap
+ 3. sudo touch /etc/ssh/ssh_host_keyswrong 
      - rm /etc/sitetoken.txt
      - (ensures that ssh keys are regenerated on first install)
      - remove old configuration files
- 3. fresh installs only: use the bootstrap script to install everything ready to go
-     - curl http://ognconfig.onglide.com/files/v1.4/bootstrap -o bootstrap
-     - chmod +x bootstrap
-     - ./bootstrap
- 4. copy Example.conf to /home/flarm/rtlsdr-flarm.conf
- 5. remove gsm_scan output files
- 6. enable first-install and disable rtlsdr-flarm
-    - curl http://ognconfig.onglide.com/files/v1.4/first-install -o /etc/init.d/first-install
-    - /usr/bin/sudo /usr/sbin/update-rc.d first-install defaults
-    - /usr/bin/sudo /usr/sbin/update-rc.d rtlsdr-flarm remove
 
 ### Shrinking the image for distribution
  From here on down is optional if you want to shrink the image size:
@@ -72,13 +65,18 @@ Making your own image
  3. locales and other stuff
     - sudo apt-get install localepurge deborphan     (during install you select which locales to keep! (raspi-config))
     - localepurge
-    Clean up apt-get junk
+ 4. Clean up apt-get junk
     - apt-get autoremove
     - apt-get autoclean
     - apt-get clean
-    -size reduction:  manually delete apt files in /var/
- 4. (size reduction: if you've done much stuff then 
+    - manually delete apt files in /var/cache/apt/
+ 5. remove gsm_scan output files
+ 6. size reduction, makes the image compress better: 
    - sudo dd if=/dev/zero of=t.1 bs=1M count=8 ; sudo dd if=/dev/zero of=t.2 bs=1M ; sudo rm t.1 t.2
- 5. (optional) use something like gpart to resize the partition downwards
- 11. fdisk /dev/disk2
-      add start + size together to get number of sectors to copy.  dd if=/xxx of=file bs=512 count=#
+   - history -c
+ 7. (optional) use something like gparted to resize the partition downwards
+ 8. Determine what to copy
+   - fdisk /dev/disk2
+      add start + size together to get number of sectors to copy.  
+   -dd if=/xxx of=file bs=512 count=#
+   - zip & bz2, md5sum and upload
