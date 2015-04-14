@@ -46,7 +46,11 @@ Making your own image
      - sudo echo "/usr/bin/wicd-curses" >> /etc/shells
      - sudo chsh -s /usr/bin/wicd-curses wifi
      - test, and configure it to prefer LAN vs WiFi as it makes it much easier to use!
-     - update the password dates use (passwd -S pi to get them) in the password change check grep in the configure script
+     - change the date on the server to something a while ago
+      - sudo date -s 150101; echo "wifi:wifi" | chpasswd; echo "ogn:ogn" | chpasswd ; echo "pi:pi" | chpasswd;
+      - on some devices set the root password to something strong and random AND disable ssh root logins altogether in /etc/ssh/sshd_config PermitRootLogin yes > PermitRootLogin no
+      - (changing the dates ensures that passwords get regenerated properly )
+      - Make sure ogn user or pi user has sudo full access (eg bananapi uses root by default so you need to help it out).  this is normally just a case of adding ogn to the sudo group.  You may also want to run visudo and allow sudoers to run commands without passwords like rpi does by default
  2. use the bootstrap script to install everything ready to go
      - curl http://ognconfig.onglide.com/files/v2.0/bootstrap -o bootstrap
      - chmod +x bootstrap
