@@ -46,7 +46,7 @@
 # on BPI and RPI and is believe to work on generic Linux installations
 #
 
-downloadpath="https://raw.githubusercontent.com/dbursem/ogn-bootstrap/master/"
+downloadpath="https://raw.githubusercontent.com/dbursem/ogn-bootstrap/jessie-support/"
 
 progress() {
     echo ""
