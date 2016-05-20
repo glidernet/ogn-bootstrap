@@ -157,13 +157,21 @@ cd /home/ogn
     echo "blacklist dvb_usb_rtl2830u"  >> /etc/modprobe.d/rtl-glidernet-blacklist.conf
 #fi
 
+#install libjpeg8 as gsm_scan depends on this
+LIBJPG_OK=$(sudo ldconfig -p | grep libjpeg.so.8)
+if [ "" == "$LIBJPG_OK" ] ; then
+    architecture=`dpkg --print-architecture`
+    wget "http://ftp.nl.debian.org/debian/pool/main/libj/libjpeg8/libjpeg8_8d1-2_"${architecture}".deb"
+    sudo dpkg -i "libjpeg8_8d1-2_"${architecture}".deb"
+fi
+
 progress "Adding system startup scripts"
- curl "${downloadpath}rtlsdr-ogn" -R -# -o /etc/init.d/rtlsdr-ogn
- curl "${downloadpath}rtlsdr-ogn.conf" -R -# -o /etc/rtlsdr-ogn.conf
+ curl ${downloadpath}"rtlsdr-ogn" -R -# -o /etc/init.d/rtlsdr-ogn
+ curl ${downloadpath}"rtlsdr-ogn.conf" -R -# -o /etc/rtlsdr-ogn.conf
  chmod +x /etc/init.d/rtlsdr-ogn
 
 progress "Installing updater and using it to install RTLSDR"
-curl "${downloadpath}update" -R -# -o /home/ogn/update
+curl ${downloadpath}"update" -R -# -o /home/ogn/update
 chmod +x /home/ogn/update
  
 # if we don't have a configuration file then make a dummy one, we also need to make the rtlsdr-ogn
@@ -186,18 +194,18 @@ fi;
 
 progress "Adding startup scripts - this will produce warnings about LSB tabs"
 
-curl '${downloadpath}rtlsdr-ogn' -R -# -o /etc/init.d/rtlsdr-ogn
-curl '${downloadpath}rtlsdr-ogn.conf' -R -# -o /etc/rtlsdr-ogn.conf
+curl ${downloadpath}'rtlsdr-ogn' -R -# -o /etc/init.d/rtlsdr-ogn
+curl ${downloadpath}'rtlsdr-ogn.conf' -R -# -o /etc/rtlsdr-ogn.conf
 chmod +x /etc/init.d/rtlsdr-ogn
 cp rtlsdr-ogn/Template.conf /home/ogn/rtlsdr-ogn.conf
 chown ogn /home/ogn/rtlsdr-ogn.conf
 if [ -e /etc/systemd ] ; then
-    curl '${downloadpath}rtlsdr-ogn.service' -R -# -o /etc/systemd/system/rtlsdr-ogn.service
+    curl ${downloadpath}'rtlsdr-ogn.service' -R -# -o /etc/systemd/system/rtlsdr-ogn.service
 fi;
 
 if [ "$online" != "1" ] ; then
-    curl '${downloadpath}httpi' -R -# -o /usr/local/bin/httpi
-    curl '${downloadpath}first-install' -R -# -o /etc/init.d/first-install
+    curl ${downloadpath}'httpi' -R -# -o /usr/local/bin/httpi
+    curl ${downloadpath}'first-install' -R -# -o /etc/init.d/first-install
     chmod +x /etc/init.d/first-install /usr/local/bin/httpi
     ##new systemctl calls
     if [ -e /etc/systemd ] ; then
