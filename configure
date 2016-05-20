@@ -275,8 +275,14 @@ if( ! $stopScanning ) {
     write_config();
 
     # change what is going to run on reboot
-    qx( /usr/bin/sudo /usr/sbin/update-rc.d -f first-install remove );
-    qx( /usr/bin/sudo /usr/sbin/update-rc.d -f rtlsdr-ogn defaults 2>/dev/null);
+    if( -e /etc/systemd ) {
+        qx( /usr/bin/sudo /bin/systemctl disable first-install 2>/dev/null );
+        qx( /usr/bin/sudo /bin/systemctl enable rtlsdr-ogn.service 2>/dev/null);
+    }
+    else {
+        qx( /usr/bin/sudo /usr/sbin/update-rc.d -f first-install remove );
+        qx( /usr/bin/sudo /usr/sbin/update-rc.d -f rtlsdr-ogn defaults 2>/dev/null);
+    }
 
     # make sure the software is updated
     qx( /usr/bin/sudo /home/ogn/update -i 2>/dev/null);
