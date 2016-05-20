@@ -62,14 +62,14 @@ echo "starting..."
 sudo="sudo"
 which sudo || {
     if [ `whoami` == 'root' ] ; then
-    sudo () {
-        $@
-    }
-    sudo=""
-    progress "Not using sudo - running as root"
+        sudo () {
+            $@
+        }
+        sudo=""
+        progress "Not using sudo - running as root"
     else
-    error "Please install sudo or run this script as root"
-    exit 1
+        error "Please install sudo or run this script as root"
+        exit 1
     fi
 }
 
@@ -80,22 +80,23 @@ if [ "$1" == "" ] ; then
 
     if [ ! -e /home/ogn ]; then
 
-    sudo useradd -m -G `groups|tr ' ' ,` ogn || {
-        progress "unable to add ogn user?!"
-        exit
-    }
+        sudo useradd -m -G `groups|tr ' ' ,` ogn || {
+            progress "unable to add ogn user?!"
+            exit
+        }
 
-    echo "ogn:ogn" | sudo chpasswd
+        echo "ogn:ogn" | sudo chpasswd
 
-    progress "Updating package information"
-    sudo apt-get update
-    
-    progress "Updating install packages"
-    sudo apt-get -y upgrade
-
+        progress "Updating package information"
+        sudo apt-get update
+        
+        progress "Updating install packages"
+        sudo apt-get -y upgrade
+        sudo apt-get -y dist-upgrade
+        
     else
 
-    progress "using existing ogn user"
+        progress "using existing ogn user"
 
     fi
 
@@ -125,13 +126,8 @@ if [ "$upgrade" != "1" ] ; then
         progress "Updating Operating System (do-release-upgrade)"
         do-release-upgrade
         updated=1
-    elif [ `which apt-get` != "" ] ; then
-        progress "Updating Operating System (apt-get)"
-        apt-get update
-        apt-get -y upgrade
-        updated=1
     else
-        progress "No automatic update available"
+        progress "No automatic OS-upgrade available"
     fi
     
 fi
