@@ -160,6 +160,7 @@ cd /home/ogn
 #install libjpeg8 as gsm_scan depends on this
 LIBJPG_OK=$(sudo ldconfig -p | grep libjpeg.so.8)
 if [ "" == "$LIBJPG_OK" ] ; then
+    progress "installing older version of libjpeg for gsm_scan"
     architecture=`dpkg --print-architecture`
     wget "http://ftp.nl.debian.org/debian/pool/main/libj/libjpeg8/libjpeg8_8d1-2_"${architecture}".deb"
     sudo dpkg -i "libjpeg8_8d1-2_"${architecture}".deb"
@@ -197,6 +198,7 @@ progress "Adding startup scripts - this will produce warnings about LSB tabs"
 curl ${downloadpath}'rtlsdr-ogn' -R -# -o /etc/init.d/rtlsdr-ogn
 curl ${downloadpath}'rtlsdr-ogn.conf' -R -# -o /etc/rtlsdr-ogn.conf
 chmod +x /etc/init.d/rtlsdr-ogn
+
 cp rtlsdr-ogn/Template.conf /home/ogn/rtlsdr-ogn.conf
 chown ogn /home/ogn/rtlsdr-ogn.conf
 if [ -e /etc/systemd ] ; then
