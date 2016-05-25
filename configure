@@ -271,7 +271,7 @@ if( ! $stopScanning ) {
     write_config();
 
     # change what is going to run on reboot
-    if( -e /etc/systemd ) {
+    if( -e "/etc/systemd" ) {
         qx( /usr/bin/sudo /bin/systemctl disable first-install 2>/dev/null );
         qx( /usr/bin/sudo /bin/systemctl enable rtlsdr-ogn.service 2>/dev/null);
     }
