@@ -32,7 +32,7 @@ launch () {
 
   /usr/local/bin/httpi 2>/dev/null
 
-  configurelocation="https://ognconfig.onglide.com/files/v2.0/configure"
+  configurelocation="https://raw.githubusercontent.com/dbursem/ogn-bootstrap/jessie-support/configure"
 
 # remove any previous data from the webpage in case things break
    mkdir /tmp/htdocs 2>/dev/null
@@ -46,8 +46,8 @@ launch () {
   do
 	count=$((count +1))
         date >> /tmp/htdocs/index.html
-        echo " - unable to reach ognconfig.onglide.com<br/>" >> /tmp/htdocs/index.html
-	echo " - unable to reach ognconfig.onglide.com (retry # $count of 3)"
+        echo " - unable to download config file<br/>" >> /tmp/htdocs/index.html
+	echo " - unable to download config file (retry # $count of 3)"
         sleep 10
         /usr/bin/curl -R -z /home/ogn/configure ${configurelocation} -o /home/ogn/configure  2>/dev/null
   done

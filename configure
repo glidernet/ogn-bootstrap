@@ -58,9 +58,6 @@ my $old_handle = select (STDOUT);
 $| = 1; # perform flush after each write to STDOUT
 select ($old_handle); 
 
-#952.400MHz:   +1.4dB: +38.91 +38.66 +39.03 +38.81 +38.86 +38.96 [ppm]
-#953.600MHz:   +2.2dB: +38.25 +38.16 +38.62 +38.21 +38.28 [ppm]
-#955.800MHz:   +3.7dB: +38.55 +38.51 +38.71 +38.50 +38.57 +38.56 [ppm]
 
 # what we read from the configuration file
 my %config;
@@ -133,9 +130,9 @@ my $ipstring = '/';
 {
     my @ips = qx( /sbin/ifconfig | grep "inet addr" | grep -v 127.0.0.1 );
     foreach my $ip ( @ips ) {
-	if( $ip =~ /inet addr:([0-9.]+)/ ) {
-	    $ipstring .= $1 . "+";
-	}
+        if( $ip =~ /inet addr:([0-9.]+)/ ) {
+            $ipstring .= $1 . "+";
+        }
     }
 
     status( "start" );
@@ -207,7 +204,6 @@ if( ! $stopScanning ) {
     if( $freq ) {
 	$config{RF_FreqCorr} = $ppm;
 	$config{RF_GSM_Gain} = $gain;
-#	$config{RF_FLARM_Gain} = $gain < 50 ? $gain + 20 : $gain;
 	$config{RF_GSM_CenterFreq} = $freq;
 
 	# save the new scan results
@@ -395,7 +391,8 @@ sub gsm_scan {
     my $beststrength = 0;
     my $previousgain = $gain;
     my $ppmchanged = 0;
-    $ppm = $ppm+0;
+    #$ppm = $ppm+0;
+    $ppm = 0; #better to start at 0 in case a low-drift radio is used
     $gain = $gain+0;
 
     my $ppmretry = 0;
@@ -409,107 +406,109 @@ sub gsm_scan {
     my $loops = 0;
     
     # anything more than 70 is too much, less than 15 means something is wrong
-    while( $gain < 70 && $gain > 10 && ! $stopScanning ) {
-	my $previousppm = $ppm;
-	my %frequencies;
-	$loops++;
-	output( "$loops: scanning at gain $gain and offset adjustment $ppm: ");
+    while( $gain < 70 && $gain > 10 && ! $stopScanning ) 
+    {
+        my $previousppm = $ppm;
+        my %frequencies;
+        $loops++;
+        output( "$loops: scanning at gain $gain and offset adjustment $ppm: ");
 
-	my @result = qx( /home/ogn/rtlsdr-ogn/gsm_scan --ppm $ppm --gain $gain 2>/dev/null);
-	
-	# check to make sure we got enough to do something with
-        if( grep /Not enough data was collected: please retry with higher gain to catch more GSM signals/, @result) {
-	    output( "re-scanning with higher gain, insufficient GSM signals detected.".
-		    ($ppmretry >= 4 && $gain > 40 ? "Are you sure the antenna is attached?<br/>" : "<br/>"));
+        my @result = qx( /home/ogn/rtlsdr-ogn/gsm_scan --ppm $ppm --gain $gain 2>/dev/null);
+        
+        # check to make sure we got enough to do something with
+        if( grep /Not enough data was collected: please retry with higher gain to catch more GSM signals/, @result) 
+        {
+            output( "re-scanning with higher gain, insufficient GSM signals detected.".
+                ($ppmretry >= 4 && $gain > 40 ? "Are you sure the antenna is attached?<br/>" : "<br/>"));
 
-	    $previousgain = $gain;
-	    $gain += 10;
+            $previousgain = $gain;
+            $gain += 10;
 
-	    # if we have hit a high gain then try with a different ppm
-	    if( $nochannelsever && $gain > 60 && $ppmretry < 9 ) {
-		$gain = 40;
-		$ppm = ($ppm + 80) % 99;
-		$ppmretry++;
-		output( "<br/>Checking with a different ppm adjustment to see if initial estimate was too far off<br/>" );
-	    }
-	    next;
-	}
+            # if we have hit a high gain then try with a different ppm
+            if( $nochannelsever && $gain > 60 && $ppmretry < 9 ) {
+            $gain = 40;
+            $ppm = ($ppm + 80) % 99;
+            $ppmretry++;
+            output( "<br/>Checking with a different ppm adjustment to see if initial estimate was too far off<br/>" );
+            }
+            next;
+        }
 
-	# if we passed that then we have seen a channel and are probably not too far off
-	$nochannelsever = 0;
+        # if we passed that then we have seen a channel and are probably not too far off
+        $nochannelsever = 0;
 
-	# check to see if the PPM is right, if it isn't then we will run the scan with a new one
-	my @ppmcorrection = grep /Receiver Xtal correction/, @result;
-	if( $ppmcorrection[0] =~ /Receiver Xtal correction = [0-9.+-]+ = ([0-9+-]+).* ppm/ ) {
-	    $ppm = $1+0;
-	    if( abs($ppm-$previousppm) > 1 ) {
-		$ppmchanged = 1;
-		$gain = 25;
-		output( "re-scanning with new ppm adjustment<br/>");
-		next;
-	    }
-	}
+        # check to see if the PPM is right, if it isn't then we will run the scan with a new one
+        my @ppmcorrection = grep /Receiver Xtal correction/, @result;
+        if( $ppmcorrection[0] =~ /Receiver Xtal correction = [0-9.+-]+ = ([0-9+-]+).* ppm/ ) {
+            $ppm = $1+0;
+            if( abs($ppm-$previousppm) > 1 ) {
+            $ppmchanged = 1;
+            $gain = 25;
+            output( "re-scanning with new ppm adjustment<br/>");
+            next;
+            }
+        }
 
-	if( grep /please retry with better initial estimate or with lower gain to reduce distortions/, @result ) {
-	    output( "re-scanning with lower gain, inconsistent drift detected.  If your scan fails it may be because the antenna is not attached?<br/>");
-	    $previousgain = $gain;
-	    $gain -= 10;
-	    next;
-	}
+        if( grep /please retry with better initial estimate or with lower gain to reduce distortions/, @result ) {
+            output( "re-scanning with lower gain, inconsistent drift detected.  If your scan fails it may be because the antenna is not attached?<br/>");
+            $previousgain = $gain;
+            $gain -= 10;
+            next;
+        }
 
-	
-	# next we need to find the best frequency
-	my @gsm = grep /MHz[:]/, @result; #:
-	foreach my $line ( @gsm ) {
-	    if( ! ($line =~ /([0-9.]+)MHz.*[+]([0-9.]+)dB:[^+-]([0-9.+ -]+)/) ) {
-		next;
-	    }
-	    my $frequency = $1;
-	    my $strength = $2;
-	    my $offsets = $3;
+        
+        # next we need to find the best frequency
+        my @gsm = grep /MHz[:]/, @result; #:
+        foreach my $line ( @gsm ) {
+            if( ! ($line =~ /([0-9.]+)MHz.*[+]([0-9.]+)dB:[^+-]([0-9.+ -]+)/) ) {
+            next;
+            }
+            my $frequency = $1;
+            my $strength = $2;
+            my $offsets = $3;
 
-	    my @offset_array = split(/\s+/, $offsets );
-	    my ($sum, $count) = (0,$#offset_array+1);
-	    foreach my $offset (@offset_array) {
-		$sum += $offset;
-	    }
-	    
-	    # make sure the offset isn't too far out of line
-	    if( abs($sum/$count) < 4 ) {
-		# store away so we can search when we are done
-		$frequencies{$frequency} = $strength-(abs($sum/$count)*2);
-#		output "{ correction => abs($sum/$count), gain => $gain, weight => $gain-(abs($sum/$count)*2) }<br/>";
-	    }
-	}
+            my @offset_array = split(/\s+/, $offsets );
+            my ($sum, $count) = (0,$#offset_array+1);
+            foreach my $offset (@offset_array) {
+            $sum += $offset;
+            }
+            
+            # make sure the offset isn't too far out of line
+            if( abs($sum/$count) < 4 ) {
+            # store away so we can search when we are done
+            $frequencies{$frequency} = $strength-(abs($sum/$count)*2);
+    		#output "{ correction => abs($sum/$count), gain => $gain, weight => $gain-(abs($sum/$count)*2) }<br/>";
+            }
+        }
 
-	# find the best
-	my @best = sort { $frequencies{$b} <=> $frequencies{$a} } keys(%frequencies);
+        # find the best
+        my @best = sort { $frequencies{$b} <=> $frequencies{$a} } keys(%frequencies);
 
-	# make sure we don't break things if adapter isn't installed
-	if( $best[0]+0 == 0 ) {
-	    output( "<br/><br/><b>Are you sure you have the dongle installed, no channels were found!</b><br/>");
-	    return (undef,undef,undef);
-	}
+        # make sure we don't break things if adapter isn't installed
+        if( $best[0]+0 == 0 ) {
+            output( "<br/><br/><b>Are you sure you have the dongle installed, no channels were found!</b><br/>");
+            return (undef,undef,undef);
+        }
 
-	output( "best frequency is $best[0] @ ".(int($frequencies{$best[0]}*10)/10)." (weighted)<br/>" );
+        output( "best frequency is $best[0] @ ".(int($frequencies{$best[0]}*10)/10)." (weighted)<br/>" );
 
-	if( $frequencies{$best[0]} < ($beststrength+2.4) && ! $ppmchanged && $loops > 1 ) {
-	    output( "Previous scan was better, will configure using gain of $previousgain and frequency $bestfrequency, ppm adjustment of $ppm<br/>");
-	    return ($ppm, $previousgain, $bestfrequency ); #previousppm?  seems to settle closer to right using current
-	}
+        if( $frequencies{$best[0]} < ($beststrength+2.4) && ! $ppmchanged && $loops > 1 ) {
+            output( "Previous scan was better, will configure using gain of $previousgain and frequency $bestfrequency, ppm adjustment of $ppm<br/>");
+            return ($ppm, $previousgain, $bestfrequency ); #previousppm?  seems to settle closer to right using current
+        }
 
-	# try again with more gain
-	$beststrength = $frequencies{$best[0]};
-	$bestfrequency = $best[0];
-	$previousgain = $gain;
-	$gain += 5;
-	$ppmchanged = 0;
+        # try again with more gain
+        $beststrength = $frequencies{$best[0]};
+        $bestfrequency = $best[0];
+        $previousgain = $gain;
+        $gain += 5;
+        $ppmchanged = 0;
     }
 
     if( ! $stopScanning ) {
-	output( "stopped scanning at gain $gain<br/>");
-	output( "Configuring with gain of $previousgain and frequency $bestfrequency<br/>");
-	return ($ppm, $previousgain, $bestfrequency );
+        output( "stopped scanning at gain $gain<br/>");
+        output( "Configuring with gain of $previousgain and frequency $bestfrequency<br/>");
+        return ($ppm, $previousgain, $bestfrequency );
     }
 }
 
@@ -557,37 +556,42 @@ sub write_config {
     my $first =0;
     copy( '/home/ogn/rtlsdr-ogn.conf', '/home/ogn/rtlsdr-ogn/rtlsdr-ogn.conf.'.date(time()));
     
-    if( ! open( FH, '>', "/home/ogn/rtlsdr-ogn.conf" ) ) {
-	qx( curl -s https://ognconfig.onglide.com/perl/startconfiguration.pl?token=$token$ipstring\\&status=error );
-	status( "write failed $!" );
-	output( "<h1>Unable to write to configuration file! error: $!</h1>" );
-	die "unable to open configuration file";
+    if( ! open( FH, '>', "/home/ogn/rtlsdr-ogn.conf" ) ) 
+    {
+        qx( curl -s https://ognconfig.onglide.com/perl/startconfiguration.pl?token=$token$ipstring\\&status=error );
+        status( "write failed $!" );
+        output( "<h1>Unable to write to configuration file! error: $!</h1>" );
+        die "unable to open configuration file";
     }
 
-    foreach my $key ( @config_order ) {
-	my $action = substr($key,0,1);
-	my $id = substr($key,1);
-	
-	if( $action eq '+' ) {
-	    print FH $depth.$id . ":\n".$depth.'{';
-	    $depth .= '  ';
-	    $first = 1;
-	}
-	elsif( $action eq '-' ) {
-	    $depth = substr($depth,0,-2);
-	    print FH $depth."} ;\n";
-	}
-	elsif( $action eq '=' ) {
-	    my ($k,$i) = split( ',', $id );
-	    if( $first ) {
-		print FH ' ';
-	    }
-	    else { 
-		print FH $depth;
-	    }
-	    print FH $i . "=" . $config{$k} . $config_description{$k}."\n";
-	    $first = 0;
-	}
+    foreach my $key ( @config_order ) 
+    {
+        my $action = substr($key,0,1);
+        my $id = substr($key,1);
+        
+        if( $action eq '+' ) 
+        {
+            print FH $depth.$id . ":\n".$depth.'{';
+            $depth .= '  ';
+            $first = 1;
+        }
+        elsif( $action eq '-' ) 
+        {
+            $depth = substr($depth,0,-2);
+            print FH $depth."} ;\n";
+        }
+        elsif( $action eq '=' ) 
+        {
+            my ($k,$i) = split( ',', $id );
+            if( $first ) {
+                print FH ' ';
+            }
+            else { 
+                print FH $depth;
+            }
+            print FH $i . "=" . $config{$k} . $config_description{$k}."\n";
+            $first = 0;
+        }
     }
 
     close(FH);
@@ -609,13 +613,13 @@ sub fetch_config {
     my %newconfig;
 
     if( $#result == -1 ) {
-	$newconfig{not_found} = 1;
+        $newconfig{not_found} = 1;
     }
 
     foreach my $l ( @result )  {
-	chomp($l);
-	my ($k,@v) = split(':',$l);
-	$newconfig{$k} = join(':',@v);
+        chomp($l);
+        my ($k,@v) = split(':',$l);
+        $newconfig{$k} = join(':',@v);
     }
 
     # store the new callsign for status display
