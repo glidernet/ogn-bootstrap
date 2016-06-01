@@ -49,7 +49,7 @@ use strict;
 use File::Copy;
 
 my $version = '2.0d';
-my $pwepoch = 1428964689; # on linux date  -d '10/25/2014' '+%s', on bsd date -f '%m/%d/%Y' -j '+%s' '1/1/2000'
+my $pwepoch = 1464127201; # on linux date  -d '05/25/2016' '+%s', on bsd date -f '%m/%d/%Y' -j '+%s' '1/1/2000'
 # this is the day after the build image was built - to make sure we can detect changed passwords.  You need to
 # wait at least a day before releasing otherwise the check may fail!
 
