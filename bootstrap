@@ -46,7 +46,7 @@
 # on BPI and RPI and is believe to work on generic Linux installations
 #
 
-downloadpath="https://raw.githubusercontent.com/dbursem/ogn-bootstrap/"
+downloadpath="https://raw.githubusercontent.com/dbursem/master/ogn-bootstrap/"
 
 progress() {
     echo ""

@@ -32,7 +32,7 @@ launch () {
 
   /usr/local/bin/httpi 2>/dev/null
 
-  configurelocation="https://raw.githubusercontent.com/dbursem/ogn-bootstrap/configure"
+  configurelocation="https://raw.githubusercontent.com/dbursem/ogn-bootstrap/master/configure"
 
 # remove any previous data from the webpage in case things break
    mkdir /tmp/htdocs 2>/dev/null
