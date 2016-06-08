@@ -1,0 +1,21 @@
+[Unit]
+SourcePath=/etc/init.d/rtlsdr-ogn
+Description=LSB: OGN receiver
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=forking
+Restart=no
+TimeoutSec=99m
+IgnoreSIGPIPE=no
+KillMode=process
+GuessMainPID=no
+RemainAfterExit=yes
+SysVStartPriority=5
+ExecStart=/etc/init.d/rtlsdr-ogn start
+ExecStop=/etc/init.d/rtlsdr-ogn stop
+ExecReload=/etc/init.d/rtlsdr-ogn reload
+
+[Install]
+WantedBy=multi-user.target

@@ -1,6 +1,6 @@
 #!/usr/bin/perl
 use POSIX qw(SIGALRM SIGTERM SIGPIPE SIGHUP sigaction);
-$VERSION = "1.7.1 (Demonic/Linux)";
+$VERSION = "Unknown";
 
 # HTTPi Hypertext Tiny Truncated Process Implementation
 # Copyright 1999-2012 Cameron Kaiser and Contributors # All rights reserved

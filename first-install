@@ -1,7 +1,13 @@
 #!/bin/bash
 
-# chkconfig: 2345 98 2
-# description: shellbox service for spawning programs
+### BEGIN INIT INFO
+# Provides:        first-install
+# Required-Start:  $network
+# Required-Stop:   $network
+# Default-Start:   2 3 4 5
+# Default-Stop:    0 1 6
+# Short-Description: Start OGN first install
+### END INIT INFO
 
 export PATH=$PATH:/usr/local/bin
 
@@ -26,34 +32,34 @@ launch () {
 
   /usr/local/bin/httpi 2>/dev/null
 
-  configurelocation="http://ognconfig.onglide.com/files/v1.4/configure"
+  configurelocation="https://raw.githubusercontent.com/dbursem/ogn-bootstrap/master/configure"
 
 # remove any previous data from the webpage in case things break
    mkdir /tmp/htdocs 2>/dev/null
    touch /tmp/htdocs/index.html 2>/dev/null
 
-   chown -R flarm:flarm /tmp/htdocs
+   chown -R ogn:ogn /tmp/htdocs
    count=0
 
-  /usr/bin/curl -R -z /home/flarm/configure  ${configurelocation} -o /home/flarm/configure  2>/dev/null
+  /usr/bin/curl -R -z /home/ogn/configure  ${configurelocation} -o /home/ogn/configure  2>/dev/null
   while [ $? -ne 0 -a $count -le 3 ];    
   do
 	count=$((count +1))
         date >> /tmp/htdocs/index.html
-        echo " - unable to reach ognconfig.onglide.com<br/>" >> /tmp/htdocs/index.html
-	echo " - unable to reach ognconfig.onglide.com (retry # $count of 3)"
+        echo " - unable to download config file<br/>" >> /tmp/htdocs/index.html
+	echo " - unable to download config file (retry # $count of 3)"
         sleep 10
-        /usr/bin/curl -R -z /home/flarm/configure ${configurelocation} -o /home/flarm/configure  2>/dev/null
+        /usr/bin/curl -R -z /home/ogn/configure ${configurelocation} -o /home/ogn/configure  2>/dev/null
   done
 
-  chmod +x /home/flarm/configure
-  chown flarm /home/flarm/configure
+  chmod +x /home/ogn/configure
+  chown ogn /home/ogn/configure
 
 # make sure we don't litter root directory with junk
-  cd /home/flarm/rtlsdr-flarm
+  cd /home/ogn/rtlsdr-ogn
   
 # run the configuration script
-  /usr/bin/perl /home/flarm/configure
+  /usr/bin/perl /home/ogn/configure
 
 }
 
