@@ -9,7 +9,7 @@ Files
 bootstrap
 ---------
 
-A basic shell script for running the installation on a new device.  It relies on the update script to install the correct version for the running hardware.  This will create the gpu nodes for RPI and setup a new 'flarm' user that the software will run as.
+A basic shell script for running the installation on a new device.  It relies on the update script to install the correct version for the running hardware.  This will create the gpu nodes for RPI and setup a new 'ogn' user that the software will run as.
 
 configure
 ---------
@@ -29,14 +29,14 @@ This is a system startup script that launches configure.  It is activated by boo
 others
 ------
 - httpi is a webserver used by configure http://www.floodgap.com/httpi/  it has been preconfigured to run on the binary image
-- rtlsdr-flarm.conf is the default configuration file for the service
-- rtlsdr-flarm is the system startup script that launches the flarm receiver.  By default it is not configured to start automatically until config has been completed.
+- rtlsdr-ogn.conf is the default configuration file for the service
+- rtlsdr-ogn is the system startup script that launches the ogn receiver.  By default it is not configured to start automatically until config has been completed.
 
 
 Making your own image
 =====================	
     ###Basic Install
-    0. use the bootstrap script to install the flarm tracker.  Choose OS upgrade & Web configuration but don't actually do the 
+    0. use the bootstrap script to install the ogn tracker.  Choose OS upgrade & Web configuration but don't actually do the 
     web configuration
  1. change pi & wifi user passwords to defaults
      - useradd wifi
@@ -55,12 +55,12 @@ Making your own image
      - curl http://ognconfig.onglide.com/files/v1.4/bootstrap -o bootstrap
      - chmod +x bootstrap
      - ./bootstrap
- 4. copy Example.conf to /home/flarm/rtlsdr-flarm.conf
+ 4. copy Example.conf to /home/ogn/rtlsdr-ogn.conf
  5. remove gsm_scan output files
- 6. enable first-install and disable rtlsdr-flarm
+ 6. enable first-install and disable rtlsdr-ogn
     - curl http://ognconfig.onglide.com/files/v1.4/first-install -o /etc/init.d/first-install
     - /usr/bin/sudo /usr/sbin/update-rc.d first-install defaults
-    - /usr/bin/sudo /usr/sbin/update-rc.d rtlsdr-flarm remove
+    - /usr/bin/sudo /usr/sbin/update-rc.d rtlsdr-ogn remove
 
 ### Shrinking the image for distribution
  From here on down is optional if you want to shrink the image size:
