@@ -35,9 +35,8 @@ others
 
 Making your own image
 =====================	
-###Basic Installation
-
- 0. use the bootstrap script to install the flarm tracker.  Choose OS upgrade & Web configuration but don't actually do the 
+    ###Basic Install
+    0. use the bootstrap script to install the flarm tracker.  Choose OS upgrade & Web configuration but don't actually do the 
     web configuration
  1. change pi & wifi user passwords to defaults
      - useradd wifi
@@ -45,42 +44,44 @@ Making your own image
      - sudo apt-get install wicd-curses
      - sudo echo "/usr/bin/wicd-curses" >> /etc/shells
      - sudo chsh -s /usr/bin/wicd-curses wifi
+     - sudo vipw & set shell for wifi to /usr/bin/wicd-curses
      - test, and configure it to prefer LAN vs WiFi as it makes it much easier to use!
-     - change the date on the server to something a while ago
-      - sudo date -s 150101; echo "wifi:wifi" | chpasswd; echo "ogn:ogn" | chpasswd ; echo "pi:pi" | chpasswd;
-      - on some devices set the root password to something strong and random AND disable ssh root logins altogether in /etc/ssh/sshd_config PermitRootLogin yes > PermitRootLogin no
-      - (changing the dates ensures that passwords get regenerated properly )
-      - Make sure ogn user or pi user has sudo full access (eg bananapi uses root by default so you need to help it out).  this is normally just a case of adding ogn to the sudo group.  You may also want to run visudo and allow sudoers to run commands without passwords like rpi does by default
- 2. use the bootstrap script to install everything ready to go
-     - curl http://ognconfig.onglide.com/files/v2.0/bootstrap -o bootstrap
-     - chmod +x bootstrap
-     - ./bootstrap
- 3. sudo touch /etc/ssh/ssh_host_keyswrong 
+     - update the password dates use (passwd -S pi to get them) in the password change check grep in the configure script
+ 2. sudo touch /etc/ssh/ssh_host_keyswrong 
      - rm /etc/sitetoken.txt
      - (ensures that ssh keys are regenerated on first install)
      - remove old configuration files
+ 3. fresh installs only: use the bootstrap script to install everything ready to go
+     - curl http://ognconfig.onglide.com/files/v1.4/bootstrap -o bootstrap
+     - chmod +x bootstrap
+     - ./bootstrap
+ 4. copy Example.conf to /home/flarm/rtlsdr-flarm.conf
+ 5. remove gsm_scan output files
+ 6. enable first-install and disable rtlsdr-flarm
+    - curl http://ognconfig.onglide.com/files/v1.4/first-install -o /etc/init.d/first-install
+    - /usr/bin/sudo /usr/sbin/update-rc.d first-install defaults
+    - /usr/bin/sudo /usr/sbin/update-rc.d rtlsdr-flarm remove
 
 ### Shrinking the image for distribution
  From here on down is optional if you want to shrink the image size:
  1. delete old logs files, ~/.history etc
+	rm /home/pi/.bash_history /root/.bash_history /home/ogn/.bash_history
+	echo > /var/log/...
+	    
  2. If on PI or other big image then remove x11 junk as you don't need it
-    - sudo apt-get remove --auto-remove --purge libx11-.*
-    - sudo apt-get autoremove
+    sudo apt-get remove --auto-remove --purge libx11-.*
+    sudo apt-get autoremove
  3. locales and other stuff
-    - sudo apt-get install localepurge deborphan     (during install you select which locales to keep! (raspi-config))
-    - localepurge
- 4. Clean up apt-get junk
+    sudo apt-get install localepurge deborphan     (during install you select which locales to keep! (raspi-config))
+	localepurge
+	apt-get remove `deborphan`
+    Clean up apt-get junk
     - apt-get autoremove
     - apt-get autoclean
     - apt-get clean
-    - manually delete apt files in /var/cache/apt/
- 5. remove gsm_scan output files
- 6. size reduction, makes the image compress better: 
+    - manually delete apt files in /var/
+ 4. if you've done much stuff then (makes it compress better)
    - sudo dd if=/dev/zero of=t.1 bs=1M count=8 ; sudo dd if=/dev/zero of=t.2 bs=1M ; sudo rm t.1 t.2
-   - history -c
- 7. (optional) use something like gparted to resize the partition downwards
- 8. Determine what to copy
-   - fdisk /dev/disk2
-      add start + size together to get number of sectors to copy.  
-   -dd if=/xxx of=file bs=512 count=#
-   - zip & bz2, md5sum and upload
+ 5. (optional) use something like gpart to resize the partition downwards
+ 11. fdisk /dev/disk2
+      add start + size together to get number of sectors to copy.  dd if=/xxx of=file bs=512 count=#

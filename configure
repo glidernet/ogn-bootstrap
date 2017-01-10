@@ -87,6 +87,11 @@ chomp($password);chomp($setuppassword);
 
 my $reducedcontent;
 
+status( "obsolete", '', '' );
+output_screen( "I'm sorry this version of first-install/configure is now obsolete.\n\nIf it is possible it is recommended that you re-install \n".
+	       "using a later version of the CD image or bootstrap\n\nIf not please search/post on the openglidernetwork google group for help\n" );
+exit;
+
 # colours
 my $og = "\033[32m";
 my $cg = "\033[0m";
