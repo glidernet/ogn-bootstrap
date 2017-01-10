@@ -1,4 +1,13 @@
 #!/bin/bash
+### BEGIN INIT INFO
+# Provides:          rtlsdr-ogn
+# Required-Start:    $all
+# Required-Stop:
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: OGN receiver
+# Description:       OGN receiver - Open Glider Network - http://glidernet.org/ (ntp fix)
+### END INIT INFO
 
 # chkconfig: 2345 98 2
 # description: shellbox service for spawning programs
@@ -8,10 +17,10 @@ export PATH=$PATH:/usr/local/bin
 export HOSTNAME=$(hostname -s)
 
 exe=/usr/bin/procServ
-options="-k ^X --killsig 15 -i ^D -c"
-prog=rtlsdr-flarm
+options="-k ^X --killsig 15 -x ^C -i ^D -c"
+prog=rtlsdr-ogn
 params=
-conf=/etc/rtlsdr-flarm.conf
+conf=/etc/rtlsdr-ogn.conf
 logdir=/var/log/$prog
 shells=/var/run/$prog
 chroot=/mnt/ramdisk

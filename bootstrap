@@ -56,6 +56,7 @@ error() {
     echo -e "\033[31m\033[1m ! $2 \033[0m"
 }
 echo "starting..."
+url="https://ognconfig.onglide.com/files/v2.1"
 
 sudo="sudo"
 which sudo || {
@@ -73,26 +74,30 @@ which sudo || {
 
 	
 
-if [ "$1" == "" ] ; then
-    progress "Adding flarm user and installing as that"
+if [ -z "$1" ]; then
+    progress "Adding ogn user and installing as that"
 
-    if [ ! -e /home/flarm ]; then
+    if [ ! -e /home/ogn ]; then
 
-	sudo useradd -m -G `groups|tr ' ' ,` flarm || {
-	    progress "unable to add flarm user?!"
+	sudo useradd -m -G `groups|tr ' ' ,` ogn || {
+	    progress "unable to add ogn user?!"
 	    exit
 	}
 
-	echo "flarm:flarm" | chpasswd
+	echo "ogn:ogn" | sudo chpasswd
+
+	progress "Updating package information"
+	sudo apt-get update
+	
+	progress "Updating install packages"
+	sudo apt-get -y upgrade
+        sudo apt-get -y dist-upgrade
 
     else
 
-	progress "using existing flarm user"
+	progress "using existing ogn user"
 
     fi
-
-    progress "Updating package information"
-#    sudo apt-get update
 
     progress "Installing menu helper"
     sudo apt-get -y install dialog 
@@ -102,16 +107,24 @@ if [ "$1" == "" ] ; then
     dialog --yesno "Do you wish to upgrade the operating system (highly recommended, but not available on all platforms)" 0 0
     upgrade=$?
 
+    dialog --yesno "Do you wish to enable automatic operating system updates (debian only)?" 0 0
+    autoupgrade=$?
+    
+    dialog --defaultno --yesno "Do you wish to prepare the filesystem for image creation?  (Takes a LONG time, don't bother if you don't need it!)" 0 0
+    cleanup=$?
+
     progress "relaunching script"
     abs_path="$(readlink -f `dirname $0`)/$(basename $0)"
-    exec $sudo su -c "/bin/bash $abs_path $online $upgrade $@" root
+    exec $sudo su -c "/bin/bash $abs_path $online $upgrade $cleanup $autoupgrade $@" root
     exit 0
 fi
 
-upgrade=$2
 
-progress "Updating install packages"
-apt-get -y upgrade
+## capture options
+online=$1
+upgrade=$2
+cleanup=$3
+autoupgrade=$4
 
 if [ "$upgrade" != "1" ] ; then
 
@@ -119,19 +132,10 @@ if [ "$upgrade" != "1" ] ; then
 	progress "Updating Operating System (rpi-update)"
 	rpi-update
 	
-	progress "Blocking unwanted SDR stuff"
-	
-	touch /etc/modprobe.d/rtl-glidernet-blacklist.conf
-	echo "blacklist rtl2832" >> /etc/modprobe.d/rtl-glidernet-blacklist.conf
-	echo "blacklist r820t"  >> /etc/modprobe.d/rtl-glidernet-blacklist.conf
-	echo "blacklist rtl2830"  >> /etc/modprobe.d/rtl-glidernet-blacklist.conf
-	echo "blacklist dvb_usb_rtl28xxu"  >> /etc/modprobe.d/rtl-glidernet-blacklist.conf
-	
 	updated=1
     fi
-    
-    if [ `which do-release-upgrade` != "" ] ; then
-	
+
+    if [ ! -z $(which do-release-upgrade) ] ; then
 	progress "Updating Operating System (do-release-upgrade)"
 	do-release-upgrade
 	
@@ -140,81 +144,93 @@ if [ "$upgrade" != "1" ] ; then
 fi
 
 
-## capture if we are doing online config or not
-online=$1
-
 ## dependencies
 progress "Installing dependencies"
-apt-get -y install git cmake libusb-1.0-0-dev libconfig-dev fftw3-dev libjpeg-dev libconfig9 procserv telnet ntp curl dialog openssl sudo make gcc
+apt-get -y install libusb-1.0-0-dev libconfig-dev fftw3-dev libjpeg-dev libconfig9 procserv telnet ntp curl dialog openssl sudo rtl-sdr
 
-progress "Installing rtlsdr"
-cd /home/flarm
-git clone git://git.osmocom.org/rtl-sdr.git
-cd rtl-sdr/
-mkdir build
-cd build
+cd /home/ogn
 
-if [ -e /dev/udev ]; then
-    cmake ../ -DCMAKE_INSTALL_PREFIX=/usr -DINSTALL_UDEV_RULES=ON
-else
-    cmake ../ -DCMAKE_INSTALL_PREFIX=/usr
-fi
-
-make
- make install
- ldconfig
-cd ../..
+progress "Blocking unwanted SDR stuff"
 
 # make sure the mod probe stuff is blocked properly on the pi
-if [ -e /usr/bin/rpi-update ] ; then
-    progress "Blocking unwanted SDR stuff"
-    
-    touch /etc/modprobe.d/rtl-glidernet-blacklist.conf
-    echo "blacklist rtl2832" >> /etc/modprobe.d/rtl-glidernet-blacklist.conf
-    echo "blacklist r820t"  >> /etc/modprobe.d/rtl-glidernet-blacklist.conf
-    echo "blacklist rtl2830"  >> /etc/modprobe.d/rtl-glidernet-blacklist.conf
-    echo "blacklist dvb_usb_rtl28xxu"  >> /etc/modprobe.d/rtl-glidernet-blacklist.conf
-fi
+# necessary not only on RPi, and wont hurt anyway
+touch /etc/modprobe.d/rtl-glidernet-blacklist.conf
+echo "blacklist rtl2832" >> /etc/modprobe.d/rtl-glidernet-blacklist.conf
+echo "blacklist r820t"  >> /etc/modprobe.d/rtl-glidernet-blacklist.conf
+echo "blacklist rtl2830"  >> /etc/modprobe.d/rtl-glidernet-blacklist.conf
+echo "blacklist dvb_usb_rtl28xxu"  >> /etc/modprobe.d/rtl-glidernet-blacklist.conf
+## davidm: I had to add (one of) these lines as well on my OrangePi running Jessie
+echo "blacklist dvb_usb_rtl2832u"  >> /etc/modprobe.d/rtl-glidernet-blacklist.conf
+echo "blacklist dvb_usb_rtl2830u"  >> /etc/modprobe.d/rtl-glidernet-blacklist.conf	
 
-progress "Adding system startup scripts"
- curl 'http://ognconfig.onglide.com/files/v1.4/rtlsdr-flarm' -R -# -o /etc/init.d/rtlsdr-flarm
- curl 'http://ognconfig.onglide.com/files/v1.4/rtlsdr-flarm.conf' -R -# -o /etc/rtlsdr-flarm.conf
- chmod +x /etc/init.d/rtlsdr-flarm
 
-progress "Installing updater and using it to install RTLSDR"
- curl 'http://ognconfig.onglide.com/files/v1.4/update' -R -# -o /home/flarm/update
- chmod +x /home/flarm/update
- # if we don't have a configuration file then make a dummy one, we also need to make the rtlsdr-flarm
- # symlink or it will get confused
- if [ ! -e /home/flarm/rtlsdr-flarm ] ; then
-     mkdir /home/flarm/rtlsdr-flarm-bootstrap
-     ln -s /home/flarm/rtlsdr-flarm-bootstrap /home/flarm/rtlsdr-flarm
- fi;
- if [ ! -e /home/flarm/rtlsdr-flarm.conf ] ; then 
-     echo "APRS:\n{ Call = \"Bootstrap\";\n" > /home/flarm/rtlsdr-flarm.conf
- fi;
-# this is until we actually have a file that we can install... we copy the correct one later on
- /home/flarm/update -i
-
-# and remove it if we made it - not necessary
-if [ -e /home/flarm/rtlsdr-flarm-bootstrap ] ; then
-    rm -rf /home/flarm/rtlsdr-flarm-bootstrap
+#install libjpeg8 as gsm_scan depends on this
+LIBJPG_OK=$(sudo ldconfig -p | grep libjpeg.so.8)
+if [ "" == "$LIBJPG_OK" ] ; then
+    progress "installing older version of libjpeg for gsm_scan"
+    architecture=`dpkg --print-architecture`
+    curl "http://ftp.nl.debian.org/debian/pool/main/libj/libjpeg8/libjpeg8_8d1-2_"${architecture}".deb" -R -# -o "libjpeg8_8d1-2_"${architecture}".deb"
+    dpkg -i libjpeg8_8d1-2_${architecture}.deb
+    rm  /home/ogn/libjpeg8_8d1-2_${architecture}.deb
 fi;
 
+# 
+progress "Adding system startup scripts"
+ curl "${url}/rtlsdr-ogn" -R -# -o /etc/init.d/rtlsdr-ogn
+ curl "${url}/rtlsdr-ogn.conf" -R -# -o /etc/rtlsdr-ogn.conf
+ curl "${url}/rtlsdr-ogn-app.conf" -R -# -o /home/ogn/rtlsdr-ogn.conf
+ chmod +x /etc/init.d/rtlsdr-ogn
+
+progress "Installing updater and using it to install RTLSDR"
+ curl "${url}/update" -R -# -o /home/ogn/update
+ chmod +x /home/ogn/update
+ # if we don't have a configuration file then make a dummy one, we also need to make the rtlsdr-ogn
+ # symlink or it will get confused
+ if [ ! -e /home/ogn/rtlsdr-ogn ] ; then
+     mkdir /home/ogn/rtlsdr-ogn-bootstrap
+     (cd /home/ogn; ln -s rtlsdr-ogn-bootstrap rtlsdr-ogn)
+ fi;
+ if [ ! -e /home/ogn/rtlsdr-ogn.conf ] ; then 
+     curl "${url}/rtlsdr-ogn-app.conf" -R -# -o /home/ogn/rtlsdr-ogn.conf
+ fi;
+# this is until we actually have a file that we can install... we copy the correct one later on
+ /home/ogn/update -i
+
+# and remove it if we made it - not necessary
+if [ -e /home/ogn/rtlsdr-ogn-bootstrap ] ; then
+    rm -rf /home/ogn/rtlsdr-ogn-bootstrap
+fi;
+
+if [ "$autoupgrade" != "1" ]; then
+    progress "Installing unattended-upgrades helper"
+    apt-get -y install unattended-upgrades
+    dpkg-reconfigure -plow unattended-upgrades
+
+    sed -i '/^Unattended-Upgrade::Origins-Pattern {/a "a=stable";' /etc/apt/apt.conf.d/50unattended-upgrades
+fi;
+    
 progress "Adding startup scripts - this will produce warnings about LSB tabs"
+ curl "${url}/rtlsdr-ogn" -R -# -o /etc/init.d/rtlsdr-ogn
+ curl "${url}/rtlsdr-ogn.conf" -R -# -o /etc/rtlsdr-ogn.conf
+ chmod +x /etc/init.d/rtlsdr-ogn
+ chown ogn /home/ogn/rtlsdr-ogn.conf
 
- curl 'http://ognconfig.onglide.com/files/v1.4/rtlsdr-flarm' -R -# -o /etc/init.d/rtlsdr-flarm
- curl 'http://ognconfig.onglide.com/files/v1.4/rtlsdr-flarm.conf' -R -# -o /etc/rtlsdr-flarm.conf
- chmod +x /etc/init.d/rtlsdr-flarm
- cp rtlsdr-flarm/Example.conf /home/flarm/rtlsdr-flarm.conf
- chown flarm /home/flarm/rtlsdr-flarm.conf
-
-if [ "$online" != "1" ] ; then
-     curl 'http://ognconfig.onglide.com/files/v1.4/httpi' -R -# -o /usr/local/bin/httpi
-     curl 'http://ognconfig.onglide.com/files/v1.4/first-install' -R -# -o /etc/init.d/first-install
+ if [ -e /etc/systemd ] ; then
+    curl "${url}/rtlsdr-ogn.service" -R -# -o /etc/systemd/system/rtlsdr-ogn.service
+ fi;
+ 
+ if [ "$online" != "1" ] ; then
+     curl "${url}/httpi" -R -# -o /usr/local/bin/httpi
+     curl "${url}/first-install" -R -# -o /etc/init.d/first-install
      chmod +x /etc/init.d/first-install /usr/local/bin/httpi
-     update-rc.d first-install defaults
-     update-rc.d rtlsdr-flarm remove
+     ##new systemctl calls
+     if [ -e /etc/systemd ] ; then
+         systemctl enable first-install
+         systemctl disable rtlsdr-ogn.service
+     else
+	 update-rc.d first-install defaults
+	 update-rc.d rtlsdr-ogn remove
+     fi
      touch /etc/ssh/ssh_host_keyswrong    
 
     progress "Done.  Please reboot your device.  You will be able to configure it at http://ognconfig.onglide.com when it reboots"
@@ -224,17 +240,86 @@ if [ "$online" != "1" ] ; then
 	error "You may need to upgrade your operating system as well"
     fi
 
+    
+    ## clean up the file system
+    if [ "$cleanup" != "1" ]; then
+	
+	progress "installing wifi user and settings"
+	echo ""
+	
+	apt-get -y install wicd-curses
+	echo "/usr/bin/wicd-curses" >> /etc/shells
+
+	useradd -G netdev wifi
+	echo "wifi:wifi" | chpasswd
+
+	chsh -s /usr/bin/wicd-curses wifi
+			
+	echo "PermitRootLogin no " >> /etc/ssh/sshd_config
+	
+	progress "removing unwanted packages"
+	apt-get -y install localepurge deborphan
+	localepurge
+	
+	for dopurge in 'libx11-.*' 'g[+][+].*' 'cpp-4.6' 'libcdparanoia' '.*gtk' '.*gstreamer' 'gcc-4.6$' 'ttf-.*' 'cmake.*' 'git.*' 'pistore.*' 'gdb.*' 'info.*' 'man.*' 'debian-reference.*' 'oracle-java8.*'
+	do
+	    echo ">>>>>>>>> $dopurge >>>>>>>>>"
+	    apt-get -y remove -y --auto-remove --purge "^$dopurge"
+	done
+	echo ">>>done"
+
+#	apt-get -y remove -y `deborphan`
+	echo "deborphan done"
+
+	apt-get -y remove dphys-swapfile
+	rm /var/swap
+	rm /home/pi/python_games
+	echo "autoremove start"
+	apt-get autoremove
+	echo "autoclean remove"
+	apt-get autoclean
+	echo "autoclean done"
+	apt-get clean
+	rm -rf /var/cache/apt
+	rm /home/ogn/rtlsdr-ogn/*jpg
+
+	if [ `grep -c tmpfs /etc/fstab` -eq 0 ]; then
+	    progress "setting up tmpfs for /var and /tmp"
+	    echo "tmpfs           /tmp            tmpfs   defaults,size=30M    0       0" >> /etc/fstab
+	    echo "tmpfs           /var/log        tmpfs   defaults,size=30M    0       0" >> /etc/fstab
+	fi
+
+	rm -rf /var/log/*
+	rm -rf /var/cache/apt/* /var/cache/man /var/cache/fontconfig
+	rm /var/cache/debconf/*old /var/lib/dpkg/*old
+	rm -rf /var/lib/apt 
+	rm -rf /boot.bak
+	rm -rf /home/pi/.bash_history /home/pi/bootstrap /home/pi/.aptitude
+
+	currentdate=`date "+%y%m%d%H%M"`
+	date -s 150101; echo "wifi:wifi" | chpasswd; echo "ogn:ogn" | chpasswd ; echo "pi:raspberry" | chpasswd;
+	print "passwords reset to default! pi/raspberry ogn/ogn wifi/wifi"
+	date -s $currentdate
+
+    fi
+
     exit
-fi
+ fi;
 
-update-rc.d rtlsdr-flarm defaults
-update-rc.d first-install remove
-
-progress "You device is ready for configuration.  Please edit the configuration file: /home/flarm/rtlsdr-flarm.conf"
+ ##new systemctl calls
+ if [ -e /etc/systemd ] ; then
+     systemctl enable rtlsdr-ogn.service
+     systemctl disable first-install
+ else
+     update-rc.d rtlsdr-ogn defaults
+     update-rc.d first-install remove
+ fi
+ 
+progress "You device is ready for configuration.  Please edit the configuration file: /home/ogn/rtlsdr-ogn.conf"
 progress "And then reboot"
 
 if [ $updated != "1" ] ; then
     error "You may need to upgrade your operating system as well"
-fi
+fi;
 
 
