@@ -74,25 +74,28 @@ which sudo || {
 	
 
 if [ "$1" == "" ] ; then
-    progress "Adding flarm user and installing as that"
+    progress "Adding ogn user and installing as that"
 
-    if [ ! -e /home/flarm ]; then
+    if [ ! -e /home/ogn ]; then
 
-	sudo useradd -m -G `groups|tr ' ' ,` flarm || {
-	    progress "unable to add flarm user?!"
+	sudo useradd -m -G `groups|tr ' ' ,` ogn || {
+	    progress "unable to add ogn user?!"
 	    exit
 	}
 
-	echo "flarm:flarm" | chpasswd
+	echo "ogn:ogn" | sudo chpasswd
+
+	progress "Updating package information"
+	sudo apt-get update
+	
+	progress "Updating install packages"
+	sudo apt-get -y upgrade
 
     else
 
-	progress "using existing flarm user"
+	progress "using existing ogn user"
 
     fi
-
-    progress "Updating package information"
-#    sudo apt-get update
 
     progress "Installing menu helper"
     sudo apt-get -y install dialog 
@@ -109,9 +112,6 @@ if [ "$1" == "" ] ; then
 fi
 
 upgrade=$2
-
-progress "Updating install packages"
-apt-get -y upgrade
 
 if [ "$upgrade" != "1" ] ; then
 
@@ -148,7 +148,7 @@ progress "Installing dependencies"
 apt-get -y install git cmake libusb-1.0-0-dev libconfig-dev fftw3-dev libjpeg-dev libconfig9 procserv telnet ntp curl dialog openssl sudo make gcc
 
 progress "Installing rtlsdr"
-cd /home/flarm
+cd /home/ogn
 git clone git://git.osmocom.org/rtl-sdr.git
 cd rtl-sdr/
 mkdir build
@@ -177,47 +177,47 @@ if [ -e /usr/bin/rpi-update ] ; then
 fi
 
 progress "Adding system startup scripts"
- curl 'http://ognconfig.onglide.com/files/v1.4/rtlsdr-flarm' -R -# -o /etc/init.d/rtlsdr-flarm
- curl 'http://ognconfig.onglide.com/files/v1.4/rtlsdr-flarm.conf' -R -# -o /etc/rtlsdr-flarm.conf
- chmod +x /etc/init.d/rtlsdr-flarm
+ curl 'https://ognconfig.onglide.com/files/v2.0/rtlsdr-ogn' -R -# -o /etc/init.d/rtlsdr-ogn
+ curl 'https://ognconfig.onglide.com/files/v2.0/rtlsdr-ogn.conf' -R -# -o /etc/rtlsdr-ogn.conf
+ chmod +x /etc/init.d/rtlsdr-ogn
 
 progress "Installing updater and using it to install RTLSDR"
- curl 'http://ognconfig.onglide.com/files/v1.4/update' -R -# -o /home/flarm/update
- chmod +x /home/flarm/update
- # if we don't have a configuration file then make a dummy one, we also need to make the rtlsdr-flarm
+ curl 'https://ognconfig.onglide.com/files/v2.0/update' -R -# -o /home/ogn/update
+ chmod +x /home/ogn/update
+ # if we don't have a configuration file then make a dummy one, we also need to make the rtlsdr-ogn
  # symlink or it will get confused
- if [ ! -e /home/flarm/rtlsdr-flarm ] ; then
-     mkdir /home/flarm/rtlsdr-flarm-bootstrap
-     ln -s /home/flarm/rtlsdr-flarm-bootstrap /home/flarm/rtlsdr-flarm
+ if [ ! -e /home/ogn/rtlsdr-ogn ] ; then
+     mkdir /home/ogn/rtlsdr-ogn-bootstrap
+     (cd /home/ogn; ln -s rtlsdr-ogn-bootstrap rtlsdr-ogn)
  fi;
- if [ ! -e /home/flarm/rtlsdr-flarm.conf ] ; then 
-     echo "APRS:\n{ Call = \"Bootstrap\";\n" > /home/flarm/rtlsdr-flarm.conf
+ if [ ! -e /home/ogn/rtlsdr-ogn.conf ] ; then 
+     echo "APRS:\n{ Call = \"BootstrapRequired\";\n" > /home/ogn/rtlsdr-ogn.conf
  fi;
 # this is until we actually have a file that we can install... we copy the correct one later on
- /home/flarm/update -i
+ /home/ogn/update -i
 
 # and remove it if we made it - not necessary
-if [ -e /home/flarm/rtlsdr-flarm-bootstrap ] ; then
-    rm -rf /home/flarm/rtlsdr-flarm-bootstrap
+if [ -e /home/ogn/rtlsdr-ogn-bootstrap ] ; then
+    rm -rf /home/ogn/rtlsdr-ogn-bootstrap
 fi;
 
 progress "Adding startup scripts - this will produce warnings about LSB tabs"
 
- curl 'http://ognconfig.onglide.com/files/v1.4/rtlsdr-flarm' -R -# -o /etc/init.d/rtlsdr-flarm
- curl 'http://ognconfig.onglide.com/files/v1.4/rtlsdr-flarm.conf' -R -# -o /etc/rtlsdr-flarm.conf
- chmod +x /etc/init.d/rtlsdr-flarm
- cp rtlsdr-flarm/Example.conf /home/flarm/rtlsdr-flarm.conf
- chown flarm /home/flarm/rtlsdr-flarm.conf
+ curl 'https://ognconfig.onglide.com/files/v2.0/rtlsdr-ogn' -R -# -o /etc/init.d/rtlsdr-ogn
+ curl 'https://ognconfig.onglide.com/files/v2.0/rtlsdr-ogn.conf' -R -# -o /etc/rtlsdr-ogn.conf
+ chmod +x /etc/init.d/rtlsdr-ogn
+ cp rtlsdr-ogn/Template.conf /home/ogn/rtlsdr-ogn.conf
+ chown ogn /home/ogn/rtlsdr-ogn.conf
 
 if [ "$online" != "1" ] ; then
-     curl 'http://ognconfig.onglide.com/files/v1.4/httpi' -R -# -o /usr/local/bin/httpi
-     curl 'http://ognconfig.onglide.com/files/v1.4/first-install' -R -# -o /etc/init.d/first-install
+     curl 'https://ognconfig.onglide.com/files/v2.0/httpi' -R -# -o /usr/local/bin/httpi
+     curl 'https://ognconfig.onglide.com/files/v2.0/first-install' -R -# -o /etc/init.d/first-install
      chmod +x /etc/init.d/first-install /usr/local/bin/httpi
      update-rc.d first-install defaults
-     update-rc.d rtlsdr-flarm remove
+     update-rc.d rtlsdr-ogn remove
      touch /etc/ssh/ssh_host_keyswrong    
 
-    progress "Done.  Please reboot your device.  You will be able to configure it at http://ognconfig.onglide.com when it reboots"
+    progress "Done.  Please reboot your device.  You will be able to configure it at https://ognconfig.onglide.com when it reboots"
     progress "Also, you may wish to update your operating system"
 
     if [ "$updated" != "1" ] ; then
@@ -227,10 +227,10 @@ if [ "$online" != "1" ] ; then
     exit
 fi
 
-update-rc.d rtlsdr-flarm defaults
+update-rc.d rtlsdr-ogn defaults
 update-rc.d first-install remove
 
-progress "You device is ready for configuration.  Please edit the configuration file: /home/flarm/rtlsdr-flarm.conf"
+progress "You device is ready for configuration.  Please edit the configuration file: /home/ogn/rtlsdr-ogn.conf"
 progress "And then reboot"
 
 if [ $updated != "1" ] ; then

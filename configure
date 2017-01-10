@@ -48,8 +48,8 @@
 use strict;
 use File::Copy;
 
-my $version = '1.4f';
-my $pwepoch = 1414195200; # on linux date  -d '10/25/2014' '+%s', on bsd date -f '%m/%d/%Y' -j '+%s' '1/1/2000'
+my $version = '2.0d';
+my $pwepoch = 1428964689; # on linux date  -d '10/25/2014' '+%s', on bsd date -f '%m/%d/%Y' -j '+%s' '1/1/2000'
 # this is the day after the build image was built - to make sure we can detect changed passwords.  You need to
 # wait at least a day before releasing otherwise the check may fail!
 
@@ -87,32 +87,27 @@ chomp($password);chomp($setuppassword);
 
 my $reducedcontent;
 
-status( "obsolete", '', '' );
-output_screen( "I'm sorry this version of first-install/configure is now obsolete.\n\nIf it is possible it is recommended that you re-install \n".
-	       "using a later version of the CD image or bootstrap\n\nIf not please search/post on the openglidernetwork google group for help\n" );
-exit;
-
 # colours
 my $og = "\033[32m";
 my $cg = "\033[0m";
 my $or = "\033[31m";
 my $cr = $cg;
-my $number_running = qx(  ps aux | grep flarm.configure | wc -l ); chomp( $number_running );
+my $number_running = qx(  ps aux | grep ogn.configure | wc -l ); chomp( $number_running );
 if( $number_running > 3 ) {
-    qx( ps aux | grep flarm.configure > /tmp/ps.out );
+    qx( ps aux | grep ogn.configure > /tmp/ps.out );
     status( "too many", 'ps', '/tmp/ps.out' );
 
     output_screen( "configure appears to already be running ($number_running).\n\n".
 		   "It will start automatically when the device boots, ".
 		   "running it twice at the same time will cause things to break and possibly kick you out of ".
 		   "your device.\n\n".
-		   "Please check the website http://ognconfig.onglide.com/ and see if your device is".
+		   "Please check the website https://ognconfig.onglide.com/ and see if your device is".
 		   "listed there.\n\n" );
    exit;
 }
     
 # stop the sdr process if it was running, this is needed so we can start the webserver
-qx( /usr/bin/sudo /usr/sbin/service rtlsdr-flarm stop );
+qx( /usr/bin/sudo /usr/sbin/service rtlsdr-ogn stop );
 
 # make sure the webserver is running as we will need it, even if they are running from the command line
 system( "/usr/bin/sudo /usr/local/bin/httpi 2>/dev/null");
@@ -120,7 +115,7 @@ system( "/usr/bin/sudo /usr/local/bin/httpi 2>/dev/null");
 # remove the incorrectly left reboot and update, don't want them running while we are installing
 qx( /usr/bin/crontab -u root -l | /bin/grep -v reboot | /bin/grep -v update | /usr/bin/crontab -u root - );
 
-print "<!DOCTYPE html>\r\n<html><head><title>RTLSDR-Flarm Configuration Tool Client</title>".
+print "<!DOCTYPE html>\r\n<html><head><title>RTLSDR-Ogn Configuration Tool Client</title>".
     '<meta http-equiv="refresh" content="5">'.
     '</head><body>';
 
@@ -128,7 +123,7 @@ print "<!DOCTYPE html>\r\n<html><head><title>RTLSDR-Flarm Configuration Tool Cli
 output( '<h2>Welcome to the Open Glider Network Configuration Helper</h2>'.
 	'version '.$version.'<br/>');
 
-output_screen('<p>This tool allows you to configure your flarm receiver using a web browser.</p>'.
+output_screen('<p>This tool allows you to configure your ogn receiver using a web browser.</p>'.
 	      '<p>Go to <b>https://ognconfig.onglide.com/configuration.html#'.$token.'</b> to enter the site details</p>'.
 	      "<p>While you do that we will scan for the strongest GSM channel and adjust your gain settings...<br/>".
 	      "Please make sure you have your antenna installed!</p>".
@@ -156,7 +151,7 @@ my $ipstring = '/';
     open JH, ">", "/tmp/htdocs/ogn_configure_callback.js";
     print JH "ogn_callback( $uniqueid, '$token' );\r\n";
     close JH;
-    qx( /bin/chown flarm:flarm /tmp/htdocs/ogn_configure_callback.js );
+    qx( /bin/chown ogn:ogn /tmp/htdocs/ogn_configure_callback.js );
 }
 
 output( "checking if ssh keys need to be regenerated:" );
@@ -212,7 +207,7 @@ if( ! $stopScanning ) {
     if( $freq ) {
 	$config{RF_FreqCorr} = $ppm;
 	$config{RF_GSM_Gain} = $gain;
-	$config{RF_FLARM_Gain} = $gain < 50 ? $gain + 20 : $gain;
+#	$config{RF_FLARM_Gain} = $gain < 50 ? $gain + 20 : $gain;
 	$config{RF_GSM_CenterFreq} = $freq;
 
 	# save the new scan results
@@ -249,7 +244,7 @@ if( ($new_config{not_found}||0) ) {
     output( "<hr/><h3>No online configuration has been found!</h3><br/>".
 	    "We will wait until you complete this before continuing.<br/>".
 	    "If you have saved your configuration and it doesn't appear here automatically try refreshing the page.<br/>",
-	    "If you haven't then please visit <a href='http://ognconfig.onglide.com/configuration.html#$token'>http://ognconfig.onglide.com/configuration.html#$token</a> to complete the configuration.<br/>");
+	    "If you haven't then please visit <a href='https://ognconfig.onglide.com/configuration.html#$token'>https://ognconfig.onglide.com/configuration.html#$token</a> to complete the configuration.<br/>");
 
     do {
 	qx( curl -s https://ognconfig.onglide.com/perl/startconfiguration.pl?token=$token$ipstring\\&status=waiting );
@@ -281,16 +276,23 @@ if( ! $stopScanning ) {
 
     # change what is going to run on reboot
     qx( /usr/bin/sudo /usr/sbin/update-rc.d -f first-install remove );
-    qx( /usr/bin/sudo /usr/sbin/update-rc.d -f rtlsdr-flarm defaults 2>/dev/null);
+    qx( /usr/bin/sudo /usr/sbin/update-rc.d -f rtlsdr-ogn defaults 2>/dev/null);
 
     # make sure the software is updated
-    qx( /usr/bin/sudo /home/flarm/update -i 2>/dev/null);
+    qx( /usr/bin/sudo /home/ogn/update -i 2>/dev/null);
+
+    # save the hostname
+#    if( $new_config{station} =~ /^[a-z0-9]+$/i ) {
+#	my $existinghost = qx( hostname -s ); chomp( $existinghost );
+#	qx( echo "ogn-$new_config{station}" > /etc/hostname );
+#	qx( sed -i "/$existinghost/ s/$existinghost/ogn-$new_config{station}/" /etc/hosts );
+#   }
 
    # output all the addresses
     my @macs = qx( /sbin/ifconfig | /usr/bin/awk '/Loopback/ {\$0=""} /Link encap/ { print \$1" has a MAC address of " \$5 }' );
 
-    my ($flarmuser,$wifiuser,$piuser) = (1,1,1);
-    $flarmuser = system( 'echo "flarm:'.$password.'" | /usr/sbin/chpasswd' ) if( ! check_pw_changed( 'flarm' ));
+    my ($ognuser,$wifiuser,$piuser) = (1,1,1);
+    $ognuser = system( 'echo "ogn:'.$password.'" | /usr/sbin/chpasswd' ) if( ! check_pw_changed( 'ogn' ));
     $wifiuser = system( 'echo "wifi:'.$setuppassword.'" | /usr/sbin/chpasswd' ) if ( ! check_pw_changed( 'wifi' ));
     $piuser = system( 'echo "pi:'.$password.'" | /usr/sbin/chpasswd' ) if ( ! check_pw_changed( 'pi' ));
 
@@ -303,7 +305,7 @@ if( ! $stopScanning ) {
     close JH;
 
     open(STDOUT, '>', "/tmp/htdocs/index.html");
-    print "<html><head><title>RTLSDR-Flarm Configuration Tool Client</title>".
+    print "<html><head><title>RTLSDR-Ogn Configuration Tool Client</title>".
 	'</head><body>';
 
     output(    '<h2>Welcome to the Open Glider Network Configuration Helper</h2>'.
@@ -315,8 +317,8 @@ if( ! $stopScanning ) {
 	       "Configuration was saved at ".$new_config{time}." UTC</p>" );
     
     output( "<h3>" );
-    if( $flarmuser == 0 ) {
-	output( "The <b>flarm</b> user password has been changed to <b>$password</b> please login and change this!<br/>" );
+    if( $ognuser == 0 ) {
+	output( "The <b>ogn</b> user password has been changed to <b>$password</b> please login and change this!<br/>" );
     }
     if( $piuser == 0 ) { 
 	output( "The <b>pi</b> user password has been changed to <b>$password</b> please login and change this!<br/>");
@@ -333,7 +335,7 @@ if( ! $stopScanning ) {
     
     # how to login and reconfigure
     output( "</div><br/><hr/>If you wish to re-run this installation please login to the device using <b>ssh</b>" );
-    if( $flarmuser == 0 || $piuser == 0 ) {
+    if( $ognuser == 0 || $piuser == 0 ) {
 	output( "and the username and password above." );
     }
     output( "<br/>Then type <b>sudo service first-install start</b> <br/>" );
@@ -344,7 +346,7 @@ if( ! $stopScanning ) {
     select ($old_handle); 
 
     output( "<br/><br/>".
-	    "<b style='color:green'>Configuration complete! You need to reboot your device now to start the flarm receiver (power cord will do just fine)</b>\n" );
+	    "<b style='color:green'>Configuration complete! You need to reboot your device now to start the ogn receiver (power cord will do just fine)</b>\n" );
 
     close(STDOUT);
 
@@ -377,6 +379,11 @@ sub check_pw_changed {
 sub gsm_scan {
     my ($ppm,$gain) = @_;
 
+    # if we are interactive and therefore don't need to scan
+    if( ($ARGV[0]||'') eq '-i' ) {
+	return ($config{RF_FreqCorr}, $config{RF_GSM_Gain}, $config{RF_GSM_CenterFreq});
+    }
+
     my $lastcount;
     my $bestfrequency = 0;
     my $beststrength = 0;
@@ -392,15 +399,17 @@ sub gsm_scan {
     if( $gain > 40 ) {
 	$gain = 40;
     }
+
+    my $loops = 0;
     
     # anything more than 70 is too much, less than 15 means something is wrong
-    while( $gain < 70 && $gain > 10 && ! $stopScanning ) {
+    while( $gain < 75 && $gain > 10 && ! $stopScanning ) {
 	my $previousppm = $ppm;
 	my %frequencies;
-	
-	output( "scanning at gain $gain and offset adjustment $ppm: ");
+	$loops++;
+	output( "$loops: scanning at gain $gain and offset adjustment $ppm: ");
 
-	my @result = qx( /home/flarm/rtlsdr-flarm/gsm_scan --ppm $ppm --gain $gain 2>/dev/null);
+	my @result = qx( /home/ogn/rtlsdr-ogn/gsm_scan --ppm $ppm --gain $gain 2>/dev/null);
 	
 	# check to make sure we got enough to do something with
         if( grep /Not enough data was collected: please retry with higher gain to catch more GSM signals/, @result) {
@@ -413,7 +422,7 @@ sub gsm_scan {
 	    # if we have hit a high gain then try with a different ppm
 	    if( $nochannelsever && $gain > 60 && $ppmretry < 9 ) {
 		$gain = 40;
-		$ppm = ($ppm + 80) % 99;
+		$ppm = ($ppm + 30)%95;  if( $ppm < 12 ) { $ppm = 0; }
 		$ppmretry++;
 		output( "<br/>Checking with a different ppm adjustment to see if initial estimate was too far off<br/>" );
 	    }
@@ -429,6 +438,7 @@ sub gsm_scan {
 	    $ppm = $1+0;
 	    if( abs($ppm-$previousppm) > 1 ) {
 		$ppmchanged = 1;
+		$gain = 25;
 		output( "re-scanning with new ppm adjustment<br/>");
 		next;
 	    }
@@ -477,7 +487,7 @@ sub gsm_scan {
 
 	output( "best frequency is $best[0] @ ".(int($frequencies{$best[0]}*10)/10)." (weighted)<br/>" );
 
-	if( $frequencies{$best[0]} < ($beststrength+2.4) && ! $ppmchanged ) {
+	if( $frequencies{$best[0]} < ($beststrength+2.4) && ! $ppmchanged && $loops > 1 ) {
 	    output( "Previous scan was better, will configure using gain of $previousgain and frequency $bestfrequency, ppm adjustment of $ppm<br/>");
 	    return ($ppm, $previousgain, $bestfrequency ); #previousppm?  seems to settle closer to right using current
 	}
@@ -501,15 +511,15 @@ sub read_config {
     my @sections;
 
     # if the configuration file is empty or doesn't exist then we need to 
-    if( ! -e '/home/flarm/rtlsdr-flarm.conf' || -z '/home/flarm/rtlsdr-flarm.conf' ) {
-	output( "Copying Example.conf as configuration file appears to be missing<br/>" );
-	status( "using example.conf" );
-	copy( '/home/flarm/rtlsdr-flarm/Example.conf', '/home/flarm/rtlsdr-flarm.conf' );
+    if( ! -e '/home/ogn/rtlsdr-ogn.conf' || -z '/home/ogn/rtlsdr-ogn.conf' ) {
+	output( "Copying Template.conf as configuration file appears to be missing<br/>" );
+	status( "using template.conf" );
+	copy( '/home/ogn/rtlsdr-ogn/Template.conf', '/home/ogn/rtlsdr-ogn.conf' );
     }
 	
 
     # read it into the hash
-    open( my $fh, '<', "/home/flarm/rtlsdr-flarm.conf" ) || die "unable to open configuration file";
+    open( my $fh, '<', "/home/ogn/rtlsdr-ogn.conf" ) || die "unable to open configuration file";
     while( <$fh> ) {
 	my $line = $_;
 	chomp $line;
@@ -533,15 +543,15 @@ sub read_config {
     close ($fh);
 
     # send the status to the server
-    status( "read", 'configuration', '/home/flarm/rtlsdr-flarm.conf' );
+    status( "read", 'configuration', '/home/ogn/rtlsdr-ogn.conf' );
 }
 
 sub write_config {
     my $depth = '';
     my $first =0;
-    copy( '/home/flarm/rtlsdr-flarm.conf', '/home/flarm/rtlsdr-flarm/rtlsdr-flarm.conf.'.date(time()));
+    copy( '/home/ogn/rtlsdr-ogn.conf', '/home/ogn/rtlsdr-ogn/rtlsdr-ogn.conf.'.date(time()));
     
-    if( ! open( FH, '>', "/home/flarm/rtlsdr-flarm.conf" ) ) {
+    if( ! open( FH, '>', "/home/ogn/rtlsdr-ogn.conf" ) ) {
 	qx( curl -s https://ognconfig.onglide.com/perl/startconfiguration.pl?token=$token$ipstring\\&status=error );
 	status( "write failed $!" );
 	output( "<h1>Unable to write to configuration file! error: $!</h1>" );
@@ -576,10 +586,10 @@ sub write_config {
 
     close(FH);
 
-    status( "write", 'configuration', '/home/flarm/rtlsdr-flarm.conf' );
+    status( "write", 'configuration', '/home/ogn/rtlsdr-ogn.conf' );
 
     # make sure we can read the newly written file
-    qx( /bin/chown flarm /home/flarm/rtlsdr-flarm.conf );
+    qx( /bin/chown ogn:ogn /home/ogn/rtlsdr-ogn.conf );
 	    
 }
 

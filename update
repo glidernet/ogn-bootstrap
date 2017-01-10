@@ -13,10 +13,9 @@ use File::stat;
 use Cwd;
 
 # to make sure the file was downloaded properly
-# md5sum d70a49430a45112b7b2a2c8d7824114d dYkZi4yjkHLeyd8I3mBeTUjFCUqnclHMnGnFo1PxOpQQdkc16PF4cHUkCLvkIAN4YN4Cdzv2wPIX8P2/jYAGJWbC9x04Vl7zjUlzOH6GMbjQNENAO0HkmgyaQOVEzavQIB2ggPHB8RRZuZenvkVrD+txlGPaXbPxSL8JRR7pO+LJe65c0ks7UZB8kQZQJlQyWsQTEpHTjDBPUi4XuZF88i23v3YDyQyOEHHvRNFVTWlGKn7g6hy9ybLnBLnmvdBI+pgg3GP/iDNVHpgWuFTts4zgnyq/gjSC58u8PygEX4TGmSGcSsDWwrGZ3xivYZkgvKXGsx8J68ijXqo5UzYPvQ==
+# md5sum 7e53a756af842dc27d2653eece0934e4 UtiXGNH/qKhf6g1acDQ6fIT31wAgELdM/2lwzvm+RyTuioosoSzg3IkJ6uzk+ZT+tVIUVjdCe732OI4GwwPAneJEOYOPC+jEZPPcagrxRm9BNEFThNYsrOt0IZcqIq6xaBzkYAt0MogXzdy8VpuX/S/C/WQT0xnaikw2U9F5O4EtPviAkLzL1B8A42TFz52SOoZYXP8Oxzpx3AIFJ5T3megDm3LzXdf5+lufpWeNFaWP1edEstYvqSdjFOrdL/6YYZU4UZ2ZQCGfBubrr8T13vO4VPeGcw7X57cUXwAiUpwHuFr9Ko/hHQhPzsstIurfAm0m+06pbj/eEFtnC5qnpQ==
 
-
-my $version='1.4i';
+my $version='2.0k';
 
 my $old_handle = select (STDOUT);
 $| = 1; # perform flush after each write to STDOUT
@@ -42,6 +41,9 @@ if( $> != 0 ) {
     die "You need to run this as root, or use sudo";
 }
 
+# The image version was not good and would sit waiting for a LONG time, use the one from 1.3
+my $startupepoch = 1429006250; # on linux date  -d '10/25/2014' '+%s', on bsd date -f '%m/%d/%Y' -j '+%s' '1/1/2000'
+
 # old style tokens
 if( -e '/home/pi/sitetoken.txt' ) {
     move( '/home/pi/sitetoken.txt', '/etc/sitetoken.txt' );
@@ -61,15 +63,25 @@ else {
 
 ## exit when a script update is found
 print "Checking for updates to update script ($scriptname, existing version $version)... ";
-die "Unable to identify script name ($scriptname)" if( ! -e $scriptname );
+if( ! -e $scriptname ) {
+    status( "scriptnamewrong,$scriptname" );
+    die "Unable to identify script name ($scriptname)" ;
+}
+
 {
     my $lasttime = stat($scriptname)->mtime;
     my $currenttime;
-    my $tempname = '/tmp/update.'.date(time());
-    system( "/usr/bin/curl -s -R -z $scriptname http://ognconfig.onglide.com/files/v1.4/update -# -o $tempname" );
+    
+    my $tempname = '/tmp/update.temporary';
+    unlink( $tempname );
+    
+    system( "/usr/bin/curl -s -R https://ognconfig.onglide.com/files/v2.1/update -# -o $tempname" );
 
-    if( -e $tempname ) {
+    if( -e "$tempname" ) {
 	$currenttime = stat($tempname)->mtime;
+    }
+    else {
+	status("error,no_temp_file");
     }
 
     if( defined( $currenttime ) && $lasttime != $currenttime ) {
@@ -90,7 +102,14 @@ die "Unable to identify script name ($scriptname)" if( ! -e $scriptname );
 	    # we need to check to make sure we have our public key saved away, without this 
 	    # we can't validate the identify
 	    {
-		open( OUT, '>', '/etc/flarmupdatekey.pem' ) || die "unable to write public key";
+		if( ! open( OUT, '>', '/etc/ognupdatekey.pem' ) )  {
+		    status("error,write,/etc/ognupdatekey.pem,$!");
+
+		    if( ! -e '/etc/ognupdatekey.pem' ) {
+			status("error,nokey");
+		    }
+		}
+		
 		print OUT "-----BEGIN PUBLIC KEY-----\n".
 		    "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArG/od7cdIuhSvKXNbO80\n".
 		    "tFncaCfwuKUrBGxGE6uxzXRfwcCIn8UukGTnzdMEErh441K+itC69KhgkEhY809K\n".
@@ -103,9 +122,15 @@ die "Unable to identify script name ($scriptname)" if( ! -e $scriptname );
 		close( OUT );
 	    }
 
-	    # execute openssl to check signature
-	    my $md5sum_signed = qx( echo "$signature" | /usr/bin/base64 -d | /usr/bin/openssl rsautl -verify -inkey /etc/flarmupdatekey.pem -keyform PEM -pubin );
+	    # execute openssl to 
+	    my $md5sum_signed = qx( echo "$signature" | /usr/bin/base64 -d | /usr/bin/openssl rsautl -verify -inkey /etc/ognupdatekey.pem -keyform PEM -pubin );
 	    chomp( $md5sum_signed );
+
+	    if( ! -e '/etc/ognupdatekey.pem' ) {
+		$md5sum_signed = $md5sum_calculated;
+		status("not_checking_signature");
+		print "*** Not Checking signature as no pem file exists ***\n";
+	    }
 
 	    # make sure it matches
 	    if( defined( $md5sum_signed ) && $md5sum_signed eq $md5sum_calculated ) {
@@ -123,10 +148,10 @@ die "Unable to identify script name ($scriptname)" if( ! -e $scriptname );
 		    status( "scriptupdate" );
 		    print "an update has been found, restarting script.\n";
 		    exec $scriptname, @ARGV ;
-		}
+		}		
 		else {
-		    print "already up to date, your time is wrong!\n";
-		    status( "localdatetimeproblem" );
+		    print "already up to date\n";
+		    status( "uptodate,$current_md5sum" );
 		}
 	    }
 	    else {
@@ -151,9 +176,9 @@ die "Unable to identify script name ($scriptname)" if( ! -e $scriptname );
 
 ## Make sure we have the correct procServer configuration file before we do anything as it 
 # won't work without it!
-if( ! -e '/etc/rtlsdr-flarm.conf' ) {
+if( ! -e '/etc/rtlsdr-ogn.conf' ) {
     status( 'noconfig' );
-    die "Unable to find /etc/rtlsdr-flarm.conf\n";
+    die "Unable to find /etc/rtlsdr-ogn.conf\n";
 }
 
 if( $ARGV[0] eq '-t' ) {
@@ -176,7 +201,10 @@ else {
 	$reboot = '-r';
     }
     my $when = sprintf( "%d %d", int(rand(59)), (int(rand(7))+23)%24 );
-    open( OUT, "| /usr/bin/crontab -u root -" ) || die "unable to write to crontab to install";
+    if( ! open( OUT, "| /usr/bin/crontab -u root -" )) {
+	status("error,write,crontab,$!");
+	die "unable to write to crontab to install";
+    }
     print OUT $check;
     print OUT "$when * * * $scriptname $reboot\n";
     close( OUT );
@@ -193,12 +221,16 @@ my %config_description;
 # next check for daemon startup script and extra details from that
 my $installdirectory;
 my $username;
-my $configfile;# if you need to copy it from /tmp/rtlsdr-flarm.site.conf after the upgrade
+my $configfile;# if you need to copy it from /tmp/rtlsdr-ogn.site.conf after the upgrade
 
 my $os; my $processor;
 
 {
-    open( my $fh, '<', "/etc/rtlsdr-flarm.conf" ) || die "Unable to read /etc/rtlsdr-flarm.conf";
+    my $fh;
+    if( ! open( $fh, '<', "/etc/rtlsdr-ogn.conf" )) {
+	status("error,open,/etc/rtlsdr-ogn.conf,$!");
+	die "Unable to read /etc/rtlsdr-ogn.conf";
+    }
     while( <$fh> ) {
         my $line = $_;
         chomp $line;
@@ -210,24 +242,23 @@ my $os; my $processor;
     }
 
     # sanity check
-    if( ! ($installdirectory =~ m|/rtlsdr-flarm$|) ) {
+    if( ! ($installdirectory =~ m|/rtlsdr-ogn$|) ) {
 	status('failed/idir');
-	die "Please change your /etc/rtlsdr-flarm.conf to point to the rtlsdr-flarm directory rather than a version specific directory.";
+	die "Please change your /etc/rtlsdr-ogn.conf to point to the rtlsdr-ogn directory rather than a version specific directory.";
     }
 
     # remove the rtlsdr as this is included in the original distributions
     my $installeddirectory = $installdirectory;
-    $installdirectory =~ s/rtlsdr-flarm$//;
+    $installdirectory =~ s/rtlsdr-ogn$//;
     $installdirectory =~ s|/$||;
 
-    # exactly where is the config file, find it the same way the flarm process would - change into the directory
+    # exactly where is the config file, find it the same way the ogn process would - change into the directory
     # and then convert to an absolute path
     chdir $installeddirectory;
     my $expandedconfigfile = Cwd::abs_path( $configfile );
-    copy( $expandedconfigfile, "/tmp/rtlsdr-ogn.conf.site" );
+    copy( $expandedconfigfile, "/tmp/rtlsdr-ogn.site.conf" );
     chdir $installdirectory;
 
-    print "$expandedconfigfile\n";
     read_config();
     $aprscall = $config{APRS_Call}||'unknown';
     $aprscall =~ s/"//g;
@@ -242,10 +273,12 @@ my $os; my $processor;
 
     # next step is to check which install it is
     $processor = qx( /bin/uname -p );
+    my $hardware = qx( cat /proc/cpuinfo | grep Hardware ); 
     $os = qx( /bin/uname -a );
     my $download;
     my $filename;
     my $dist;
+    my $osv = undef;
 
     if( -e '/etc/init.d/flarm-update' ) {
 	print "Disabling old updater...";
@@ -260,161 +293,204 @@ my $os; my $processor;
 	}
     }
 
-    # add the ogn user
-    qx( /usr/sbin/useradd -m -G `groups|tr ' ' ,` ogn 2>/dev/null );
-
-    if ( ! -e '/home/ogn' ) {
-	mkdir '/home/ogn';
-	qx( /bin/chown ogn:ogn /home/ogn );
+    if( $hardware =~ /BCM2708/ || ( $os =~ /arm/ && -e "$installdirectory/rtlsdr-ogn/gpu_dev") ) {
+        $filename = "rtlsdr-ogn-bin-RPI-GPU-latest.tgz";
+        $download = "http://download.glidernet.org/rpi-gpu/$filename";
+	$dist = 'RPI-GPU';
+	$os = 'raspberry';
+	$osv=qx( /bin/uname -r );
+    }
+    elsif( $processor =~ /arm/ || $os =~ /arm/ ) {
+        $filename = "rtlsdr-ogn-bin-ARM-latest.tgz";
+        $download = "http://download.glidernet.org/arm/$filename";
+	$dist = 'ARM';
+    }
+    elsif( $processor =~ /32/ || $processor =~ /i[0-9]86/ ) {
+        $filename = "rtlsdr-ogn-bin-x86-latest.tgz";
+        $download = "http://download.glidernet.org/x86/$filename";
+	$dist = 'x86';
+    }
+    elsif( $processor =~ /64/ ) {
+        $filename = "rtlsdr-ogn-bin-x64-latest.tgz";
+        $download = "http://download.glidernet.org/x64/$filename";
+	$dist = 'x64';
+    }
+    else {
+	my $sstring = "unidentified,$os,$processor,$hardware,".qx( uname -a ).",".qx( uname -m );
+	$sstring =~ s/[^A-Za-z0-9_.]/_/g;
+	status( $sstring );
+	die "Unable to identify installation type :(\n".
+	    "os: $os\n".
+	    "processor: $processor\n".
+	    "uname -m: ". qx( uname -m ). "\n".
+	    "Please email melissa-ognconfig\@littlebluecar with the above output for help!\n";
     }
 
-    # copy the configuration file over
-    print "preparing for 2.0 update... \n";
+    # identify the existing version
+    my $existingversion = readlink( $installdirectory."/rtlsdr-ogn" );
+    status( $installdirectory.','.($existingversion||'?').','.$dist );
+    status( "iedd,".$installeddirectory );
 
-    # disable old process
-    qx( /usr/sbin/service rtlsdr-flarm stop );
-    qx( /usr/sbin/update-rc.d rtlsdr-flarm remove );
-    unlink( '/etc/init.d/rtlsdr-flarm' );
-#    unlink( '/etc/rtlsdr-flarm.conf' );
 
-    # download the new startup scripts
-    qx( /usr/bin/curl 'http://ognconfig.onglide.com/files/v2.0/rtlsdr-ogn' -R -# -o /etc/init.d/rtlsdr-ogn );
-    qx( /usr/bin/curl 'http://ognconfig.onglide.com/files/v2.0/rtlsdr-ogn.conf' -R -# -o /etc/rtlsdr-ogn.conf );
+    print "Source: $download\n".
+	"Installation Directory: $installdirectory\n";
+    print "Configuration file: $configfile ($expandedconfigfile)\n";
 
-    qx( /bin/chmod +x /etc/init.d/rtlsdr-ogn );
-    qx( /bin/chown ogn /home/ogn/rtlsdr-ogn.conf );
+    print "Callsign: $aprscall\n";
+    print "\nExisting version: $existingversion\n";
 
-    # download the new updater, it will actually do the installation
-    qx( /usr/bin/curl 'http://ognconfig.onglide.com/files/v2.0/update' -R -# -o /home/ogn/update );
+    if( $ARGV[0] eq '-t' ) {
+	print "\n Testing only - no changes made\n";
+	exit;
+    }
 
-    # enable new process
-    qx( /usr/sbin/update-rc.d rtlsdr-ogn defaults );
+    # this is a work around as the OGN official startup script will hang on NTP for a LONG time
+    # use the 1_3 version as it is less prone to this problem
+    {
+	my $startuptime = stat("/etc/init.d/rtlsdr-ogn")->mtime;
+	if( $startuptime < $startupepoch ) {
+	    system( "/usr/bin/curl 'https://ognconfig.onglide.com/files/v2.0/rtlsdr-ogn' -R -# -o /etc/init.d/rtlsdr-ogn" );
+	    qx( /bin/chmod +x /etc/init.d/rtlsdr-ogn );
+	    qx( /usr/bin/sudo /usr/sbin/update-rc.d -f rtlsdr-ogn defaults 2>/dev/null);
+	    status( "upgrading/rtlsdr-ogn" );
+	}
+    }
 
-    # copy only the config we want accross
-    remove133config();
-    write_config();
 
-    # remove the old crontab and then use the installer to configure a new one - this MAY
-    # not return!
-    print "Launching updater for version 2.0 to do installation\n";
-    qx( echo '' | /usr/bin/crontab -u root - );
-    qx( /bin/chmod +x /home/ogn/update  );
-    system( "/home/ogn/update -i" );
+    # check for a new download and that the dates are different from before
+    my $lasttime = -e "$installdirectory/$filename" ? stat("$installdirectory/$filename")->mtime : 0;
+    qx( /usr/bin/curl -s -z $installdirectory/$filename $download -o $installdirectory/$filename );
+    my $currenttime = stat("$installdirectory/$filename")->mtime;
+    
+    # check what version is in the archive
+    my $symlinkdetails = qx( /bin/tar tf $installdirectory/$filename | grep -e 'rtlsdr-ogn-' | head -1 );
+    my $archiveversion;
+    chomp( $symlinkdetails );
+    if( $symlinkdetails =~ /^(rtlsdr-ogn-[0-9.]+)/ ) {
+	$archiveversion = $1;
+	print "Archive version: $archiveversion\n";
+    }
+    else {
+	# if the file downloaded is not valid then rename it and remove the temporary copy
+	copy( "$installdirectory/$filename", "$installdirectory/$filename.".date(time()) );
+	unlink( "$installdirectory/$filename" );
 
-    # now download the configure script and run it this will fetch the correct configuration for this site
-    # from the website
+	status("invalid,$download,$!,$symlinkdetails,$?");
+	system( "rm $installdirectory/$filename.*T*" );
+	print "Unable to identify archive version or archive missing symlink for rtlsdr-ogn\n".
+	    "File saved in $installdirectory/$filename.".date(time())."\n";
 
-    print "\n\n*** rebooting now ***\n";
-    status( "reboot" );
-    qx( /sbin/reboot );
+	exit;
+    }
+
+    print "\n";
+
+    # if they are then we are upgrading
+    if( $lasttime != $currenttime || $archiveversion ne ($existingversion||'') ) {
+        print "Upgrade from ".($existingversion||'no symlink found')." to $archiveversion found. installing\n";
+        status( "upgrading/$archiveversion" );
+    }
+    else {
+        status( "up2date$ARGV[0]" );
+        print "Up to date. (version $existingversion)\n";
+
+	# if we have been asked to reboot then do it upon completion
+	if( $ARGV[0] eq '-r' ) {
+	    qx( /sbin/reboot );
+	}
+        exit;
+    }
+
+    # perform the upgrade, first stop the service so we don't get any conflicts
+    print "Stopping ogn service: ";
+    qx( /usr/sbin/service rtlsdr-ogn stop );
+    print "done.\n";
+
+    # then uncompress it
+    qx( cd $installdirectory ; /bin/tar xzf $filename );
+    qx( cd $installdirectory ; /bin/rm rtlsdr-ogn; /bin/ln -fs $archiveversion rtlsdr-ogn );
+
+    # then make sure it is executable and can run as root
+    qx( cd $installdirectory/rtlsdr-ogn ; /bin/chown ogn:ogn *;  /bin/chown root gsm_scan ogn-rf; /bin/chmod a+s gsm_scan ogn-rf; /usr/bin/mkfifo ogn-rf.fifo; /bin/chown ogn:ogn ogn-rf.fifo );
+
+    # if it is a pi then make the gpu_dev
+    if( $dist eq 'RPI-GPU' ) {
+	if( ($osv+0) >= 4.1 ) {
+	    qx( cd $installdirectory/rtlsdr-ogn; /bin/mknod gpu_dev c 249 0; /bin/chown ogn:ogn gpu_dev );
+	}
+	else {
+	    qx( cd $installdirectory/rtlsdr-ogn; /bin/mknod gpu_dev c 100 0; /bin/chown ogn:ogn gpu_dev );
+	}
+    }
+
+    ###################
+    # make sure we have the configuration file in the right directory
+    chdir( $installeddirectory );
+    my $newexpandedconfigfile = Cwd::abs_path( $configfile );
+    
+    # check if anything has changed... if it has then we need to copy the file
+    if( $newexpandedconfigfile ne $expandedconfigfile ) {
+	if( ! copy( '/tmp/rtlsdr-ogn.site.conf', "$newexpandedconfigfile" ) ) {
+	    print "unable to copy $!\n";
+	}
+	status("mvconfig,f,$expandedconfigfile" );
+	status("mvconfig,t,$newexpandedconfigfile" );
+	print "Copied configuration file to $configfile ($newexpandedconfigfile)\n";
+    }
+    else {
+	status("config,$expandedconfigfile");
+	print "Configuration file path has not changed, not copying.  Backup in /tmp/rtlsdr-ogn.site.conf if needed\n";
+    }
+
+    # and if we are allowed to start the ogn service
+    if( $ARGV[0] ne '-i' && $ARGV[0] ne '-r' ) {
+	print "Restarting ogn service: ";
+	qx( /usr/sbin/service rtlsdr-ogn start );
+	print "done.\n";
+    }
+
+    $existingversion = readlink( $installdirectory."/rtlsdr-ogn" );
+    status( "done/$existingversion/$ARGV[0]" );
+    print "Upgrade completed ($existingversion)\n";
+
+    # if we have been asked to reboot then do it upon completion
+    if( $ARGV[0] eq '-r' ) {
+	qx( /sbin/reboot );
+    }
 }
 
 sub read_config {
     my @sections;
 
-    # if the configuration file is empty or doesn't exist then we need to 
-    if( ! -e '/tmp/rtlsdr-ogn.conf.site' || -z '/tmp/rtlsdr-ogn.conf.site' ) {
-	print "Copying Template.conf as configuration file appears to be missing\n";
-	status( "using_template.conf" );
-	copy( '/home/ogn/rtlsdr-ogn/Template.conf', '/tmp/rtlsdr-ogn.conf.site' );
-    }
-	
-
     # read it into the hash
-    open( my $fh, '<', "/tmp/rtlsdr-ogn.conf.site" ) || die "unable to open configuration file";
+    open( my $fh, '<', "/tmp/rtlsdr-ogn.site.conf" ) || return;
     while( <$fh> ) {
-	my $line = $_;
-	chomp $line;
-	if( $line =~ /^\s*([A-Za-z]+):/ ) {
-	    push @sections, $1;
-	    push @config_order, "+$1";
-	}
+        my $line = $_;
+        chomp $line;
+        if( $line =~ /^\s*([A-Za-z]+):/ ) {
+            push @sections, $1;
+            push @config_order, "+$1";
+        }
 
-	if( $line =~ /^\s*}/ ) {
-	    pop @sections;
-	    push @config_order, "-$1";
-	}
+        if( $line =~ /^\s*}/ ) {
+            pop @sections;
+            push @config_order, "-$1";
+        }
 
-	if( $line =~ /([A-Za-z]+)\s*=\s*([^;]+)(.*)/ ) {
-	    my $key = join('_',@sections,$1);
-	    $config{$key} = $2;
-	    $config_description{$key} = $3;
-	    push @config_order, "=$key,$1"; # so we know what order to write in
-	}
+        if( $line =~ /([A-Za-z]+)\s*=\s*([^;]+)(.*)/ ) {
+            my $key = join('_',@sections,$1);
+            $config{$key} = $2;
+            $config_description{$key} = $3;
+            push @config_order, "=$key,$1"; # so we know what order to write in
+        }
     }
     close ($fh);
-
-    # send the status to the server
-    status( "read", 'configuration', '/home/ogn/rtlsdr-ogn.conf' );
 }
 
-sub remove133config {
-
-    my $skip = 0;
-    @config_order = grep {
-
-	my $k = $_;
-	$skip = 1 if( $k =~ /[+](Flarm|Demodulator|HTTP)/i ); # drop whole sections
-	
-	my $keep = ! $skip;
-
-	# keys we don't want
-	$keep = 0 if( $k =~ /(SensTime|Icon|Server|BeaconInterval|OfsTune)/ );
-	
-	$skip = 0 if( $k eq '-' );
-	$keep;
-    } @config_order;
-}
-
-sub write_config {
-    my $depth = '';
-    my $first =0;
-    copy( '/home/ogn/rtlsdr-ogn.conf', '/home/ogn/rtlsdr-ogn/rtlsdr-ogn.conf.'.date(time()));
-    
-    if( ! open( FH, '>', "/home/ogn/rtlsdr-ogn.conf" ) ) {
-	status( "cfgwritefailed,$!" );
-	die "unable to open configuration file";
-    }
-
-    foreach my $key ( @config_order ) {
-	my $action = substr($key,0,1);
-	my $id = substr($key,1);
-	
-	if( $action eq '+' ) {
-	    print FH $depth.$id . ":\n".$depth.'{';
-	    $depth .= '  ';
-	    $first = 1;
-	}
-	elsif( $action eq '-' ) {
-	    $depth = substr($depth,0,-2);
-	    print FH $depth."} ;\n";
-	}
-	elsif( $action eq '=' ) {
-	    my ($k,$i) = split( ',', $id );
-	    if( $first ) {
-		print FH ' ';
-	    }
-	    else { 
-		print FH $depth;
-	    }
-	    print FH $i . "=" . $config{$k} . $config_description{$k}."\n";
-	    $first = 0;
-	}
-    }
-
-    close(FH);
-
-    status( "writeconfiguration" );
-
-    # make sure we can read the newly written file
-    qx( /bin/chown ogn:ogn /home/ogn/rtlsdr-ogn.conf );
-	    
-
-}
 
 sub status {
     my ($status) = @_;
-    qx( /usr/bin/curl -s "http://ognconfig.onglide.com/perl/startupgrade.pl?token=$token/v$version\&status=$status\&call=$aprscall" );
+    qx( /usr/bin/curl -s https://ognconfig.onglide.com/perl/startupgrade.pl?token=$token/v$version\\&status=$status\\&call=$aprscall );
 }
 
 
