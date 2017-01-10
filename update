@@ -13,9 +13,9 @@ use File::stat;
 use Cwd;
 
 # to make sure the file was downloaded properly
-# md5sum 7e53a756af842dc27d2653eece0934e4 UtiXGNH/qKhf6g1acDQ6fIT31wAgELdM/2lwzvm+RyTuioosoSzg3IkJ6uzk+ZT+tVIUVjdCe732OI4GwwPAneJEOYOPC+jEZPPcagrxRm9BNEFThNYsrOt0IZcqIq6xaBzkYAt0MogXzdy8VpuX/S/C/WQT0xnaikw2U9F5O4EtPviAkLzL1B8A42TFz52SOoZYXP8Oxzpx3AIFJ5T3megDm3LzXdf5+lufpWeNFaWP1edEstYvqSdjFOrdL/6YYZU4UZ2ZQCGfBubrr8T13vO4VPeGcw7X57cUXwAiUpwHuFr9Ko/hHQhPzsstIurfAm0m+06pbj/eEFtnC5qnpQ==
+# md5sum 57b80f87891f936b9dcd3f38edee7722 RmeupofZYXEIBjkLLbQuxblRB91JL4szA6tTylb4gkggYUJ3YDt1uazxHK7/HmAYlBjcZq+wgrFvqifD9TFB1nl3JBacSmvE5hpp9M+Csbd9kWrYx4xxOBcGO3cns53bG2nHKiD9nkFfhbQ5O71gujXZ4KhCxmydT/zrOK0zrgNYkhQWgBvID78vwl+WRPRg+2w2vyjTr0iOFCgDJCnhxXzoCkC57o3R7mfXc0P22nRhm2P3FOGdo//mzdX6GGaiE5YKq+ufhKn6rimCVqfkn8uc5zY6L4J26/sZDoIAfSQuC6E1zd+uzHFsrtZNg+0YUvnL6DTA8W5Zzof5M7KOrA==
 
-my $version='2.0k';
+my $version='2.1a';
 
 my $old_handle = select (STDOUT);
 $| = 1; # perform flush after each write to STDOUT
@@ -267,7 +267,7 @@ my $os; my $processor;
     if( $aprscall eq 'Example' || $aprscall eq 'unknown' ) {
 	status( "failed/unconfigured" );
 	die "This device has not yet been configured.\nPlease edit $expandedconfigfile\n".
-	    "If you are using an image from http://ognconfig.onglide.com or the bootstrap you should complete configuration before running this.\n".
+	    "If you are using an image from https://ognconfig.onglide.com or the bootstrap you should complete configuration before running this.\n".
 	    "If the update script has been installed then it will automatically retry the update every night.\n";
     }
 
@@ -276,6 +276,7 @@ my $os; my $processor;
     my $hardware = qx( cat /proc/cpuinfo | grep Hardware ); 
     $os = qx( /bin/uname -a );
     my $download;
+    my $md5download = 'http://download.glidernet.org/md5.txt';
     my $filename;
     my $dist;
     my $osv = undef;
@@ -305,7 +306,7 @@ my $os; my $processor;
         $download = "http://download.glidernet.org/arm/$filename";
 	$dist = 'ARM';
     }
-    elsif( $processor =~ /32/ || $processor =~ /i[0-9]86/ ) {
+    elsif( $processor =~ /32/ || $processor =~ /i[0-9]86/ || $os =~ /[0-9]86-pae/ ) {
         $filename = "rtlsdr-ogn-bin-x86-latest.tgz";
         $download = "http://download.glidernet.org/x86/$filename";
 	$dist = 'x86';
@@ -349,10 +350,43 @@ my $os; my $processor;
     {
 	my $startuptime = stat("/etc/init.d/rtlsdr-ogn")->mtime;
 	if( $startuptime < $startupepoch ) {
-	    system( "/usr/bin/curl 'https://ognconfig.onglide.com/files/v2.0/rtlsdr-ogn' -R -# -o /etc/init.d/rtlsdr-ogn" );
+	    system( "/usr/bin/curl 'https://ognconfig.onglide.com/files/v2.1/rtlsdr-ogn' -R -# -o /etc/init.d/rtlsdr-ogn" );
 	    qx( /bin/chmod +x /etc/init.d/rtlsdr-ogn );
 	    qx( /usr/bin/sudo /usr/sbin/update-rc.d -f rtlsdr-ogn defaults 2>/dev/null);
 	    status( "upgrading/rtlsdr-ogn" );
+	}
+    }
+
+    # First we need to check the MD5 status and see if we have a different checksum as this will
+    # trump the file date check we used to use
+    my $expectedchecksum = 'expected';
+    {
+	my $f = "$installdirectory/md5.txt";
+	my $lasttime = -e $f ? stat($f)->mtime : 0;
+	qx( /usr/bin/curl -s -z $f $md5download -o $f );
+	my $currenttime = stat($f)->mtime;
+	
+	if( qx( cat $f | /bin/grep $filename ) =~ /^([0-9a-f]+) / ) {
+	    $expectedchecksum = $1;
+	}
+
+	# if the file has changed then we need to check to see if the checksum has changed
+	if ( $lasttime != $currenttime ) {
+	    print "Fetched new checksum file\n";
+	    
+	    my $currentchecksum = 'current';
+	    if( qx( /usr/bin/md5sum $installdirectory/$filename ) =~ /^([0-9a-f]+) / ) {
+		$currentchecksum = $1;
+	    }
+
+	    if( $currentchecksum ne $expectedchecksum ) {
+		status( "md5sumdiff,$download,$currentchecksum,$expectedchecksum");
+		system( "touch -d 2000-01-01T00:00:00 $installdirectory/$filename" );
+		print "md5: checksum incorrect ($currentchecksum != $expectedchecksum), marking current download as old\n"
+	    }
+	}
+	else {
+	    status("md5sum,file_date_unchanged");
 	}
     }
 
@@ -371,16 +405,22 @@ my $os; my $processor;
 	print "Archive version: $archiveversion\n";
     }
     else {
-	# if the file downloaded is not valid then rename it and remove the temporary copy
-	copy( "$installdirectory/$filename", "$installdirectory/$filename.".date(time()) );
-	unlink( "$installdirectory/$filename" );
-
+	# error on invalid files and abort
 	status("invalid,$download,$!,$symlinkdetails,$?");
-	system( "rm $installdirectory/$filename.*T*" );
-	print "Unable to identify archive version or archive missing symlink for rtlsdr-ogn\n".
-	    "File saved in $installdirectory/$filename.".date(time())."\n";
-
+	print "Unable to identify archive version or archive missing symlink for rtlsdr-ogn\n";
 	exit;
+    }
+
+    # make sure that the downloaded version has the correct checksum, if it doesn't then don't
+    # do anything with it
+    if( qx( /usr/bin/md5sum $installdirectory/$filename ) =~ /^([0-9a-f]+) / ) {
+	my $currentchecksum = $1;
+	
+	if( $currentchecksum ne $expectedchecksum ) {
+	    status("invalidcsum,$download,$currentchecksum,$expectedchecksum");
+	    print "Downloaded file does not match the published checksum, aborting\n";
+	    exit;
+	}
     }
 
     print "\n";
@@ -388,6 +428,7 @@ my $os; my $processor;
     # if they are then we are upgrading
     if( $lasttime != $currenttime || $archiveversion ne ($existingversion||'') ) {
         print "Upgrade from ".($existingversion||'no symlink found')." to $archiveversion found. installing\n";
+	print "$lasttime != $currenttime\n";
         status( "upgrading/$archiveversion" );
     }
     else {
@@ -490,6 +531,7 @@ sub read_config {
 
 sub status {
     my ($status) = @_;
+    print $status."\n";
     qx( /usr/bin/curl -s https://ognconfig.onglide.com/perl/startupgrade.pl?token=$token/v$version\\&status=$status\\&call=$aprscall );
 }
 

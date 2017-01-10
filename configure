@@ -47,12 +47,18 @@
 #
 use strict;
 use File::Copy;
+use Data::Dumper;
 
-my $version = '2.0d';
+my $version = '2.1c';
 my $pwepoch = 1428964689; # on linux date  -d '10/25/2014' '+%s', on bsd date -f '%m/%d/%Y' -j '+%s' '1/1/2000'
 # this is the day after the build image was built - to make sure we can detect changed passwords.  You need to
 # wait at least a day before releasing otherwise the check may fail!
 
+# make sure we have a htdocs directory
+mkdir( "/tmp/htdocs" );
+qx( /bin/chown ogn:ogn /tmp/htdocs );
+
+# and move out STDOUT to there for the webpage
 open(STDOUT, '>', "/tmp/htdocs/index.html") || close(STDOUT);
 my $old_handle = select (STDOUT);
 $| = 1; # perform flush after each write to STDOUT
@@ -66,6 +72,7 @@ select ($old_handle);
 my %config;
 my @config_order;
 my %config_description;
+my %config_default;
 my $aprscall = 'install';
 
 ## figure out our synchronisation key, we will generate a new one if keys are marked as wrong even if one
@@ -92,16 +99,16 @@ my $og = "\033[32m";
 my $cg = "\033[0m";
 my $or = "\033[31m";
 my $cr = $cg;
-my $number_running = qx(  ps aux | grep ogn.configure | wc -l ); chomp( $number_running );
+my $number_running = qx(  ps aux | grep ogn.configure | grep -v sudo | wc -l ); chomp( $number_running );
 if( $number_running > 3 ) {
-    qx( ps aux | grep ogn.configure > /tmp/ps.out );
+    qx( ps aux | grep ogn.configure | grep -v sudo > /tmp/ps.out );
     status( "too many", 'ps', '/tmp/ps.out' );
 
     output_screen( "configure appears to already be running ($number_running).\n\n".
 		   "It will start automatically when the device boots, ".
 		   "running it twice at the same time will cause things to break and possibly kick you out of ".
 		   "your device.\n\n".
-		   "Please check the website https://ognconfig.onglide.com/ and see if your device is".
+		   "Please check the website http://ognconfig.onglide.com/ and see if your device is".
 		   "listed there.\n\n" );
    exit;
 }
@@ -123,12 +130,19 @@ print "<!DOCTYPE html>\r\n<html><head><title>RTLSDR-Ogn Configuration Tool Clien
 output( '<h2>Welcome to the Open Glider Network Configuration Helper</h2>'.
 	'version '.$version.'<br/>');
 
-output_screen('<p>This tool allows you to configure your ogn receiver using a web browser.</p>'.
-	      '<p>Go to <b>https://ognconfig.onglide.com/configuration.html#'.$token.'</b> to enter the site details</p>'.
-	      "<p>While you do that we will scan for the strongest GSM channel and adjust your gain settings...<br/>".
-	      "Please make sure you have your antenna installed!</p>".
-	      "<br/><hr/>");
+output('<p>This tool allows you to configure your ogn receiver using a web browser.</p>'.
+       '<p>Go to <b>https://ognconfig.onglide.com/configuration.html#'.$token.'</b> to enter the site details</p>'.
+       "<p>While you do that we will scan for the strongest GSM channel and adjust your gain settings...<br/>".
+       "Please make sure you have your antenna installed!</p>".
+       "<br/><hr/>");
 
+# make sure it is in english if the default language is not, otherwise we will not
+# match the ifconfig settings properly
+if( !$ENV{"LANG"} =~ /^en/ ) {
+    $ENV{"LANG"} = 'en';
+}
+
+# lookup and report the interface addresses.
 my $ipstring = '/';
 {
     my @ips = qx( /sbin/ifconfig | grep "inet addr" | grep -v 127.0.0.1 );
@@ -140,7 +154,7 @@ my $ipstring = '/';
 
     status( "start" );
 
-    my $uniqueid = qx( curl -s https://ognconfig.onglide.com/perl/startconfiguration.pl?token=$token$ipstring\\&status=starting );
+    my $uniqueid = qx( curl -s https://ognconfig.onglide.com/perl/startconfiguration.pl?token=$token$ipstring\\&status=starting\\&version=$version );
     chomp($uniqueid);
     $uniqueid =~ /:([0-9]+)$/; $uniqueid = $1;
 
@@ -174,7 +188,7 @@ if( -e '/etc/ssh/ssh_host_keyswrong' ) {
     qx( curl -s https://ognconfig.onglide.com/perl/startconfiguration.pl?token=$token$ipstring\\&status=sshkeys );
     status( "sshkeys" );
 
-    print STDERR "\nIf you have connected via ssh you will need to remove the old key before you can reconnect\n\n";
+    print STDERR "\nIf you have connected via ssh you will need to remove the old host key on your computer before you can reconnect\n\n";
     qx( /usr/bin/sudo /bin/rm /etc/ssh/ssh_host_keyswrong );
     sleep(10);
 }
@@ -199,7 +213,25 @@ output( "Running gsm scan:<br/>" );
 qx( curl -s https://ognconfig.onglide.com/perl/startconfiguration.pl?token=$token$ipstring\\&status=scanning );
 status( "gsm scan" );
 
-my ($ppm,$gain,$freq) = gsm_scan( $config{RF_FreqCorr}, $config{RF_GSM_Gain} );
+#print STDERR "\n----------\n".Dumper(\%config). "\n-------\n";
+
+# check to see if we have previously scanned as an 850
+my @scanfreqs;
+if( ($config{RF_GSM_CenterFreq}||910) < 900 ) {
+    @scanfreqs = ( '--gsm-850', undef );
+}
+else {
+    @scanfreqs = ( undef, '--gsm-850' );
+}
+
+# now try all our scan frequencies until we find a centre frequency
+my ($ppm,$gain,$freq); 
+foreach my $scanfreq ( @scanfreqs ) {
+    if( ! $freq ) {
+	($ppm,$gain,$freq) = gsm_scan( $config{RF_FreqCorr}, $config{RF_GSM_Gain}, $scanfreq );
+    }
+}
+
 
 # update the configuration with the scan results, if it ends correctly
 if( ! $stopScanning ) {
@@ -207,9 +239,10 @@ if( ! $stopScanning ) {
     if( $freq ) {
 	$config{RF_FreqCorr} = $ppm;
 	$config{RF_GSM_Gain} = $gain;
-#	$config{RF_FLARM_Gain} = $gain < 50 ? $gain + 20 : $gain;
 	$config{RF_GSM_CenterFreq} = $freq;
 
+#	print STDERR Dumper(\%config);
+	
 	# save the new scan results
 	write_config();
 	output( "Saved scan results into configuration file<br/>" );
@@ -271,12 +304,41 @@ if( ! $stopScanning ) {
     $config{Position_GeoidSepar}=$new_config{geoid};
     $config{APRS_Call}='"'.$new_config{station}.'"';
 
+    # form the comment string and add it to the configuraiton
+    {
+	my @comment;
+	push @comment, '"'.$new_config{comments}.'"' if( $new_config{comments} );
+	push @comment, '"Contact: '.$new_config{email}.'"' if( ($new_config{email}||'') ne '' );
+	push @comment, '"Antenna: '.$new_config{antenna}.'"' if( ($new_config{antenna}||'') ne '' );
+	push @comment, '"Webcam: '.$new_config{webcam}.'"' if( ($new_config{webcam}||'') ne '' );
+	push @comment, '"Weather: '.$new_config{weather}.'"' if( ($new_config{weather}||'') ne '' );
+	
+	if( scalar @comment ) {
+	    $config{Beacon_Comment}='[ '.join(',', @comment).' ]'
+	}
+    }
+
+    # new country specific configuration
+    $config{RF_OGN_CenterFreq} = $new_config{centerfreq};
+    $config{RF_OGN_SampleRate} = $new_config{samplerate};
+    $config{RF_OGN_FreqHopChannels} = $new_config{freqhopchannels};
+    $config{Demodulator_ChannelOfs} = $new_config{channelofs};
+    $config{Demodulator_ScanMargin} = $new_config{scanmargin};
+
+#    print STDERR Dumper(\%config);
+    
     # and save these results
     write_config();
 
     # change what is going to run on reboot
-    qx( /usr/bin/sudo /usr/sbin/update-rc.d -f first-install remove );
-    qx( /usr/bin/sudo /usr/sbin/update-rc.d -f rtlsdr-ogn defaults 2>/dev/null);
+    if( -e "/etc/systemd" ) {
+        qx( /usr/bin/sudo /bin/systemctl disable first-install 2>/dev/null );
+        qx( /usr/bin/sudo /bin/systemctl enable rtlsdr-ogn.service 2>/dev/null);
+    }
+    else {
+        qx( /usr/bin/sudo /usr/sbin/update-rc.d -f first-install remove );
+        qx( /usr/bin/sudo /usr/sbin/update-rc.d -f rtlsdr-ogn defaults 2>/dev/null);
+    }
 
     # make sure the software is updated
     qx( /usr/bin/sudo /home/ogn/update -i 2>/dev/null);
@@ -289,12 +351,12 @@ if( ! $stopScanning ) {
 #   }
 
    # output all the addresses
-    my @macs = qx( /sbin/ifconfig | /usr/bin/awk '/Loopback/ {\$0=""} /Link encap/ { print \$1" has a MAC address of " \$5 }' );
+    my @macs = qx( /sbin/ifconfig | /usr/bin/awk '/Loopback/ || /^lo/ {\$0=""} /Link encap/ { print \$1" has a MAC address of " \$5 }' );
 
     my ($ognuser,$wifiuser,$piuser) = (1,1,1);
-    $ognuser = system( 'echo "ogn:'.$password.'" | /usr/sbin/chpasswd' ) if( ! check_pw_changed( 'ogn' ));
-    $wifiuser = system( 'echo "wifi:'.$setuppassword.'" | /usr/sbin/chpasswd' ) if ( ! check_pw_changed( 'wifi' ));
-    $piuser = system( 'echo "pi:'.$password.'" | /usr/sbin/chpasswd' ) if ( ! check_pw_changed( 'pi' ));
+    $ognuser = system( 'echo "ogn:'.$password.'" | /usr/sbin/chpasswd 2>/dev/null' ) if( ! check_pw_changed( 'ogn' ));
+    $wifiuser = system( 'echo "wifi:'.$setuppassword.'" | /usr/sbin/chpasswd 2>/dev/null' ) if ( ! check_pw_changed( 'wifi' ));
+    $piuser = system( 'echo "pi:'.$password.'" | /usr/sbin/chpasswd 2>/dev/null' ) if ( ! check_pw_changed( 'pi' ));
 
     # make a js file that can be include by the other server to provide
     # the wrapping website with the token to complete configuration.
@@ -312,7 +374,7 @@ if( ! $stopScanning ) {
 	       "<p>The following Configuration has been received:<br/>".
 	       "Station Name:               ".$new_config{station}."<br/>".
 	       "Altitude of Antenna (AMSL): ".$new_config{elevationantenna}.'+'.$new_config{height}.'='.($new_config{elevationantenna}+$new_config{height})."m<br/>".
-	       "Position:                   ".($new_config{lat}/10000000).','.($new_config{lng}/10000000)."<br/>".
+	       "Position:                   ".sprintf("%0.9f,%0.9f",($new_config{lat}),($new_config{lng}))."<br/>".
 	       "<br/>".
 	       "Configuration was saved at ".$new_config{time}." UTC</p>" );
     
@@ -331,7 +393,7 @@ if( ! $stopScanning ) {
     output( "<br/>If you would like to configure your router with a static IP for this device you can use the following".
 	    " information:<br/><div style='margin-left: 20px'>");
 
-    output( join( '<br/>\n', @macs ) );
+    output( join( '<br/>', @macs ) );
     
     # how to login and reconfigure
     output( "</div><br/><hr/>If you wish to re-run this installation please login to the device using <b>ssh</b>" );
@@ -351,8 +413,9 @@ if( ! $stopScanning ) {
     close(STDOUT);
 
     qx( curl -s https://ognconfig.onglide.com/perl/startconfiguration.pl?token=$token$ipstring\\&status=done );
+    
     # send the status to the server
-    status( "confirmation", 'output', '/tmp/htdocs/index.html' );
+    status_stripped( "confirmation", 'output', '/tmp/htdocs/index.html' );
 
 }
 
@@ -364,7 +427,7 @@ sub check_pw_changed {
     my ($username) = @_;
 
     # look up the change date
-    my $pwdata = qx( /usr/bin/passwd -S $username  ); chomp( $pwdata );
+    my $pwdata = qx( /usr/bin/passwd -S $username 2>/dev/null ); chomp( $pwdata );
     if( $pwdata =~ /$username...([0-9]{2}\/[0-9]{2}\/[0-9]{4})/i ) {
 	
 	# convert to epoch and then make sure it's a number
@@ -377,10 +440,11 @@ sub check_pw_changed {
 
 
 sub gsm_scan {
-    my ($ppm,$gain) = @_;
+    my ($ppm,$gain,$options) = @_;
 
     # if we are interactive and therefore don't need to scan
     if( ($ARGV[0]||'') eq '-i' ) {
+	print "----\n";
 	return ($config{RF_FreqCorr}, $config{RF_GSM_Gain}, $config{RF_GSM_CenterFreq});
     }
 
@@ -389,7 +453,8 @@ sub gsm_scan {
     my $beststrength = 0;
     my $previousgain = $gain;
     my $ppmchanged = 0;
-    $ppm = $ppm+0;
+
+    $ppm = 0; #better to start at 0 in case a low-drift radio is used
     $gain = $gain+0;
 
     my $ppmretry = 0;
@@ -407,9 +472,10 @@ sub gsm_scan {
 	my $previousppm = $ppm;
 	my %frequencies;
 	$loops++;
-	output( "$loops: scanning at gain $gain and offset adjustment $ppm: ");
+	output( "$loops: scanning at gain $gain and offset adjustment $ppm ".($options||'').': ');
 
-	my @result = qx( /home/ogn/rtlsdr-ogn/gsm_scan --ppm $ppm --gain $gain 2>/dev/null);
+	print "/home/ogn/rtlsdr-ogn/gsm_scan --ppm $ppm --gain $gain $options 2>/dev/null\n";
+	my @result = qx( /home/ogn/rtlsdr-ogn/gsm_scan --ppm $ppm --gain $gain $options 2>/dev/null);
 	
 	# check to make sure we got enough to do something with
         if( grep /Not enough data was collected: please retry with higher gain to catch more GSM signals/, @result) {
@@ -516,7 +582,6 @@ sub read_config {
 	status( "using template.conf" );
 	copy( '/home/ogn/rtlsdr-ogn/Template.conf', '/home/ogn/rtlsdr-ogn.conf' );
     }
-	
 
     # read it into the hash
     open( my $fh, '<', "/home/ogn/rtlsdr-ogn.conf" ) || die "unable to open configuration file";
@@ -533,11 +598,18 @@ sub read_config {
 	    push @config_order, "-$1";
 	}
 
-	if( $line =~ /([A-Za-z]+)\s*=\s*([^;]+)(.*)/ ) {
-	    my $key = join('_',@sections,$1);
-	    $config{$key} = $2;
-	    $config_description{$key} = $3;
-	    push @config_order, "=$key,$1"; # so we know what order to write in
+	if( $line =~ /(##|)\s*([A-Za-z]+)\s*=\s*([^;]+)(.*)/ ) {
+	    my $key = join('_',@sections,$2);
+	    if( $1 ne '##' ) { # keep as a default if we don't have a value
+		$config{$key} = $3;
+		$config_default{$key} = $3;
+	    }
+	    else {
+		$config_default{$key} = $3;
+	    }
+	    
+	    $config_description{$key} = $4;
+	    push @config_order, "=$key,$2"; # so we know what order to write in
 	}
     }
     close ($fh);
@@ -579,7 +651,12 @@ sub write_config {
 	    else { 
 		print FH $depth;
 	    }
-	    print FH $i . "=" . $config{$k} . $config_description{$k}."\n";
+	    if( ! defined($config{$k}) || $config{$k} eq '' ) {
+		print FH "## $i=" . $config_default{$k} . $config_description{$k}."\n";
+	    }
+	    else {
+		print FH $i . "=" . $config{$k} . $config_description{$k}."\n";
+	    }
 	    $first = 0;
 	}
     }
@@ -614,6 +691,8 @@ sub fetch_config {
 
     # store the new callsign for status display
     $aprscall = $newconfig{station}||'notdefined';
+
+#    print STDERR "\n****\n".Dumper(\%newconfig)."\n";
 	
     return %newconfig;
 }
@@ -670,4 +749,9 @@ sub status {
     }
 }
 
-
+# send a file encrypted with the ognconfig public key 
+sub status_stripped {
+    my ($status,$type,$filename) = @_;
+    qx( /bin/grep -ve 'password has been changed to.*please login' $filename > $filename.stripped );
+    status( $status, $type, $filename.'.stripped' );
+}
