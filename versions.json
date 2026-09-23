@@ -19,7 +19,7 @@
   ],
   "channels": {
     "stable": "0.3.2",
-    "latest": "0.3.2"
+    "latest": "0.2.8"
   },
   "releases": {
     "0.3.2": {
@@ -34,6 +34,54 @@
         "url": "http://download.glidernet.org/arm/rtlsdr-ogn-bin-ARM-0.3.2.tgz",
         "md5": "33a1f70c74538660274fa653e9ba6503",
         "sha256": null
+      }
+    },
+    "0.2.2": {
+      "armhf": {
+        "url": "http://download.glidernet.org/arm/rtlsdr-ogn-bin-ARM-0.2.2.tgz",
+        "md5": "befcb9ec0aec2d9e2237551bb8e28fc4",
+        "sha256": "0c7480a75d80e269df227cbf2521151ff894eb14350dffcf4e74d3cf91f28f4b",
+        "size": 105583
+      }
+    },
+    "0.2.3": {
+      "armhf": {
+        "url": "http://download.glidernet.org/arm/rtlsdr-ogn-bin-ARM-0.2.3.tgz",
+        "md5": "d2068e87fb68b073ac16b793c1434f3b",
+        "sha256": "2931d8fdb25afb59401aba35f01ef82fab7e6650a60149f72e72b0cb197fc0e2",
+        "size": 111516
+      }
+    },
+    "0.2.4": {
+      "armhf": {
+        "url": "http://download.glidernet.org/arm/rtlsdr-ogn-bin-ARM-0.2.4.tgz",
+        "md5": "028d4f1787495285f6c1966453d4b1be",
+        "sha256": "d607ad48a7eef7a23f4d4d85ac1d10a061f9c7f338a2e8fa93e39e72c22d4757",
+        "size": 151952
+      }
+    },
+    "0.2.5": {
+      "armhf": {
+        "url": "http://download.glidernet.org/arm/rtlsdr-ogn-bin-ARM-0.2.5.tgz",
+        "md5": "e5cc809346ad30d31328f6702b9197e7",
+        "sha256": "52aada35616d3c817d431599b70e00dbce86a31288398812110d1bc22bbe1529",
+        "size": 177354
+      }
+    },
+    "0.2.6": {
+      "armhf": {
+        "url": "http://download.glidernet.org/arm/rtlsdr-ogn-bin-ARM-0.2.6.tgz",
+        "md5": "c0b352548e71fa6461c26f2228d009e3",
+        "sha256": "742b49daa8a33a091648b9dcca4d0cb0ae1bf05c22b80b914aa7a3aff134957e",
+        "size": 187260
+      }
+    },
+    "0.2.8": {
+      "armhf": {
+        "url": "http://download.glidernet.org/arm/rtlsdr-ogn-bin-ARM-0.2.8.tgz",
+        "md5": "180b04a44fb69cfa0743b2295d94dfdb",
+        "sha256": "8882f8d751a84d82887c4abff611fd27760b1052f23fed075355d872e36b3d95",
+        "size": 248396
       }
     }
   }
