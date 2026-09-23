@@ -168,10 +168,20 @@ jobs:
 
           git config user.name  'github-actions[bot]'
           git config user.email 'github-actions[bot]@users.noreply.github.com'
-          if git diff --quiet os-list.json; then
+
+          # Stage first, then compare the index against HEAD. `git diff` on its
+          # own only looks at tracked files, so while os-list.json was untracked
+          # it reported "no change" and the commit below was never reached --
+          # which is why the file it is supposed to maintain never appeared.
+          git add os-list.json
+          if git diff --cached --quiet -- os-list.json; then
             echo 'os-list.json already current'
           else
-            git add os-list.json
             git commit -m "os-list.json: ${{ github.ref_name }}"
+            # The build ahead of this can run for an hour and a half, so master
+            # may have moved since the checkout. Without this the push is
+            # rejected non-fast-forward and the release ships with os-list.json
+            # still pointing at the previous image.
+            git pull --rebase origin master
             git push origin HEAD:master
           fi

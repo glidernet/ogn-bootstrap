@@ -1,0 +1,26 @@
+{
+  "os_list": [
+    {
+      "name": "OGN Receiver",
+      "description": "Raspberry Pi OS Lite with the Open Glider Network receiver software preinstalled. Set the hostname to your receiver's name, then edit MyReceiver.conf on the card to say where the aerial is.",
+      "icon": "https://raw.githubusercontent.com/glidernet/ogn-bootstrap/master/doc/ogn-icon.png",
+      "url": "https://github.com/glidernet/ogn-bootstrap/releases/download/build-1/ogn-receiver-2026-09-23-arm64.img.xz",
+      "extract_size": 3598712832,
+      "extract_sha256": "5914d208c508c8fd8cab06b06333d1eb110dc07fac741952394175f5be382e70",
+      "image_download_size": 507699784,
+      "image_download_sha256": "966b48f6f65a0ab95076a3aa421039f8ee2c462296a5799e436c39bc0741e32e",
+      "release_date": "2026-09-23",
+      "init_format": "cloudinit-rpi",
+      "devices": [
+        "pi5-64bit",
+        "pi4-64bit",
+        "pi3-64bit"
+      ],
+      "architecture": "armv8",
+      "capabilities": [
+        "rpi_connect"
+      ],
+      "website": "https://github.com/glidernet/ogn-bootstrap"
+    }
+  ]
+}
