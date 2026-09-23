@@ -11,7 +11,7 @@ when the receiver lives in a locked container on the far side of an airfield.
 
 | | |
 |---|---|
-| A Raspberry Pi | 3, 4, 5, Zero 2 W or a CM — anything 64-bit |
+| A Raspberry Pi | 3B/3B+, 4, 5, or CM3/CM4/CM5 — 64-bit, with 1 GB of RAM or more. Not the Zero 2 W or the 3A+: 64-bit, but only 512 MB. Not the Pi 1, 2, Zero, Zero W or CM1, which are 32-bit. |
 | An SD card | **8 GB or more.** The image flashes to 3.6 GB, so 4 GB is technically enough and practically a bad idea. Nothing above 16 GB is ever used. |
 | An RTL-SDR stick | RTL-SDR Blog V3/V4 or similar; the TCXO ones need no calibration |
 | An 868 MHz aerial | outdoors, as high as you can reasonably get it |
