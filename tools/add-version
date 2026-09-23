@@ -21,6 +21,7 @@ import argparse
 import hashlib
 import json
 import pathlib
+import re
 import sys
 import urllib.request
 
@@ -49,10 +50,40 @@ def upstream_md5s() -> dict:
     return out
 
 
+def version_key(version: str):
+    """Numeric sort key for a dotted version, or None if it is not one.
+
+    Ordering these as plain strings puts 0.2.10 below 0.2.8, which is exactly
+    how the wrong release ends up in a channel.
+    """
+    parts = version.split(".")
+    if not parts or not all(p.isdigit() for p in parts):
+        return None
+    return tuple(int(p) for p in parts)
+
+
+def newest_known(manifest: dict):
+    """Sort key of the highest release the manifest knows about, by any route.
+
+    Channel targets are included as well as `releases`, so a channel pointing
+    at something not recorded here still counts as ground already covered.
+    """
+    names = set(manifest.get("releases", {}))
+    names.update(v for v in manifest.get("channels", {}).values() if v)
+    return max((k for k in map(version_key, names) if k is not None), default=None)
+
+
 def discover(manifest: dict) -> list:
-    """List versions published upstream that the manifest does not know about."""
-    import re
-    known = set(manifest.get("releases", {}))
+    """List versions published upstream that are newer than anything we have.
+
+    Upstream's directory listing is an archive going back years, so "absent
+    from the manifest" is not the same as "new" -- nearly all of it is older
+    than what receivers are already running, and proposing it walks the
+    channels backwards. Only versions above the highest one already known are
+    worth a pull request; an old release that someone genuinely wants recorded
+    is a deliberate `add-version <version>` call, not a scheduled job.
+    """
+    current = newest_known(manifest)
     found = set()
     for subdir, pattern in ARCHES.values():
         rx = re.compile(re.escape(pattern).replace(r"\{v\}", r"(\d+\.\d+\.\d+)"))
@@ -62,14 +93,22 @@ def discover(manifest: dict) -> list:
             print(f"{subdir}: could not list: {exc}", file=sys.stderr)
             continue
         found.update(rx.findall(listing))
-    return sorted(found - known)
+
+    newer = {}
+    for version in found:
+        key = version_key(version)
+        if key is None or (current is not None and key <= current):
+            continue
+        newer[key] = version
+    return [newer[k] for k in sorted(newer)]
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("version", nargs="?", help="release to add, e.g. 0.3.2")
     ap.add_argument("--discover", action="store_true",
-                    help="list versions published upstream but missing here, and exit")
+                    help="list versions published upstream that are newer than "
+                         "anything here, and exit")
     ap.add_argument("--arch", action="append", choices=sorted(ARCHES),
                     help="limit to one architecture (default: all)")
     ap.add_argument("--released", help="release date, YYYY-MM-DD")
