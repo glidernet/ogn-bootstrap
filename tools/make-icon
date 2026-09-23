@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""make-icon — draw doc/ogn-icon.png, the 40x40 icon Imager shows in its list.
+
+Committed as a PNG rather than an SVG because every entry in Raspberry Pi's own
+list is a PNG, and 40x40 is what the Imager documentation asks for. Generated
+rather than hand-drawn so the file in the repo can be reproduced and reviewed
+as code instead of taken on trust.
+
+    tools/make-icon
+
+Copyright (c) 2026 ifly7charlie. MIT licence, see LICENSE.
+"""
+
+import struct
+import zlib
+from pathlib import Path
+
+SIZE = 40
+SS = 4                      # supersampling factor, for smooth edges
+CORNER = 9                  # rounded-square corner radius
+
+BACKGROUND = (11, 61, 98)   # deep blue
+INK = (255, 255, 255)
+
+# The mark: a ground station with three arcs of signal coming in.
+ORIGIN = (SIZE / 2, SIZE * 0.80)
+DOT_R = 2.6
+ARC_RADII = (7.5, 13.0, 18.5)
+ARC_HALF_WIDTH = 1.35
+ARC_SPREAD = 1.25           # how far from vertical the arcs sweep
+
+
+def covered(x, y):
+    """Is this (sub)pixel inside the rounded square?"""
+    cx = min(max(x, CORNER), SIZE - CORNER)
+    cy = min(max(y, CORNER), SIZE - CORNER)
+    return (x - cx) ** 2 + (y - cy) ** 2 <= CORNER ** 2
+
+
+def inked(x, y):
+    """Is this (sub)pixel part of the mark?"""
+    dx = x - ORIGIN[0]
+    dy = y - ORIGIN[1]
+    r = (dx * dx + dy * dy) ** 0.5
+
+    if r <= DOT_R:
+        return True
+    if dy >= 0:                         # arcs only sweep upwards
+        return False
+    if abs(dx) > -dy * ARC_SPREAD:      # ...and only within the spread
+        return False
+    return any(abs(r - radius) <= ARC_HALF_WIDTH for radius in ARC_RADII)
+
+
+def render():
+    rows = []
+    for py in range(SIZE):
+        row = bytearray()
+        for px in range(SIZE):
+            hits = ink = 0
+            for sy in range(SS):
+                for sx in range(SS):
+                    x = px + (sx + 0.5) / SS
+                    y = py + (sy + 0.5) / SS
+                    if not covered(x, y):
+                        continue
+                    hits += 1
+                    if inked(x, y):
+                        ink += 1
+            samples = SS * SS
+            if hits == 0:
+                row += bytes((0, 0, 0, 0))
+                continue
+            alpha = round(255 * hits / samples)
+            mix = ink / hits
+            colour = tuple(
+                round(BACKGROUND[i] + (INK[i] - BACKGROUND[i]) * mix)
+                for i in range(3)
+            )
+            row += bytes(colour + (alpha,))
+        rows.append(bytes(row))
+    return rows
+
+
+def write_png(path, rows):
+    raw = b"".join(b"\x00" + row for row in rows)       # filter type 0 per row
+
+    def chunk(tag, data):
+        body = tag + data
+        return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body))
+
+    png = b"\x89PNG\r\n\x1a\n"
+    png += chunk(b"IHDR", struct.pack(">IIBBBBB", SIZE, SIZE, 8, 6, 0, 0, 0))
+    png += chunk(b"IDAT", zlib.compress(raw, 9))
+    png += chunk(b"IEND", b"")
+    path.write_bytes(png)
+    return len(png)
+
+
+if __name__ == "__main__":
+    out = Path(__file__).resolve().parent.parent / "doc" / "ogn-icon.png"
+    out.parent.mkdir(exist_ok=True)
+    size = write_png(out, render())
+    print(f"wrote {out} ({size} bytes, {SIZE}x{SIZE})")

@@ -1,0 +1,74 @@
+# Watch download.glidernet.org for new OGN releases and open a pull request
+# adding them to versions.json.
+#
+# It only ever opens a PR. It does not merge, and it does not touch the
+# `stable` channel, so no receiver moves until a human promotes the version.
+#
+# Deliberately uses only the `gh` CLI that GitHub's runners already provide,
+# rather than a third-party action: a repository whose entire job is to be the
+# trustworthy source of a checksum should not hand that role to a marketplace
+# dependency.
+name: check upstream
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"   # Mondays, 06:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Look for releases we do not know about
+        id: discover
+        run: |
+          set -euo pipefail
+          versions=$(tools/add-version --discover)
+          if [ -z "$versions" ]; then
+            echo "nothing new upstream"
+            echo "found=" >> "$GITHUB_OUTPUT"
+          else
+            echo "new upstream releases: $versions"
+            echo "found=$(echo "$versions" | tr '\n' ' ')" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Record them, and open a pull request
+        if: steps.discover.outputs.found != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          branch="upstream/$(date +%Y-%m-%d)"
+          git switch -c "$branch"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          for v in ${{ steps.discover.outputs.found }}; do
+            tools/add-version "$v" --promote latest
+          done
+
+          git add versions.json
+          git commit -m "versions: add ${{ steps.discover.outputs.found }}
+
+          Found by the scheduled upstream check. Checksums computed from the
+          published tarballs and cross-checked against upstream md5.txt.
+
+          Promoted to 'latest' only. Test on a receiver before moving 'stable'."
+          git push -u origin "$branch"
+
+          gh pr create \
+            --title "versions: add ${{ steps.discover.outputs.found }}" \
+            --body "New OGN release(s) found on download.glidernet.org.
+
+          SHA256 computed here from the published tarball and cross-checked
+          against upstream's \`md5.txt\`. Promoted to \`latest\` only — nothing
+          moves for receivers on \`stable\` until someone edits
+          \`channels.stable\`.
+
+          Before promoting: install it on one receiver and confirm it decodes."

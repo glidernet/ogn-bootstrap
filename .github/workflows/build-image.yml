@@ -1,0 +1,177 @@
+name: Build receiver image
+
+# Builds the "OGN Receiver" image that appears in Raspberry Pi Imager, publishes
+# it as a release asset, and updates os-list.json so Imager picks it up.
+#
+# What this workflow does on GitHub's runners, stated plainly because it is the
+# only part of this repository that downloads and executes third-party code:
+#
+#   * downloads Raspberry Pi OS Lite (64-bit) from downloads.raspberrypi.com
+#     over TLS, and verifies it against the SHA256 in Raspberry Pi's own OS list
+#   * installs qemu-user-static from Ubuntu so arm64 binaries can run
+#   * loop-mounts the image and runs apt inside it, which fetches and runs
+#     package maintainer scripts from the Debian and Raspberry Pi archives
+#   * publishes the result under this repository's releases
+#
+# It runs on GitHub-hosted runners only, never on a developer machine, and
+# tools/build-image.sh refuses to start anywhere that is not Linux with root.
+#
+# ---------------------------------------------------------------------------
+# WHY THIS IS TWO JOBS
+#
+# Running apt in a chroot means running root-owned maintainer scripts written by
+# other people. A chroot is not a security boundary and neither is a privileged
+# container: both need /dev, loop devices and CAP_SYS_ADMIN, and anything with
+# those can reach the host. So isolating the build buys very little.
+#
+# What a package postinst could actually do damage with is this repository's
+# credentials — pushing a tampered image, or rewriting os-list.json so every
+# receiver installs it. That is worth defending, and it is defended by keeping
+# the credentials out of the job that runs the untrusted code:
+#
+#   build    no token at all (permissions: {}), no persisted git credentials.
+#            Runs the chroot. Its only output is an artifact.
+#   publish  contents: write, but runs nothing from outside this repository.
+#            Downloads the artifact, re-checks its hashes, and releases it.
+#
+# An escape in `build` gets an ephemeral VM that is about to be destroyed. It
+# does not get the ability to publish.
+# ---------------------------------------------------------------------------
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Publish a release and update os-list.json'
+        type: boolean
+        default: false
+
+permissions: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions: {}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Without this, checkout leaves a usable token in .git/config for the
+          # rest of the job — including for everything the chroot runs.
+          persist-credentials: false
+
+      # The image, a copy of it and the compressed output together need most of
+      # the runner's disk. The preinstalled toolchains are several gigabytes we
+      # have no use for.
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /opt/hostedtoolcache /usr/local/lib/android /usr/share/dotnet
+          df -h /
+
+      # qemu-user-static registers the arm64 binfmt handler as part of its
+      # postinst, so the chroot works without any third-party action.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-user-static parted xz-utils
+          ls -l /proc/sys/fs/binfmt_misc/qemu-aarch64
+
+      - name: Check the payload is in step with src/
+        run: tools/build-vendor-data && git diff --exit-code boot/vendor-data
+
+      - name: Build
+        run: sudo --preserve-env=OGN_VERSION tools/build-image.sh
+        env:
+          OGN_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || format('dev-{0}', github.sha) }}
+
+      - name: Summarise
+        run: |
+          {
+            echo '## Image'
+            echo '```json'
+            cat dist/image-meta.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ogn-receiver-image
+          path: |
+            dist/*.img.xz
+            dist/image-meta.json
+          retention-days: 7
+
+  # Only a tag, or a manual run that asked for it, gets published. A dev build
+  # stops at the artifact and leaves os-list.json alone.
+  publish:
+    needs: build
+    if: github.ref_type == 'tag' || inputs.publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ogn-receiver-image
+          path: dist
+
+      # image-meta.json is what os-list.json is built from, and Imager refuses
+      # any image whose extract_sha256 does not match. Confirm the compressed
+      # file we are about to publish is the one it describes.
+      - name: Verify the artifact matches its metadata
+        run: |
+          set -euo pipefail
+          img=$(ls dist/*.img.xz)
+          want=$(python3 -c 'import json; print(json.load(open("dist/image-meta.json"))["image_download_sha256"])')
+          got=$(sha256sum "$img" | cut -d' ' -f1)
+          [ "$want" = "$got" ] || { echo "artifact SHA256 mismatch: $want != $got"; exit 1; }
+          echo "ok: $(basename "$img")"
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_type == 'tag' && github.ref_name || format('build-{0}', github.run_number) }}
+        run: |
+          set -euo pipefail
+          img=$(ls dist/*.img.xz)
+          base=$(python3 -c 'import json; print(json.load(open("dist/image-meta.json"))["base_image"])')
+
+          notes=$(cat <<EOF
+          Raspberry Pi OS Lite (64-bit) with the OGN receiver software preinstalled.
+
+          Add this to Raspberry Pi Imager as a custom repository:
+
+              https://raw.githubusercontent.com/${{ github.repository }}/master/os-list.json
+
+          Built from \`$base\`.
+          EOF
+          )
+
+          gh release view "$TAG" >/dev/null 2>&1 \
+            || gh release create "$TAG" --title "$TAG" --notes "$notes"
+          gh release upload "$TAG" "$img" dist/image-meta.json --clobber
+
+          echo "DOWNLOAD_URL=https://github.com/${{ github.repository }}/releases/download/$TAG/$(basename "$img")" >> "$GITHUB_ENV"
+
+      - name: Update os-list.json
+        run: |
+          set -euo pipefail
+          tools/make-os-list --meta dist/image-meta.json --url "$DOWNLOAD_URL" --out os-list.json
+
+          git config user.name  'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          if git diff --quiet os-list.json; then
+            echo 'os-list.json already current'
+          else
+            git add os-list.json
+            git commit -m "os-list.json: ${{ github.ref_name }}"
+            git push origin HEAD:master
+          fi

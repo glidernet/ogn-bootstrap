@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+"""add-version - record a released OGN decoder build in versions.json.
+
+Downloads the tarball, computes its SHA256, and cross-checks it against the
+MD5 upstream publishes in md5.txt. The SHA256 is what receivers will verify
+against; the MD5 check here is a second pair of eyes on the download, since
+both come over the same unauthenticated HTTP connection and neither is worth
+anything on its own.
+
+    tools/add-version 0.3.2              # all architectures
+    tools/add-version 0.3.2 --arch arm64
+    tools/add-version 0.3.2 --promote stable
+
+Nothing is downloaded to a receiver by this script; it only edits
+versions.json, which you then review and commit.
+
+Copyright (c) 2026 ifly7charlie. MIT licence, see LICENSE.
+"""
+
+import argparse
+import hashlib
+import json
+import pathlib
+import sys
+import urllib.request
+
+BASE = "http://download.glidernet.org"
+MANIFEST = pathlib.Path(__file__).resolve().parent.parent / "versions.json"
+
+# Upstream uses a different directory and filename spelling per architecture.
+ARCHES = {
+    "arm64": ("arm64", "rtlsdr-ogn-bin-arm64-{v}.tgz"),
+    "armhf": ("arm", "rtlsdr-ogn-bin-ARM-{v}.tgz"),
+}
+
+
+def get(url: str) -> bytes:
+    with urllib.request.urlopen(url, timeout=120) as r:  # noqa: S310 - http only, see docstring
+        return r.read()
+
+
+def upstream_md5s() -> dict:
+    """Parse download.glidernet.org/md5.txt into {path: digest}."""
+    out = {}
+    for line in get(f"{BASE}/md5.txt").decode().splitlines():
+        parts = line.split()
+        if len(parts) == 2:
+            out[parts[1].lstrip("./")] = parts[0]
+    return out
+
+
+def discover(manifest: dict) -> list:
+    """List versions published upstream that the manifest does not know about."""
+    import re
+    known = set(manifest.get("releases", {}))
+    found = set()
+    for subdir, pattern in ARCHES.values():
+        rx = re.compile(re.escape(pattern).replace(r"\{v\}", r"(\d+\.\d+\.\d+)"))
+        try:
+            listing = get(f"{BASE}/{subdir}/").decode(errors="replace")
+        except Exception as exc:  # noqa: BLE001
+            print(f"{subdir}: could not list: {exc}", file=sys.stderr)
+            continue
+        found.update(rx.findall(listing))
+    return sorted(found - known)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("version", nargs="?", help="release to add, e.g. 0.3.2")
+    ap.add_argument("--discover", action="store_true",
+                    help="list versions published upstream but missing here, and exit")
+    ap.add_argument("--arch", action="append", choices=sorted(ARCHES),
+                    help="limit to one architecture (default: all)")
+    ap.add_argument("--released", help="release date, YYYY-MM-DD")
+    ap.add_argument("--notes", default="", help="one-line note for the manifest")
+    ap.add_argument("--promote", choices=["stable", "latest"], action="append",
+                    default=[], help="also point this channel at the version")
+    args = ap.parse_args()
+
+    manifest = json.loads(MANIFEST.read_text())
+
+    if args.discover:
+        for v in discover(manifest):
+            print(v)
+        return 0
+    if not args.version:
+        ap.error("give a version, or use --discover")
+
+    release = manifest["releases"].setdefault(args.version, {})
+    if args.released:
+        release["released"] = args.released
+    if args.notes:
+        release["notes"] = args.notes
+
+    md5s = upstream_md5s()
+
+    for arch in args.arch or sorted(ARCHES):
+        subdir, pattern = ARCHES[arch]
+        name = pattern.format(v=args.version)
+        path = f"{subdir}/{name}"
+        url = f"{BASE}/{path}"
+
+        print(f"{arch}: fetching {url}")
+        try:
+            blob = get(url)
+        except Exception as exc:  # noqa: BLE001 - report and carry on to other arches
+            print(f"{arch}: FAILED: {exc}", file=sys.stderr)
+            continue
+
+        sha256 = hashlib.sha256(blob).hexdigest()
+        md5 = hashlib.md5(blob).hexdigest()  # noqa: S324 - matching upstream's published digest
+
+        published = md5s.get(path)
+        if published is None:
+            print(f"{arch}: WARNING: md5.txt lists no entry for {path}", file=sys.stderr)
+        elif published != md5:
+            print(f"{arch}: REFUSED: md5.txt says {published}, download is {md5}.\n"
+                  f"        The download is corrupt, or upstream changed the file "
+                  f"under a version number that is supposed to be frozen.",
+                  file=sys.stderr)
+            return 1
+        else:
+            print(f"{arch}: md5 matches upstream")
+
+        release[arch] = {
+            "url": url,
+            "md5": md5,
+            "sha256": sha256,
+            "size": len(blob),
+        }
+        print(f"{arch}: sha256 {sha256}  ({len(blob)} bytes)")
+
+    for channel in args.promote:
+        manifest["channels"][channel] = args.version
+        print(f"channel {channel} -> {args.version}")
+
+    MANIFEST.write_text(json.dumps(manifest, indent=2) + "\n")
+    print(f"\nupdated {MANIFEST}. Review the diff, then commit.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

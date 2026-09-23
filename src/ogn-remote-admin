@@ -1,0 +1,192 @@
+#!/bin/bash
+#
+# ogn-remote-admin — optional remote access, driven by Install.RemoteAdmin.
+#
+# Everything here is off unless the operator turned it on. That is a
+# deliberate departure from the older OGN images, which shipped third-party
+# access enabled by default. Remote access to a machine on someone's club
+# network should be a decision somebody made on purpose.
+#
+# Copyright (c) 2026 ifly7charlie. MIT licence, see LICENSE.
+
+set -euo pipefail
+
+LIBDIR="${OGN_LIBDIR:-/usr/local/lib/ogn-bootstrap}"
+# shellcheck source=src/ogn-common.sh
+. "$LIBDIR/ogn-common.sh"
+
+CONF="$BOOT_CONF"
+USER_NAME=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --config) CONF="$2"; shift 2 ;;
+        --user)   USER_NAME="$2"; shift 2 ;;
+        -h|--help) sed -n '3,9p' "$0"; exit 0 ;;
+        *) die "unknown option: $1" ;;
+    esac
+done
+
+need_root
+[ -n "$USER_NAME" ] || USER_NAME=$(detect_ogn_user) || die "could not determine the user"
+HOME_DIR=$(user_home "$USER_NAME")
+USER_GROUP=$(id -gn "$USER_NAME")
+
+conf_load "$CONF"
+trap conf_cleanup EXIT
+
+# ---------------------------------------------------------------------------
+# Extra SSH keys
+# ---------------------------------------------------------------------------
+EXTRA_KEYS=$(conf_get Install.RemoteAdmin.ExtraSSHKeys "")
+if [ -n "$EXTRA_KEYS" ]; then
+    AUTH="$HOME_DIR/.ssh/authorized_keys"
+    install -d -m 0700 -o "$USER_NAME" -g "$USER_GROUP" "$HOME_DIR/.ssh"
+    touch "$AUTH"
+    printf '%s\n' "$EXTRA_KEYS" | while IFS= read -r key; do
+        [ -n "$key" ] || continue
+        grep -qxF "$key" "$AUTH" || { printf '%s\n' "$key" >> "$AUTH"; log "added an extra SSH key"; }
+    done
+    chown "$USER_NAME:$USER_GROUP" "$AUTH"
+    chmod 0600 "$AUTH"
+
+    # Only worth hardening sshd once we know a key can get in.
+    install -d -m 0755 /etc/ssh/sshd_config.d
+    cat > /etc/ssh/sshd_config.d/10-ogn.conf <<'EOF'
+# Installed by ogn-bootstrap because SSH keys were supplied.
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+EOF
+    systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
+fi
+
+# ---------------------------------------------------------------------------
+# Raspberry Pi Connect
+#
+# rpi-connect runs as a *user* service, which means the account needs linger
+# enabled or it stops the moment the operator logs out. Raspberry Pi's own
+# documentation does not mention that; the sequence below is the one Raspberry
+# Pi Imager itself generates, which is the authoritative example.
+# ---------------------------------------------------------------------------
+if conf_bool Install.RemoteAdmin.Connect; then
+    log "enabling Raspberry Pi Connect for $USER_NAME"
+    if ! command -v rpi-connect >/dev/null; then
+        apt_install rpi-connect-lite
+    fi
+
+    UNIT_DIR="$HOME_DIR/.config/systemd/user"
+    install -d -m 0755 -o "$USER_NAME" -g "$USER_GROUP" "$HOME_DIR/.config"
+    install -d -m 0755 -o "$USER_NAME" -g "$USER_GROUP" "$HOME_DIR/.config/systemd"
+    install -d -m 0755 -o "$USER_NAME" -g "$USER_GROUP" "$UNIT_DIR"
+    install -d -m 0755 -o "$USER_NAME" -g "$USER_GROUP" "$UNIT_DIR/default.target.wants"
+    install -d -m 0755 -o "$USER_NAME" -g "$USER_GROUP" "$UNIT_DIR/paths.target.wants"
+    ln -sfn /usr/lib/systemd/user/rpi-connect.service        "$UNIT_DIR/default.target.wants/rpi-connect.service"
+    ln -sfn /usr/lib/systemd/user/rpi-connect-signin.path    "$UNIT_DIR/paths.target.wants/rpi-connect-signin.path"
+    chown -h "$USER_NAME:$USER_GROUP" "$UNIT_DIR/default.target.wants/rpi-connect.service" \
+                                     "$UNIT_DIR/paths.target.wants/rpi-connect-signin.path"
+
+    install -d -m 0755 /var/lib/systemd/linger
+    loginctl enable-linger "$USER_NAME" 2>/dev/null || install -m 0644 /dev/null "/var/lib/systemd/linger/$USER_NAME"
+
+    AUTH_KEY=$(conf_get Install.RemoteAdmin.ConnectAuthKey "")
+    CONNECT_DIR="$HOME_DIR/.config/com.raspberrypi.connect"
+    install -d -m 0700 -o "$USER_NAME" -g "$USER_GROUP" "$CONNECT_DIR"
+    if [ -n "$AUTH_KEY" ]; then
+        printf '%s\n' "$AUTH_KEY" > "$CONNECT_DIR/auth.key"
+        chown "$USER_NAME:$USER_GROUP" "$CONNECT_DIR/auth.key"
+        chmod 0600 "$CONNECT_DIR/auth.key"
+        log "Connect auth key written; the device will link itself"
+    fi
+
+    systemctl --quiet --user --machine="$USER_NAME@.host" daemon-reload 2>/dev/null || true
+    systemctl --quiet --user --machine="$USER_NAME@.host" start rpi-connect.service 2>/dev/null || true
+
+    if [ -z "$AUTH_KEY" ]; then
+        MOTD_FILE=/etc/motd.d/30-ogn-connect motd_set <<EOF
+
+  Raspberry Pi Connect is installed but not yet linked to an account.
+  Run this as $USER_NAME and follow the link it prints:
+
+      rpi-connect signin
+
+EOF
+    else
+        rm -f /etc/motd.d/30-ogn-connect
+    fi
+else
+    rm -f /etc/motd.d/30-ogn-connect
+fi
+
+# ---------------------------------------------------------------------------
+# OGN core team reverse tunnel
+#
+# Opt-in only. This asks autossh.glidernet.org which port to use, then holds a
+# reverse tunnel so the OGN team can reach this receiver's SSH from outside.
+# They must have accepted this machine's key first — see the README. Driven by
+# a systemd timer rather than a cron entry, so its state and failures are
+# visible in the usual place.
+# ---------------------------------------------------------------------------
+if conf_bool Install.RemoteAdmin.OGNTeam; then
+    log "enabling the OGN core team reverse tunnel"
+    apt_install autossh
+
+    cat > /usr/local/sbin/ogn-team-tunnel <<'TUNEOF'
+#!/bin/bash
+# Hold a reverse SSH tunnel to the OGN core team's relay. Installed by
+# ogn-bootstrap, and only when Install.RemoteAdmin.OGNTeam is true.
+set -euo pipefail
+RELAY_HOST="autossh.glidernet.org"
+RELAY_USER="glidernet-assh"
+
+pgrep -x autossh >/dev/null && exit 0
+
+CALL=$(sed -n 's/^ *Call *= *"\([^"]*\)".*/\1/p' /boot/firmware/MyReceiver.conf 2>/dev/null | head -1)
+[ -n "$CALL" ] || CALL=$(hostname -s)
+
+IFACE=$(ip route show default 2>/dev/null | awk '{print $5; exit}')
+MAC=$(cat "/sys/class/net/${IFACE:-eth0}/address" 2>/dev/null || echo unknown)
+VERSION=$(basename "$(readlink -f /home/*/rtlsdr-ogn 2>/dev/null | head -1)" 2>/dev/null || echo unknown)
+
+PORT=$(curl --fail --silent --max-time 30 \
+    "http://$RELAY_HOST/remoteReceiver/?r=$CALL&m=$MAC&i=$VERSION") || {
+        echo "could not obtain a tunnel port from $RELAY_HOST" >&2; exit 1; }
+
+case "$PORT" in ''|*[!0-9]*) echo "relay returned '$PORT', not a port" >&2; exit 1 ;; esac
+
+exec autossh -M "${PORT}0" -N -f \
+    -R "${PORT}:localhost:22" \
+    -o "ServerAliveInterval 60" -o "ServerAliveCountMax 3" \
+    -o "ExitOnForwardFailure yes" -o "StrictHostKeyChecking accept-new" \
+    "$RELAY_USER@$RELAY_HOST"
+TUNEOF
+    chmod 0755 /usr/local/sbin/ogn-team-tunnel
+
+    cat > /etc/systemd/system/ogn-team-tunnel.service <<'EOF'
+[Unit]
+Description=OGN core team reverse SSH tunnel
+Documentation=https://github.com/glidernet/ogn-bootstrap
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=forking
+ExecStart=/usr/local/sbin/ogn-team-tunnel
+EOF
+    cat > /etc/systemd/system/ogn-team-tunnel.timer <<'EOF'
+[Unit]
+Description=Keep the OGN core team reverse tunnel up
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=10min
+
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl daemon-reload
+    systemctl enable --now ogn-team-tunnel.timer >/dev/null
+else
+    systemctl disable --now ogn-team-tunnel.timer >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/ogn-team-tunnel.timer \
+          /etc/systemd/system/ogn-team-tunnel.service \
+          /usr/local/sbin/ogn-team-tunnel
+fi

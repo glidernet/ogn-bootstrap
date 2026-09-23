@@ -1,0 +1,87 @@
+#!/bin/bash
+#
+# ogn-calibrate — measure the SDR's crystal error in ppm using gsm_scan.
+#
+#   sudo ogn-calibrate            measure and report
+#   sudo ogn-calibrate --quiet    print just the number, for scripting
+#   sudo ogn-calibrate --apply    measure and write FreqCorr into the config
+#
+# gsm_scan listens to GSM base stations, whose carriers are held to a far
+# tighter tolerance than any TV dongle, and reports how far off yours is.
+# It needs the aerial connected and GSM coverage; on a rural site or a stick
+# with a TCXO the answer may simply be "no usable signal", which is fine —
+# leave FreqCorr unset and the decoder uses its default.
+#
+# Copyright (c) 2026 ifly7charlie. MIT licence, see LICENSE.
+
+set -euo pipefail
+
+LIBDIR="${OGN_LIBDIR:-/usr/local/lib/ogn-bootstrap}"
+# shellcheck source=src/ogn-common.sh
+. "$LIBDIR/ogn-common.sh"
+
+QUIET=0
+APPLY=0
+SCAN_TIMEOUT="${OGN_CALIBRATE_TIMEOUT:-180}"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --quiet)   QUIET=1; shift ;;
+        --apply)   APPLY=1; shift ;;
+        -h|--help) sed -n '3,14p' "$0"; exit 0 ;;
+        *)         die "unknown option: $1" ;;
+    esac
+done
+
+need_root
+OGN_USER=$(detect_ogn_user) || die "could not determine the user"
+INSTALL_DIR=$(readlink -f "$(user_home "$OGN_USER")/rtlsdr-ogn" 2>/dev/null) \
+    || die "the OGN software is not installed yet"
+[ -x "$INSTALL_DIR/gsm_scan" ] || die "no gsm_scan in $INSTALL_DIR"
+
+TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+cat > "$TMP/scan.conf" <<'EOF'
+RF:
+{ GSM:
+  { CenterFreq = 938.4;
+    Gain       =  25.0;
+  } ;
+} ;
+EOF
+
+[ "$QUIET" -eq 1 ] || log "scanning for GSM carriers (up to ${SCAN_TIMEOUT}s) — this needs the aerial connected"
+
+OUT=$(cd "$INSTALL_DIR" && timeout "$SCAN_TIMEOUT" ./gsm_scan "$TMP/scan.conf" 2>&1) || true
+
+# gsm_scan reports a line containing "Receiver Xtal correction" followed by the
+# figure in ppm. Pull the first number that follows that phrase rather than a
+# fixed field position, so a change in spacing or wording order does not
+# silently yield a wrong correction.
+PPM=$(printf '%s\n' "$OUT" \
+      | sed -n 's/.*[Xx]tal correction[^0-9+-]*\([+-]\?[0-9]\+\(\.[0-9]\+\)\?\).*/\1/p' \
+      | head -1)
+
+if [ -z "$PPM" ]; then
+    [ "$QUIET" -eq 1 ] || warn "no usable GSM signal found; leaving FreqCorr unset"
+    exit 1
+fi
+
+PPM=${PPM%.*}   # the config wants an integer
+
+if [ "$QUIET" -eq 1 ]; then
+    printf '%s\n' "$PPM"
+    exit 0
+fi
+
+log "measured frequency correction: ${PPM} ppm"
+
+if [ "$APPLY" -eq 1 ]; then
+    CONF="$INSTALL_DIR/MyReceiver.conf"
+    [ -f "$CONF" ] || die "no $CONF to update"
+    if grep -Eq '^\s*FreqCorr\s*=' "$CONF"; then
+        sed -i "s|^\( *FreqCorr *= *\).*|\1$PPM;   # measured by ogn-calibrate|" "$CONF"
+    else
+        sed -i "s|^\( *SampleRate *=\)|  FreqCorr = $PPM;   # measured by ogn-calibrate\n\1|" "$CONF"
+    fi
+    log "wrote FreqCorr = $PPM to $CONF"
+    systemctl is-active --quiet rtlsdr-ogn.service && systemctl restart rtlsdr-ogn.service
+fi

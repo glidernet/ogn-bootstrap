@@ -1,0 +1,84 @@
+#!/bin/bash
+#
+# build-vendor-data — assemble src/ into boot/vendor-data.
+#
+# The result is a single shell script that unpacks the installer onto the Pi
+# and runs it. It is deliberately plain text rather than a base64 blob: this
+# file ends up on somebody's SD card, and they should be able to read what it
+# is about to do to their machine.
+#
+# Copyright (c) 2026 ifly7charlie. MIT licence, see LICENSE.
+
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+OUT=boot/vendor-data
+LIB_FILES=(src/ogn-common.sh)
+BIN_FILES=(src/ogn-install src/ogn-update src/ogn-maintenance src/ogn-remote-admin src/ogn-calibrate)
+
+emit_file() {
+    local src="$1" dest="$2" mode="$3" marker
+    marker="OGN_PAYLOAD_$(basename "$src" | tr '.-' '__')"
+    if grep -qF "$marker" "$src"; then
+        echo "refusing to build: $src contains the heredoc marker $marker" >&2
+        exit 1
+    fi
+    printf "cat > %s <<'%s'\n" "$dest" "$marker"
+    cat "$src"
+    printf '%s\nchmod %s %s\n\n' "$marker" "$mode" "$dest"
+}
+
+{
+cat <<'HEADER'
+#!/bin/bash
+#
+# OGN receiver first-boot installer.
+#
+# This file was placed on the boot partition of this SD card. cloud-init runs
+# it once, as root, the first time the Pi starts, and it:
+#
+#   * installs rtl-sdr and the supporting packages from Debian
+#   * stops the DVB-T drivers claiming the SDR stick
+#   * downloads the OGN decoder from download.glidernet.org, checking it
+#     against a SHA256 published at github.com/glidernet/ogn-bootstrap
+#   * copies your MyReceiver.conf into place and starts the receiver
+#   * optionally switches the root filesystem to read-only, and sets up a
+#     weekly window for security updates
+#
+# It does NOT enable any remote access unless you asked for it in
+# MyReceiver.conf. Everything under Install.RemoteAdmin is off by default.
+#
+# Nothing here needs editing. Your settings all live in MyReceiver.conf,
+# next to this file.
+#
+# Source and documentation: https://github.com/glidernet/ogn-bootstrap
+# Copyright (c) 2026 ifly7charlie. MIT licence.
+#
+# ---------------------------------------------------------------------------
+# GENERATED FILE — do not edit. Rebuild with tools/build-vendor-data.
+# ---------------------------------------------------------------------------
+
+set -euo pipefail
+
+LIBDIR=/usr/local/lib/ogn-bootstrap
+install -d -m 0755 "$LIBDIR" /usr/local/sbin
+
+HEADER
+
+for f in "${LIB_FILES[@]}"; do
+    emit_file "$f" "\$LIBDIR/$(basename "$f")" 0644
+done
+for f in "${BIN_FILES[@]}"; do
+    emit_file "$f" "/usr/local/sbin/$(basename "$f")" 0755
+done
+
+cat <<'FOOTER'
+# Hand over to the installer. Its output goes to the cloud-init log, which is
+# /var/log/cloud-init-output.log, and to the journal.
+exec /usr/local/sbin/ogn-install
+FOOTER
+} > "$OUT"
+
+chmod 0755 "$OUT"
+bash -n "$OUT"
+printf 'wrote %s (%s lines, %s bytes)\n' "$OUT" "$(wc -l < "$OUT")" "$(wc -c < "$OUT")"

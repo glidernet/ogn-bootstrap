@@ -1,0 +1,10 @@
+* text=auto
+
+# These end up on an SD card and are read by a shell or by libconfig. CRLF in
+# either would be a strange way to spend an afternoon.
+boot/vendor-data      text eol=lf
+boot/MyReceiver.conf  text eol=lf
+src/*                 text eol=lf
+tools/*               text eol=lf
+
+*.png binary

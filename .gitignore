@@ -1,0 +1,8 @@
+*.img
+*.img.xz
+*.tgz
+.DS_Store
+
+# Image build scratch and output. os-list.json is committed; dist/ is not.
+.build/
+dist/

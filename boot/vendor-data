@@ -1,0 +1,1519 @@
+#!/bin/bash
+#
+# OGN receiver first-boot installer.
+#
+# This file was placed on the boot partition of this SD card. cloud-init runs
+# it once, as root, the first time the Pi starts, and it:
+#
+#   * installs rtl-sdr and the supporting packages from Debian
+#   * stops the DVB-T drivers claiming the SDR stick
+#   * downloads the OGN decoder from download.glidernet.org, checking it
+#     against a SHA256 published at github.com/glidernet/ogn-bootstrap
+#   * copies your MyReceiver.conf into place and starts the receiver
+#   * optionally switches the root filesystem to read-only, and sets up a
+#     weekly window for security updates
+#
+# It does NOT enable any remote access unless you asked for it in
+# MyReceiver.conf. Everything under Install.RemoteAdmin is off by default.
+#
+# Nothing here needs editing. Your settings all live in MyReceiver.conf,
+# next to this file.
+#
+# Source and documentation: https://github.com/glidernet/ogn-bootstrap
+# Copyright (c) 2026 ifly7charlie. MIT licence.
+#
+# ---------------------------------------------------------------------------
+# GENERATED FILE — do not edit. Rebuild with tools/build-vendor-data.
+# ---------------------------------------------------------------------------
+
+set -euo pipefail
+
+LIBDIR=/usr/local/lib/ogn-bootstrap
+install -d -m 0755 "$LIBDIR" /usr/local/sbin
+
+cat > $LIBDIR/ogn-common.sh <<'OGN_PAYLOAD_ogn_common_sh'
+# shellcheck shell=bash
+# Shared helpers for the ogn-bootstrap scripts.
+# Sourced, never executed directly.
+#
+# Copyright (c) 2026 ifly7charlie. MIT licence, see LICENSE.
+
+# cloud-init runs the vendor script with a minimal PATH, so make sure the
+# sibling commands are reachable by bare name.
+case ":$PATH:" in *:/usr/local/sbin:*) ;; *) PATH="/usr/local/sbin:$PATH" ;; esac
+export PATH
+
+BOOT_DIR="${OGN_BOOT_DIR:-/boot/firmware}"
+# Used by the scripts that source this file, which shellcheck cannot see.
+# shellcheck disable=SC2034
+BOOT_CONF="$BOOT_DIR/MyReceiver.conf"
+# shellcheck disable=SC2034
+STATE_DIR="$BOOT_DIR/ogn-bootstrap"
+MANIFEST_URL="${OGN_MANIFEST_URL:-https://raw.githubusercontent.com/glidernet/ogn-bootstrap/master/versions.json}"
+MANIFEST_CACHE="/var/lib/ogn-bootstrap/versions.json"
+MOTD_FILE="/etc/motd.d/10-ogn-bootstrap"
+
+log()  { printf '%s ogn-bootstrap: %s\n' "$(date -Is)" "$*"; }
+warn() { printf '%s ogn-bootstrap: WARNING: %s\n' "$(date -Is)" "$*" >&2; }
+die()  { printf '%s ogn-bootstrap: ERROR: %s\n' "$(date -Is)" "$*" >&2; exit 1; }
+
+need_root() {
+    [ "$(id -u)" -eq 0 ] || die "must run as root (try: sudo $0)"
+}
+
+# --------------------------------------------------------------------------
+# libconfig reader
+#
+# Flattens a libconfig file to PATH=VALUE lines, e.g.
+#   Install.RemoteAdmin.Connect=false
+# Comments (// # /* */) are stripped string-aware, so a URL inside a quoted
+# string is not mistaken for a comment. Values keep their quotes; conf_get
+# strips them.
+# --------------------------------------------------------------------------
+_libconfig_flatten() {
+    LC_ALL=C awk '{ src = src $0 "\n" } END {
+        n = length(src); i = 1; instr = 0; out = ""
+        while (i <= n) {
+            c = substr(src, i, 1)
+            if (instr) {
+                out = out c
+                if (c == "\\") { i++; out = out substr(src, i, 1); i++; continue }
+                if (c == "\"") instr = 0
+                i++; continue
+            }
+            if (c == "\"") { instr = 1; out = out c; i++; continue }
+            if (c == "/" && substr(src, i+1, 1) == "/") {
+                while (i <= n && substr(src, i, 1) != "\n") i++; continue }
+            if (c == "#") {
+                while (i <= n && substr(src, i, 1) != "\n") i++; continue }
+            if (c == "/" && substr(src, i+1, 1) == "*") {
+                i += 2
+                while (i <= n && !(substr(src, i, 1) == "*" && substr(src, i+1, 1) == "/")) i++
+                i += 2; continue }
+            out = out c; i++
+        }
+        n = length(out); i = 1; np = 0; pending = ""
+        while (i <= n) {
+            c = substr(out, i, 1)
+            if (c == " " || c == "\t" || c == "\n" || c == "\r") { i++; continue }
+            if (c ~ /[A-Za-z_]/) {
+                j = i
+                while (j <= n && substr(out, j, 1) ~ /[A-Za-z0-9_]/) j++
+                pending = substr(out, i, j - i); i = j; continue }
+            if (c == "{") { np++; stack[np] = pending; pending = ""; i++; continue }
+            if (c == "}") { if (np > 0) { delete stack[np]; np-- } pending = ""; i++; continue }
+            if (c == "=") {
+                j = i + 1; val = ""; bd = 0; ins = 0
+                while (j <= n) {
+                    d = substr(out, j, 1)
+                    if (ins) {
+                        val = val d
+                        if (d == "\\") { j++; val = val substr(out, j, 1); j++; continue }
+                        if (d == "\"") ins = 0
+                        j++; continue }
+                    if (d == "\"") { ins = 1; val = val d; j++; continue }
+                    if (d == "[" || d == "(") { bd++; val = val d; j++; continue }
+                    if (d == "]" || d == ")") { bd--; val = val d; j++; continue }
+                    if (d == ";" && bd <= 0) break
+                    val = val d; j++
+                }
+                p = ""
+                for (k = 1; k <= np; k++) p = p stack[k] "."
+                gsub(/^[ \t\r\n]+/, "", val); gsub(/[ \t\r\n]+$/, "", val)
+                print p pending "=" val
+                pending = ""; i = j + 1; continue }
+            i++
+        }
+    }' "$1"
+}
+
+# conf_load <file> — flatten a libconfig file into a lookup table
+#
+# Deliberately a temp file rather than an associative array: Raspberry Pi OS
+# has bash 5, but this way the scripts also run under the bash 3.2 on a Mac,
+# which is where the test harness runs.
+OGN_CONF_CACHE=""
+conf_load() {
+    local file="$1"
+    [ -r "$file" ] || die "cannot read $file"
+    [ -n "$OGN_CONF_CACHE" ] || OGN_CONF_CACHE=$(mktemp)
+    _libconfig_flatten "$file" > "$OGN_CONF_CACHE"
+    [ -s "$OGN_CONF_CACHE" ] || die "$file contained no settings — is it valid libconfig?"
+}
+
+conf_cleanup() { [ -n "$OGN_CONF_CACHE" ] && rm -f "$OGN_CONF_CACHE"; }
+
+# conf_get <path> [default]
+conf_get() {
+    local k="$1" d="${2-}" val
+    val=$(grep -m1 "^$k=" "$OGN_CONF_CACHE" 2>/dev/null) || true
+    if [ -z "$val" ]; then printf '%s' "$d"; return 0; fi
+    val="${val#*=}"
+    # strip one layer of surrounding double quotes
+    case "$val" in
+        '"'*'"') val="${val#\"}"; val="${val%\"}" ;;
+    esac
+    if [ -z "$val" ]; then printf '%s' "$d"; else printf '%s' "$val"; fi
+}
+
+# conf_has <path> — true if the key is present at all, even if empty
+conf_has() { grep -q "^$1=" "$OGN_CONF_CACHE" 2>/dev/null; }
+
+# conf_bool <path> [default] — true/yes/1/on are true, anything else false
+conf_bool() {
+    case "$(conf_get "$1" "${2:-false}" | tr '[:upper:]' '[:lower:]')" in
+        true|yes|1|on) return 0 ;;
+        *)             return 1 ;;
+    esac
+}
+
+# --------------------------------------------------------------------------
+# Service user
+#
+# Trixie has no default 'pi' account: Raspberry Pi Imager creates whatever the
+# operator typed. Detect it rather than hardcoding, so the install lands in the
+# right home directory whatever they chose.
+# --------------------------------------------------------------------------
+detect_ogn_user() {
+    local u
+    if [ -n "${OGN_USER_OVERRIDE:-}" ]; then
+        printf '%s' "$OGN_USER_OVERRIDE"; return 0
+    fi
+    # UID 1000 is what Imager creates
+    u=$(getent passwd 1000 | cut -d: -f1)
+    if [ -n "$u" ]; then printf '%s' "$u"; return 0; fi
+    # fall back to the first member of the sudo group with a real home
+    for u in $(getent group sudo | cut -d: -f4 | tr ',' ' '); do
+        if [ -d "$(getent passwd "$u" | cut -d: -f6)" ]; then
+            printf '%s' "$u"; return 0
+        fi
+    done
+    return 1
+}
+
+user_home() { getent passwd "$1" | cut -d: -f6; }
+
+# --------------------------------------------------------------------------
+# apt
+#
+# cloud-init may still be holding the lock when the vendor script runs, so wait
+# rather than failing the whole first boot on a race.
+# --------------------------------------------------------------------------
+apt_wait() {
+    local waited=0
+    while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 \
+       || fuser /var/lib/apt/lists/lock   >/dev/null 2>&1; do
+        [ "$waited" -eq 0 ] && log "waiting for the apt lock to clear"
+        sleep 5
+        waited=$((waited + 5))
+        [ "$waited" -ge 600 ] && die "apt lock still held after 10 minutes"
+    done
+}
+
+apt_install() {
+    [ $# -gt 0 ] || return 0
+    local missing=()
+    local p
+    for p in "$@"; do
+        dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q "ok installed" || missing+=("$p")
+    done
+    [ ${#missing[@]} -eq 0 ] && return 0
+    log "installing: ${missing[*]}"
+    apt_wait
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq
+    apt_wait
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends "${missing[@]}"
+}
+
+# --------------------------------------------------------------------------
+# Downloads
+#
+# The OGN binaries are served from download.glidernet.org over plain HTTP.
+# There is no HTTPS: https:// fails the TLS handshake outright, and port 443
+# on that host serves *cleartext*, so any "try TLS first" fallback would look
+# like it worked while providing nothing.
+#
+# Integrity therefore comes from versions.json, which we fetch from GitHub over
+# real TLS. Upstream's published MD5 is checked too, but only for what it was
+# always for: spotting a truncated or corrupted download.
+# --------------------------------------------------------------------------
+fetch() {
+    local url="$1" dest="$2"
+    curl --fail --silent --show-error --location \
+         --connect-timeout 20 --max-time 600 --retry 3 --retry-delay 5 \
+         --proto '=http,https' \
+         -o "$dest" "$url"
+}
+
+verify_sha256() {
+    local file="$1" expected="$2" actual
+    [ -n "$expected" ] || die "no expected SHA256 supplied for $file"
+    actual=$(sha256sum "$file" | cut -d' ' -f1)
+    if [ "$actual" != "$expected" ]; then
+        die "SHA256 mismatch for $file: expected $expected, got $actual"
+    fi
+}
+
+verify_md5() {
+    local file="$1" expected="$2" actual
+    [ -n "$expected" ] || return 0
+    actual=$(md5sum "$file" | cut -d' ' -f1)
+    if [ "$actual" != "$expected" ]; then
+        warn "upstream MD5 mismatch for $file (download may be corrupt)"
+        return 1
+    fi
+    return 0
+}
+
+# --------------------------------------------------------------------------
+# Manifest
+#
+# json_get uses python3, which Raspberry Pi OS Lite ships. Keeping the manifest
+# as JSON means tools/add-version and the GitHub action can edit it safely.
+# --------------------------------------------------------------------------
+manifest_fetch() {
+    local tmp
+    if ! mkdir -p "$(dirname "$MANIFEST_CACHE")" 2>/dev/null; then
+        # Not root, so we cannot refresh the cache. A read-only check against
+        # whatever was last fetched is still useful.
+        [ -r "$MANIFEST_CACHE" ] && return 0
+        return 1
+    fi
+    tmp=$(mktemp)
+    if fetch "$MANIFEST_URL" "$tmp" && python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$tmp"; then
+        mv "$tmp" "$MANIFEST_CACHE"
+        return 0
+    fi
+    rm -f "$tmp"
+    if [ -r "$MANIFEST_CACHE" ]; then
+        warn "could not fetch the version manifest; using the cached copy"
+        return 0
+    fi
+    return 1
+}
+
+# manifest_resolve <channel-or-version> -> prints the version number
+manifest_resolve() {
+    python3 - "$MANIFEST_CACHE" "$1" <<'PY'
+import json, sys
+m = json.load(open(sys.argv[1]))
+want = sys.argv[2]
+v = m.get("channels", {}).get(want, want)
+if v not in m.get("releases", {}):
+    sys.exit(1)
+print(v)
+PY
+}
+
+# manifest_field <version> <arch> <field>
+manifest_field() {
+    python3 - "$MANIFEST_CACHE" "$1" "$2" "$3" <<'PY'
+import json, sys
+m = json.load(open(sys.argv[1]))
+try:
+    print(m["releases"][sys.argv[2]][sys.argv[3]][sys.argv[4]])
+except KeyError:
+    sys.exit(1)
+PY
+}
+
+ogn_arch() {
+    case "$(dpkg --print-architecture)" in
+        arm64) printf 'arm64' ;;
+        armhf) printf 'armhf' ;;
+        *)     printf '%s' "$(dpkg --print-architecture)" ;;
+    esac
+}
+
+# --------------------------------------------------------------------------
+# Boot partition
+#
+# /boot/firmware is FAT, and FAT is what actually corrupts when the power goes
+# off mid-write. The root filesystem is protected by the overlay, but the boot
+# partition cannot be: cloud-init has to read it, and the maintenance marker
+# has to survive the reboots the maintenance cycle depends on.
+#
+# So it is mounted read-only in normal running and made writable only for the
+# few seconds it takes to write something, then flushed and dropped back. A
+# receiver that is never powered down cleanly will still come back.
+# --------------------------------------------------------------------------
+boot_rw() {
+    mountpoint -q "$BOOT_DIR" || return 0
+    findmnt -no OPTIONS "$BOOT_DIR" | grep -q '^ro\b\|,ro\b' || return 0
+    mount -o remount,rw "$BOOT_DIR"
+}
+
+boot_ro() {
+    mountpoint -q "$BOOT_DIR" || return 0
+    sync -f "$BOOT_DIR" 2>/dev/null || sync
+    mount -o remount,ro "$BOOT_DIR" 2>/dev/null || true
+}
+
+# boot_write <path> — write stdin to a file on the boot partition, safely
+boot_write() {
+    local dest="$1" was_ro=0
+    findmnt -no OPTIONS "$BOOT_DIR" 2>/dev/null | grep -q '^ro\b\|,ro\b' && was_ro=1
+    [ "$was_ro" -eq 1 ] && boot_rw
+    mkdir -p "$(dirname "$dest")"
+    cat > "$dest"
+    sync -f "$dest" 2>/dev/null || sync
+    [ "$was_ro" -eq 1 ] && boot_ro
+    return 0
+}
+
+# --------------------------------------------------------------------------
+# MOTD
+# --------------------------------------------------------------------------
+motd_set() {
+    mkdir -p "$(dirname "$MOTD_FILE")"
+    cat > "$MOTD_FILE"
+}
+OGN_PAYLOAD_ogn_common_sh
+chmod 0644 $LIBDIR/ogn-common.sh
+
+cat > /usr/local/sbin/ogn-install <<'OGN_PAYLOAD_ogn_install'
+#!/bin/bash
+#
+# ogn-install — set up an OGN receiver on Raspberry Pi OS Trixie.
+#
+# Normally run once, unattended, by cloud-init on first boot. Also safe to run
+# by hand on an already-configured Pi: every step is idempotent.
+#
+#   sudo ogn-install              use /boot/firmware/MyReceiver.conf
+#   sudo ogn-install --config X   use a different config file
+#   sudo ogn-install --no-reboot  ignore Install.RebootWhenDone
+#
+# Copyright (c) 2026 ifly7charlie. MIT licence, see LICENSE.
+
+set -euo pipefail
+
+LIBDIR="${OGN_LIBDIR:-/usr/local/lib/ogn-bootstrap}"
+# shellcheck source=src/ogn-common.sh
+. "$LIBDIR/ogn-common.sh"
+
+CONF_OVERRIDE=""
+FORCE_NO_REBOOT=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --config)    CONF_OVERRIDE="$2"; shift 2 ;;
+        --no-reboot) FORCE_NO_REBOOT=1; shift ;;
+        -h|--help)   sed -n '3,12p' "$0"; exit 0 ;;
+        *)           die "unknown option: $1" ;;
+    esac
+done
+[ -n "$CONF_OVERRIDE" ] && BOOT_CONF="$CONF_OVERRIDE"
+
+need_root
+mkdir -p /var/lib/ogn-bootstrap
+
+# ---------------------------------------------------------------------------
+# 1. Read and sanity-check the configuration
+# ---------------------------------------------------------------------------
+if [ ! -r "$BOOT_CONF" ]; then
+    motd_set <<EOF
+
+  OGN receiver: NOT CONFIGURED
+
+  No MyReceiver.conf was found at $BOOT_CONF.
+
+  Copy it from https://github.com/glidernet/ogn-bootstrap onto the boot
+  partition of the SD card, fill in the four TODO lines, and run:
+
+      sudo ogn-install
+
+EOF
+    die "no configuration at $BOOT_CONF — nothing installed"
+fi
+
+log "reading $BOOT_CONF"
+conf_load "$BOOT_CONF"
+trap conf_cleanup EXIT
+
+OGN_USER=$(detect_ogn_user) || die "could not work out which account to install for; pass OGN_USER_OVERRIDE"
+OGN_HOME=$(user_home "$OGN_USER")
+[ -d "$OGN_HOME" ] || die "home directory $OGN_HOME for $OGN_USER does not exist"
+OGN_GROUP=$(id -gn "$OGN_USER")
+log "installing for user $OGN_USER ($OGN_HOME)"
+
+# Receiver name: blank means "use the hostname", which is the one OGN setting
+# Raspberry Pi Imager can actually capture.
+CALL=$(conf_get APRS.Call "")
+CALL_SOURCE="MyReceiver.conf"
+if [ -z "$CALL" ]; then
+    CALL=$(hostname -s)
+    CALL_SOURCE="hostname"
+fi
+if ! printf '%s' "$CALL" | grep -Eq '^[A-Za-z0-9]{1,9}$'; then
+    die "receiver name '$CALL' (from $CALL_SOURCE) is not valid: up to 9 letters and digits, nothing else.
+     See http://wiki.glidernet.org/receiver-naming-convention"
+fi
+log "receiver name: $CALL (from $CALL_SOURCE)"
+
+# Position. A receiver reporting from a template default is worse than one that
+# is plainly switched off, so this gates the decoder rather than the install.
+LAT=$(conf_get Position.Latitude 0)
+LON=$(conf_get Position.Longitude 0)
+ALT=$(conf_get Position.Altitude 0)
+POSITION_OK=1
+if awk "BEGIN{exit !($LAT == 0 && $LON == 0)}" 2>/dev/null; then
+    POSITION_OK=0
+    warn "position is still 0,0 — the receiver will be installed but left stopped"
+elif awk "BEGIN{exit !($LAT < -90 || $LAT > 90 || $LON < -180 || $LON > 180)}" 2>/dev/null; then
+    POSITION_OK=0
+    warn "position $LAT,$LON is out of range — the receiver will be left stopped"
+else
+    log "position: $LAT, $LON at ${ALT} m AMSL"
+    # Not fatal: an aerial genuinely at 0 m AMSL is possible, just unusual
+    # enough to be worth saying out loud, since it is also what you get by
+    # filling in the position and forgetting the line underneath it.
+    awk "BEGIN{exit !($ALT == 0)}" 2>/dev/null \
+        && warn "altitude is 0 m — check Position.Altitude is the aerial's height above SEA level, in metres"
+fi
+
+READONLY_FS=0;    conf_bool Install.ReadOnlyFS    true && READONLY_FS=1
+REBOOT_WHEN_DONE=0; conf_bool Install.RebootWhenDone true && REBOOT_WHEN_DONE=1
+[ "$FORCE_NO_REBOOT" -eq 1 ] && REBOOT_WHEN_DONE=0
+CHANNEL=$(conf_get Install.UpdateChannel stable)
+WINDOW=$(conf_get Install.MaintenanceWindow "")
+
+# ---------------------------------------------------------------------------
+# 2. Packages
+#
+# Trixie substitutions worth knowing: libconfig9 -> libconfig11 (and the 0.3.2
+# binaries static-link it anyway), ntp/ntpdate are gone entirely, and the
+# decoder needs libpng16 rather than the libjpeg8 the old guides all mention.
+#
+# procServ and telnet are deliberately absent. The older images ran both
+# binaries inside procServ so you could telnet to ports 50000/50001 and watch
+# the console. Here they are ordinary systemd services, so the same output is
+# in the journal -- which survives, is rotated, and can be read remotely --
+# and there is no console to attach to. `journalctl -u ogn-decode -f`.
+# ---------------------------------------------------------------------------
+PACKAGES=(rtl-sdr librtlsdr0 libpng16-16t64 lynx curl ca-certificates unattended-upgrades)
+[ "$READONLY_FS" -eq 1 ] && PACKAGES+=(overlayroot)
+conf_bool Install.RemoteAdmin.OGNTeam && PACKAGES+=(autossh)
+apt_install "${PACKAGES[@]}"
+
+# ---------------------------------------------------------------------------
+# 3. Keep the DVB-T drivers off the SDR
+# ---------------------------------------------------------------------------
+BLACKLIST=/etc/modprobe.d/rtl-glidernet-blacklist.conf
+if [ ! -f "$BLACKLIST" ]; then
+    log "blacklisting the DVB-T kernel drivers"
+    cat > "$BLACKLIST" <<'EOF'
+# The RTL2832-based SDR sticks are claimed by the DVB-T drivers on plug-in,
+# which stops rtl-sdr from opening them. Installed by ogn-bootstrap.
+blacklist rtl2832
+blacklist r820t
+blacklist rtl2830
+blacklist dvb_usb_rtl28xxu
+EOF
+    for m in dvb_usb_rtl28xxu rtl2832 rtl2830 r820t; do
+        modprobe -r "$m" 2>/dev/null || true
+    done
+fi
+
+# ---------------------------------------------------------------------------
+# 4. Decoder binaries
+# ---------------------------------------------------------------------------
+OGN_USER="$OGN_USER" OGN_HOME="$OGN_HOME" ogn-update --channel "$CHANNEL" --install-only
+
+INSTALL_DIR="$OGN_HOME/rtlsdr-ogn"
+[ -d "$INSTALL_DIR" ] || die "expected $INSTALL_DIR after installing the binaries"
+REAL_DIR=$(readlink -f "$INSTALL_DIR")
+
+# ---------------------------------------------------------------------------
+# 5. Place the configuration
+#
+# Copied, not regenerated: what was edited on the card is what runs. Only two
+# values are ever rewritten, and only when the operator left them for us.
+# ---------------------------------------------------------------------------
+TARGET_CONF="$REAL_DIR/MyReceiver.conf"
+log "writing $TARGET_CONF"
+install -o "$OGN_USER" -g "$OGN_GROUP" -m 0644 "$BOOT_CONF" "$TARGET_CONF"
+
+if [ "$CALL_SOURCE" = "hostname" ]; then
+    sed -i "s|^\( *Call *= *\)\"\"|\1\"$CALL\"|" "$TARGET_CONF"
+fi
+
+if ! conf_has RF.FreqCorr && [ -x "$REAL_DIR/gsm_scan" ]; then
+    if PPM=$(ogn-calibrate --quiet 2>/dev/null) && [ -n "$PPM" ]; then
+        log "measured frequency correction: ${PPM} ppm"
+        sed -i "s|^\( *SampleRate *=\)|  FreqCorr = $PPM;   # measured by ogn-calibrate at install\n\1|" "$TARGET_CONF"
+    else
+        log "could not measure frequency correction; run 'sudo ogn-calibrate' once the aerial is connected"
+    fi
+fi
+
+# The geoid grid lets the decoder convert between ellipsoid and sea-level
+# heights properly, which is why GeoidSepar is deliberately absent from the
+# config template.
+if [ ! -s "$REAL_DIR/WW15MGH.DAC" ]; then
+    log "fetching the EGM96 geoid grid"
+    ( cd "$REAL_DIR" && runuser -u "$OGN_USER" -- bash ./getEGM.sh ) \
+        || warn "could not fetch WW15MGH.DAC; altitudes will be less accurate"
+fi
+
+# ---------------------------------------------------------------------------
+# 6. Services
+# ---------------------------------------------------------------------------
+install -d -m 0755 /etc/systemd/system
+
+write_unit() {
+    local name="$1" tmp
+    tmp=$(mktemp)
+    cat > "$tmp"
+    if ! cmp -s "$tmp" "/etc/systemd/system/$name"; then
+        install -m 0644 "$tmp" "/etc/systemd/system/$name"
+        log "updated $name"
+    fi
+    rm -f "$tmp"
+}
+
+write_unit ogn-rf.service <<EOF
+[Unit]
+Description=OGN receiver: RF front end
+Documentation=https://github.com/glidernet/ogn-bootstrap
+PartOf=rtlsdr-ogn.service
+After=time-sync.target
+Wants=time-sync.target
+
+[Service]
+Type=simple
+User=$OGN_USER
+WorkingDirectory=$REAL_DIR
+ExecStart=$REAL_DIR/ogn-rf MyReceiver.conf
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+EOF
+
+write_unit ogn-decode.service <<EOF
+[Unit]
+Description=OGN receiver: decoder and APRS uplink
+Documentation=https://github.com/glidernet/ogn-bootstrap
+PartOf=rtlsdr-ogn.service
+After=ogn-rf.service time-sync.target
+Wants=time-sync.target
+
+[Service]
+Type=simple
+User=$OGN_USER
+WorkingDirectory=$REAL_DIR
+ExecStart=$REAL_DIR/ogn-decode MyReceiver.conf
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+EOF
+
+# The grouping unit exists so that 'systemctl restart rtlsdr-ogn' does the
+# obvious thing. PartOf= on the two real units makes stop/restart propagate.
+write_unit rtlsdr-ogn.service <<EOF
+[Unit]
+Description=OGN receiver
+Documentation=https://github.com/glidernet/ogn-bootstrap
+Wants=ogn-rf.service ogn-decode.service
+After=ogn-rf.service ogn-decode.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Let the monitoring tooling restart the receiver without a password.
+SUDOERS=/etc/sudoers.d/010-ogn-receiver
+if [ ! -f "$SUDOERS" ] || ! grep -q "^$OGN_USER " "$SUDOERS"; then
+    printf '%s ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart rtlsdr-ogn\n' "$OGN_USER" > "$SUDOERS"
+    chmod 0440 "$SUDOERS"
+    visudo -cqf "$SUDOERS" || { rm -f "$SUDOERS"; die "generated an invalid sudoers file"; }
+fi
+
+# ---------------------------------------------------------------------------
+# 7. Clock
+#
+# The old guides run ntpdate from cron every ten minutes. On Trixie ntpdate is
+# not merely unnecessary, it does not exist: systemd-timesyncd is the time
+# source. What the decoder actually needs is to not start before the clock is
+# right, and time-sync.target alone does not guarantee that — it is reached
+# when synchronisation *starts*. systemd-time-wait-sync is what makes the
+# ordering mean what it looks like it means, and Debian ships it disabled.
+# ---------------------------------------------------------------------------
+systemctl enable --now systemd-timesyncd.service >/dev/null 2>&1 || true
+systemctl enable systemd-time-wait-sync.service  >/dev/null 2>&1 || true
+
+# ---------------------------------------------------------------------------
+# 8. Hardware watchdog
+#
+# A drop-in, rather than editing /etc/systemd/system.conf, which is deprecated.
+# ---------------------------------------------------------------------------
+install -d -m 0755 /etc/systemd/system.conf.d
+cat > /etc/systemd/system.conf.d/10-ogn-watchdog.conf <<'EOF'
+# Reboot if the kernel stops petting the watchdog. Installed by ogn-bootstrap.
+[Manager]
+RuntimeWatchdogSec=15
+RebootWatchdogSec=3min
+EOF
+
+# ---------------------------------------------------------------------------
+# 9. Logs
+#
+# The decoder is chatty, and a receiver runs for years, so the logs are the
+# most likely thing to wear out a card. Two things make that impossible
+# rather than merely unlikely:
+#
+#   Storage=volatile  the journal lives in /run, i.e. RAM, always. Not
+#                     "auto", which would start persisting the moment
+#                     something created /var/log/journal, and not reliant on
+#                     the overlay being switched on.
+#   RuntimeMaxUse     capped, because the flip side of a journal in RAM is a
+#                     journal competing with the decoder for RAM.
+#
+# This is also why the services log to the journal rather than running under
+# procServ as the older images did: procServ writes plain files under
+# /var/log, which persist whenever the overlay is off, and it never rotates
+# them.
+# ---------------------------------------------------------------------------
+install -d -m 0755 /etc/systemd/journald.conf.d
+cat > /etc/systemd/journald.conf.d/10-ogn.conf <<'EOF'
+# Keep the journal in RAM so it can never wear out the SD card.
+# Installed by ogn-bootstrap.
+[Journal]
+Storage=volatile
+RuntimeMaxUse=32M
+RuntimeMaxFileSize=8M
+EOF
+systemctl restart systemd-journald 2>/dev/null || true
+
+# Debian 13 does not install rsyslog, but if something pulled it in it would
+# write /var/log/syslog continuously and undo the above.
+if systemctl list-unit-files rsyslog.service >/dev/null 2>&1 \
+   && systemctl is-enabled --quiet rsyslog.service 2>/dev/null; then
+    log "disabling rsyslog: it writes to /var/log continuously"
+    systemctl disable --now rsyslog.service || true
+fi
+
+# ---------------------------------------------------------------------------
+# 10. Optional remote administration — all off unless explicitly enabled
+# ---------------------------------------------------------------------------
+ogn-remote-admin --config "$BOOT_CONF" --user "$OGN_USER"
+
+# ---------------------------------------------------------------------------
+# 11. Unattended security updates, and the maintenance timer
+# ---------------------------------------------------------------------------
+cat > /etc/apt/apt.conf.d/51ogn-unattended-upgrades <<'EOF'
+// Security updates only, and never an automatic reboot: the maintenance
+// cycle owns reboots, because it is the only thing that knows when the
+// read-only overlay is out of the way. Installed by ogn-bootstrap.
+Unattended-Upgrade::Origins-Pattern {
+    "origin=Debian,codename=${distro_codename}-security,label=Debian-Security";
+    "origin=Raspbian,codename=${distro_codename},label=Raspbian";
+};
+Unattended-Upgrade::Automatic-Reboot "false";
+APT::Periodic::Update-Package-Lists "0";
+APT::Periodic::Unattended-Upgrade "0";
+EOF
+
+if [ -n "$WINDOW" ]; then
+    write_unit ogn-maintenance.service <<'EOF'
+[Unit]
+Description=OGN receiver maintenance (updates, read-only overlay cycle)
+Documentation=https://github.com/glidernet/ogn-bootstrap
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ogn-maintenance --scheduled
+EOF
+    write_unit ogn-maintenance.timer <<EOF
+[Unit]
+Description=OGN receiver maintenance window
+
+[Timer]
+OnCalendar=$WINDOW
+RandomizedDelaySec=30m
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl enable ogn-maintenance.timer >/dev/null
+    log "maintenance window: $WINDOW"
+else
+    systemctl disable --now ogn-maintenance.timer >/dev/null 2>&1 || true
+    log "automatic updates disabled (MaintenanceWindow is empty)"
+fi
+
+# Resume any maintenance cycle that was interrupted, and report new versions.
+write_unit ogn-boot-check.service <<'EOF'
+[Unit]
+Description=OGN receiver boot check (resume maintenance, report updates)
+Documentation=https://github.com/glidernet/ogn-bootstrap
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ogn-maintenance --boot-check
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl enable ogn-boot-check.service >/dev/null
+
+systemctl daemon-reload
+
+# ---------------------------------------------------------------------------
+# 12. Start it, or explain why not
+# ---------------------------------------------------------------------------
+VERSION=$(basename "$REAL_DIR")
+if [ "$POSITION_OK" -eq 1 ]; then
+    systemctl enable rtlsdr-ogn.service >/dev/null
+    systemctl restart rtlsdr-ogn.service
+    log "receiver $CALL started ($VERSION)"
+    motd_set <<EOF
+
+  OGN receiver $CALL — $VERSION
+  Status page:  http://$(hostname -s).local:$(conf_get HTTP.Port 8080)/
+  Service:      systemctl status rtlsdr-ogn
+  Logs:         journalctl -u ogn-decode -f
+  Settings:     $TARGET_CONF
+
+EOF
+else
+    systemctl disable rtlsdr-ogn.service >/dev/null 2>&1 || true
+    motd_set <<EOF
+
+  OGN receiver $CALL: INSTALLED BUT NOT TRANSMITTING
+
+  The antenna position in MyReceiver.conf is still $LAT, $LON.
+
+  A receiver reporting a wrong position is worse than one that is switched
+  off, so nothing will be sent to the network until you set it. Edit:
+
+      $BOOT_CONF
+
+  (or $TARGET_CONF on this Pi), then run:
+
+      sudo ogn-install
+
+EOF
+    warn "receiver installed but NOT started: set the antenna position first"
+fi
+
+# ---------------------------------------------------------------------------
+# 13. Read-only root, last of all
+# ---------------------------------------------------------------------------
+if [ "$READONLY_FS" -eq 1 ]; then
+    # The boot partition is FAT, and FAT is what corrupts on an unclean power
+    # cycle. raspi-config refuses to change this once the overlay is active,
+    # so it has to happen first.
+    if ! grep -qE '^[^#]*/boot/firmware.*\bro\b' /etc/fstab; then
+        log "mounting the boot partition read-only"
+        raspi-config nonint do_bootro 0 || warn "could not set the boot partition read-only"
+    fi
+
+    if ogn-maintenance --overlay-status | grep -q '^enabled'; then
+        log "read-only overlay already enabled"
+    else
+        log "enabling the read-only overlay (takes effect at the next reboot)"
+        ogn-maintenance --overlay-enable
+        if [ "$REBOOT_WHEN_DONE" -eq 0 ]; then
+            warn "the read-only overlay is armed but will not be active until you reboot"
+        fi
+    fi
+fi
+
+date -Is | boot_write "$STATE_DIR/installed"
+log "setup complete"
+
+if [ "$REBOOT_WHEN_DONE" -eq 1 ]; then
+    log "rebooting"
+    systemctl reboot
+fi
+OGN_PAYLOAD_ogn_install
+chmod 0755 /usr/local/sbin/ogn-install
+
+cat > /usr/local/sbin/ogn-update <<'OGN_PAYLOAD_ogn_update'
+#!/bin/bash
+#
+# ogn-update — install or upgrade the OGN decoder binaries.
+#
+#   sudo ogn-update --check          report what is installed and available
+#   sudo ogn-update                  upgrade to the configured channel
+#   sudo ogn-update --channel 0.3.2  install one exact version
+#
+# Integrity comes from versions.json, fetched from GitHub over TLS. The
+# binaries themselves come from download.glidernet.org, which has no working
+# HTTPS at all — and, worse, answers port 443 with cleartext, so a naive
+# "try TLS, fall back" would look like it had worked. The SHA256 in the
+# manifest is what actually protects this; upstream's MD5 is checked as well,
+# but only to catch a corrupt download.
+#
+# Copyright (c) 2026 ifly7charlie. MIT licence, see LICENSE.
+
+set -euo pipefail
+
+LIBDIR="${OGN_LIBDIR:-/usr/local/lib/ogn-bootstrap}"
+# shellcheck source=src/ogn-common.sh
+. "$LIBDIR/ogn-common.sh"
+
+CHANNEL=""
+CHECK_ONLY=0
+INSTALL_ONLY=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --channel)      CHANNEL="$2"; shift 2 ;;
+        --check)        CHECK_ONLY=1; shift ;;
+        --install-only) INSTALL_ONLY=1; shift ;;
+        -h|--help)      sed -n '3,16p' "$0"; exit 0 ;;
+        *)              die "unknown option: $1" ;;
+    esac
+done
+
+[ "$CHECK_ONLY" -eq 1 ] || need_root
+
+if [ -z "${OGN_USER:-}" ]; then
+    OGN_USER=$(detect_ogn_user) || die "could not work out which account to install for"
+fi
+[ -n "${OGN_HOME:-}" ] || OGN_HOME=$(user_home "$OGN_USER")
+OGN_GROUP=$(id -gn "$OGN_USER" 2>/dev/null || printf "%s" "$OGN_USER")
+LINK="$OGN_HOME/rtlsdr-ogn"
+
+if [ -z "$CHANNEL" ]; then
+    if [ -r "$BOOT_CONF" ]; then
+        conf_load "$BOOT_CONF"
+        CHANNEL=$(conf_get Install.UpdateChannel stable)
+    else
+        CHANNEL=stable
+    fi
+fi
+
+installed_version() {
+    local target
+    [ -L "$LINK" ] || { printf 'none'; return; }
+    target=$(basename "$(readlink -f "$LINK")")
+    printf '%s' "${target#rtlsdr-ogn-}"
+}
+
+INSTALLED=$(installed_version)
+
+manifest_fetch || die "could not fetch the version manifest from $MANIFEST_URL, and no cached copy exists"
+WANTED=$(manifest_resolve "$CHANNEL") \
+    || die "'$CHANNEL' is not a known channel or version in the manifest"
+
+ARCH=$(ogn_arch)
+
+if [ "$CHECK_ONLY" -eq 1 ]; then
+    printf 'installed=%s\nchannel=%s\navailable=%s\n' "$INSTALLED" "$CHANNEL" "$WANTED"
+    [ "$INSTALLED" = "$WANTED" ] && exit 0 || exit 10
+fi
+
+if [ "$INSTALLED" = "$WANTED" ]; then
+    log "rtlsdr-ogn $WANTED is already installed"
+    exit 0
+fi
+
+URL=$(manifest_field    "$WANTED" "$ARCH" url)    || die "the manifest has no $ARCH build for $WANTED"
+SHA=$(manifest_field    "$WANTED" "$ARCH" sha256) || die "the manifest has no SHA256 for $WANTED/$ARCH"
+MD5=$(manifest_field    "$WANTED" "$ARCH" md5 2>/dev/null || true)
+
+case "$SHA" in
+    ""|None|null|*[!0-9a-fA-F]*)
+        die "versions.json has no SHA256 for $WANTED/$ARCH, so the download cannot be verified.
+     Refusing to install. Populate it with:  tools/add-version $WANTED" ;;
+esac
+[ "${#SHA}" -eq 64 ] || die "the manifest SHA256 for $WANTED/$ARCH is not 64 hex characters"
+
+TMP=$(mktemp -d)
+cleanup() { rm -rf "$TMP"; }
+trap cleanup EXIT
+
+log "downloading rtlsdr-ogn $WANTED ($ARCH)"
+fetch "$URL" "$TMP/ogn.tgz" || die "download failed: $URL"
+verify_md5    "$TMP/ogn.tgz" "$MD5" || die "download appears corrupt"
+verify_sha256 "$TMP/ogn.tgz" "$SHA"
+log "checksum verified"
+
+# The upstream tarball contains rtlsdr-ogn-<version>/ *and* a sibling symlink
+# named rtlsdr-ogn pointing at it. Unpacked into the home directory that gives
+# exactly the versioned-directory-plus-symlink layout the fleet already uses,
+# so we let it, but extract to a staging area first so a failed download can
+# never leave a half-replaced install behind.
+tar xzf "$TMP/ogn.tgz" -C "$TMP"
+NEWDIR="$TMP/rtlsdr-ogn-$WANTED"
+[ -d "$NEWDIR" ] || die "the tarball did not contain rtlsdr-ogn-$WANTED as expected"
+
+DEST="$OGN_HOME/rtlsdr-ogn-$WANTED"
+if [ -d "$DEST" ]; then
+    log "replacing the existing $DEST"
+    rm -rf "$DEST"
+fi
+cp -a "$NEWDIR" "$DEST"
+chown -R "$OGN_USER:$OGN_GROUP" "$DEST"
+
+# Carry the configuration and the geoid grid across from the previous version,
+# so an upgrade never loses the site's settings.
+if [ -L "$LINK" ]; then
+    OLD=$(readlink -f "$LINK")
+    for keep in MyReceiver.conf WW15MGH.DAC; do
+        if [ -s "$OLD/$keep" ] && [ ! -s "$DEST/$keep" ]; then
+            cp -a "$OLD/$keep" "$DEST/$keep"
+            chown "$OGN_USER:$OGN_GROUP" "$DEST/$keep"
+            log "carried $keep over from $(basename "$OLD")"
+        fi
+    done
+fi
+
+# ogn-rf and gsm_scan need root to reach the GPU and to mmap; upstream ships
+# them expecting setuid.
+for b in ogn-rf gsm_scan; do
+    if [ -f "$DEST/$b" ]; then
+        chown root:root "$DEST/$b"
+        chmod a+s "$DEST/$b"
+    fi
+done
+[ -p "$DEST/ogn-rf.fifo" ] || { rm -f "$DEST/ogn-rf.fifo"; mkfifo -m 0600 "$DEST/ogn-rf.fifo"; }
+chown "$OGN_USER:$OGN_GROUP" "$DEST/ogn-rf.fifo"
+
+ln -sfn "$DEST" "$LINK"
+chown -h "$OGN_USER:$OGN_GROUP" "$LINK"
+log "installed rtlsdr-ogn $WANTED at $DEST"
+
+if [ "$INSTALL_ONLY" -eq 0 ] && systemctl is-enabled --quiet rtlsdr-ogn.service 2>/dev/null; then
+    log "restarting the receiver"
+    systemctl restart rtlsdr-ogn.service
+fi
+OGN_PAYLOAD_ogn_update
+chmod 0755 /usr/local/sbin/ogn-update
+
+cat > /usr/local/sbin/ogn-maintenance <<'OGN_PAYLOAD_ogn_maintenance'
+#!/bin/bash
+#
+# ogn-maintenance — apply updates in a window where the filesystem is writable.
+#
+#   sudo ogn-maintenance --now        run the cycle immediately
+#   sudo ogn-maintenance --status     show where the cycle has got to
+#
+# With the read-only overlay active, writes to the root filesystem go to RAM
+# and are thrown away at reboot, so updates have to happen with the overlay
+# out of the way. That means a two-reboot cycle:
+#
+#   overlay on  -> disable overlay, reboot
+#   overlay off -> apt security updates, ogn-update, enable overlay, reboot
+#   overlay on  -> normal running
+#
+# The state marker lives on the boot partition, which sits outside the root
+# overlay, so it survives the reboots that the cycle depends on. Every step
+# checks the marker first, so an interruption at any point resumes or aborts
+# to a known state rather than leaving the receiver unprotected.
+#
+# Copyright (c) 2026 ifly7charlie. MIT licence, see LICENSE.
+
+set -euo pipefail
+
+LIBDIR="${OGN_LIBDIR:-/usr/local/lib/ogn-bootstrap}"
+# shellcheck source=src/ogn-common.sh
+. "$LIBDIR/ogn-common.sh"
+
+STATE_FILE="$STATE_DIR/maintenance.state"
+UPDATE_MOTD=/etc/motd.d/20-ogn-updates
+MAX_ATTEMPTS=3
+
+state_read()  { [ -r "$STATE_FILE" ] && cut -d' ' -f1 "$STATE_FILE" || printf 'idle'; }
+state_count() { [ -r "$STATE_FILE" ] && cut -d' ' -f2 "$STATE_FILE" || printf '0'; }
+state_write() { printf '%s %s %s\n' "$1" "${2:-0}" "$(date -Is)" | boot_write "$STATE_FILE"; }
+# Only ever touch the card if there is actually something to remove: this runs
+# on every boot, and an unconditional rm is still a write to a FAT partition.
+state_clear() {
+    [ -e "$STATE_FILE" ] || return 0
+    boot_rw; rm -f "$STATE_FILE"; boot_ro
+}
+
+# --- overlay -------------------------------------------------------------
+# On Trixie raspi-config drives Debian's overlayroot with a plain
+# overlayroot=tmpfs kernel parameter. That is a real improvement on the old
+# scheme, which baked a uname-specific initrd name into config.txt and so
+# broke silently across kernel upgrades.
+overlay_active()    { grep -q 'overlayroot=tmpfs' /proc/cmdline; }
+overlay_next_boot() { grep -q 'overlayroot=tmpfs' "$BOOT_DIR/cmdline.txt" 2>/dev/null; }
+
+overlay_status() {
+    local now next
+    overlay_active    && now=active   || now=inactive
+    overlay_next_boot && next=enabled || next=disabled
+    printf '%s now=%s next_boot=%s\n' "$next" "$now" "$next"
+}
+
+overlay_set() {
+    # raspi-config's convention is inverted: 0 enables, 1 disables.
+    local want="$1"
+    command -v raspi-config >/dev/null || die "raspi-config is not installed; cannot manage the overlay"
+    if [ "$want" = enable ]; then
+        raspi-config nonint do_overlayfs 0
+    else
+        raspi-config nonint do_overlayfs 1
+    fi
+}
+
+# Swap on a tmpfs overlay is pathological: the backing file lives in the RAM
+# upper layer, so the system pins memory to hold a "disk" that is itself
+# memory, and the overlay slowly fills. Disable the units that recreate it
+# rather than just swapoff, or it returns at the next boot.
+swap_disable() {
+    local u
+    swapoff -a 2>/dev/null || true
+    for u in rpi-setup-loop@var-swap.service rpi-resize-swap-file.service dphys-swapfile.service; do
+        systemctl disable --now "$u" >/dev/null 2>&1 || true
+    done
+    rm -f /var/swap 2>/dev/null || true
+}
+
+# --- the actual updating -------------------------------------------------
+do_updates() {
+    # A kernel or firmware package writes to /boot/firmware, so open it for the
+    # duration of the pass rather than per-file.
+    boot_rw
+    log "applying security updates"
+    apt_wait
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq || warn "apt-get update failed; continuing"
+    apt_wait
+    unattended-upgrade -v 2>&1 | sed 's/^/  /' || warn "unattended-upgrade reported a problem; continuing"
+
+    log "checking for a new OGN release"
+    if ogn-update; then
+        log "OGN software is up to date"
+    else
+        warn "ogn-update failed; the previously installed version is still in place"
+    fi
+    boot_ro
+}
+
+report_available() {
+    local out installed available
+    if ! out=$(ogn-update --check 2>/dev/null); then
+        installed=$(printf '%s' "$out" | sed -n 's/^installed=//p')
+        available=$(printf '%s' "$out" | sed -n 's/^available=//p')
+        if [ -n "$available" ] && [ "$installed" != "$available" ]; then
+            mkdir -p "$(dirname "$UPDATE_MOTD")"
+            cat > "$UPDATE_MOTD" <<EOF
+
+  OGN $installed is installed; $available is available.
+  It will be installed automatically in the next maintenance window,
+  or now with:  sudo ogn-maintenance --now
+
+EOF
+            log "update available: $installed -> $available"
+            return 0
+        fi
+    fi
+    rm -f "$UPDATE_MOTD"
+    return 0
+}
+
+# --- cycle ---------------------------------------------------------------
+begin_cycle() {
+    local attempts
+    if [ "$(state_read)" != "idle" ]; then
+        log "a maintenance cycle is already in progress ($(state_read)); not starting another"
+        return 0
+    fi
+    if ! overlay_active; then
+        # Nothing to work around — just update in place.
+        log "overlay is not active; updating without rebooting"
+        do_updates
+        state_clear
+        return 0
+    fi
+    attempts=$(( $(state_count) + 1 ))
+    log "disabling the read-only overlay and rebooting to apply updates"
+    state_write updating "$attempts"
+    overlay_set disable
+    systemctl reboot
+}
+
+resume_cycle() {
+    local attempts
+    attempts=$(state_count)
+    if [ "$attempts" -gt "$MAX_ATTEMPTS" ]; then
+        warn "maintenance has failed $attempts times; giving up and restoring the overlay"
+        state_write restoring "$attempts"
+        overlay_set enable
+        state_clear
+        systemctl reboot
+        return 0
+    fi
+    if overlay_active; then
+        # We asked for the overlay to be off and it is still on: the disable
+        # did not take. Restore a known state rather than looping.
+        warn "expected the overlay to be off after rebooting, but it is active; aborting this cycle"
+        state_clear
+        return 0
+    fi
+    log "maintenance pass (attempt $attempts)"
+    do_updates
+    log "re-enabling the read-only overlay and rebooting"
+    state_write restoring "$attempts"
+    overlay_set enable
+    state_clear
+    systemctl reboot
+}
+
+boot_check() {
+    case "$(state_read)" in
+        updating)
+            resume_cycle
+            ;;
+        restoring)
+            # We were interrupted between enabling the overlay and rebooting.
+            if overlay_next_boot; then
+                log "maintenance finished"
+                state_clear
+            else
+                warn "the overlay was not re-enabled after maintenance; re-enabling now"
+                overlay_set enable
+                state_clear
+                systemctl reboot
+            fi
+            ;;
+        *)
+            state_clear
+            report_available
+            ;;
+    esac
+}
+
+# --- entry point ---------------------------------------------------------
+MODE=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --scheduled)      MODE=scheduled ;;
+        --boot-check)     MODE=boot-check ;;
+        --now)            MODE=now ;;
+        --status)         MODE=status ;;
+        --overlay-status) MODE=overlay-status ;;
+        --overlay-enable) MODE=overlay-enable ;;
+        --overlay-disable) MODE=overlay-disable ;;
+        -h|--help)        sed -n '3,20p' "$0"; exit 0 ;;
+        *)                die "unknown option: $1" ;;
+    esac
+    shift
+done
+
+case "$MODE" in
+    overlay-status) overlay_status; exit 0 ;;
+    status)
+        printf 'state:   %s (since %s)\n' "$(state_read)" "$([ -r "$STATE_FILE" ] && cut -d' ' -f3 "$STATE_FILE" || printf 'n/a')"
+        printf 'overlay: %s\n' "$(overlay_status)"
+        if [ "$(id -u)" -eq 0 ] || [ -r "$MANIFEST_CACHE" ]; then
+            ogn-update --check || true
+        fi
+        exit 0 ;;
+esac
+
+need_root
+
+case "$MODE" in
+    overlay-enable)  swap_disable; overlay_set enable ;;
+    overlay-disable) overlay_set disable ;;
+    boot-check)      boot_check ;;
+    scheduled|now)   begin_cycle ;;
+    *)               die "say what to do: --now, --status, or --boot-check" ;;
+esac
+OGN_PAYLOAD_ogn_maintenance
+chmod 0755 /usr/local/sbin/ogn-maintenance
+
+cat > /usr/local/sbin/ogn-remote-admin <<'OGN_PAYLOAD_ogn_remote_admin'
+#!/bin/bash
+#
+# ogn-remote-admin — optional remote access, driven by Install.RemoteAdmin.
+#
+# Everything here is off unless the operator turned it on. That is a
+# deliberate departure from the older OGN images, which shipped third-party
+# access enabled by default. Remote access to a machine on someone's club
+# network should be a decision somebody made on purpose.
+#
+# Copyright (c) 2026 ifly7charlie. MIT licence, see LICENSE.
+
+set -euo pipefail
+
+LIBDIR="${OGN_LIBDIR:-/usr/local/lib/ogn-bootstrap}"
+# shellcheck source=src/ogn-common.sh
+. "$LIBDIR/ogn-common.sh"
+
+CONF="$BOOT_CONF"
+USER_NAME=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --config) CONF="$2"; shift 2 ;;
+        --user)   USER_NAME="$2"; shift 2 ;;
+        -h|--help) sed -n '3,9p' "$0"; exit 0 ;;
+        *) die "unknown option: $1" ;;
+    esac
+done
+
+need_root
+[ -n "$USER_NAME" ] || USER_NAME=$(detect_ogn_user) || die "could not determine the user"
+HOME_DIR=$(user_home "$USER_NAME")
+USER_GROUP=$(id -gn "$USER_NAME")
+
+conf_load "$CONF"
+trap conf_cleanup EXIT
+
+# ---------------------------------------------------------------------------
+# Extra SSH keys
+# ---------------------------------------------------------------------------
+EXTRA_KEYS=$(conf_get Install.RemoteAdmin.ExtraSSHKeys "")
+if [ -n "$EXTRA_KEYS" ]; then
+    AUTH="$HOME_DIR/.ssh/authorized_keys"
+    install -d -m 0700 -o "$USER_NAME" -g "$USER_GROUP" "$HOME_DIR/.ssh"
+    touch "$AUTH"
+    printf '%s\n' "$EXTRA_KEYS" | while IFS= read -r key; do
+        [ -n "$key" ] || continue
+        grep -qxF "$key" "$AUTH" || { printf '%s\n' "$key" >> "$AUTH"; log "added an extra SSH key"; }
+    done
+    chown "$USER_NAME:$USER_GROUP" "$AUTH"
+    chmod 0600 "$AUTH"
+
+    # Only worth hardening sshd once we know a key can get in.
+    install -d -m 0755 /etc/ssh/sshd_config.d
+    cat > /etc/ssh/sshd_config.d/10-ogn.conf <<'EOF'
+# Installed by ogn-bootstrap because SSH keys were supplied.
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+EOF
+    systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
+fi
+
+# ---------------------------------------------------------------------------
+# Raspberry Pi Connect
+#
+# rpi-connect runs as a *user* service, which means the account needs linger
+# enabled or it stops the moment the operator logs out. Raspberry Pi's own
+# documentation does not mention that; the sequence below is the one Raspberry
+# Pi Imager itself generates, which is the authoritative example.
+# ---------------------------------------------------------------------------
+if conf_bool Install.RemoteAdmin.Connect; then
+    log "enabling Raspberry Pi Connect for $USER_NAME"
+    if ! command -v rpi-connect >/dev/null; then
+        apt_install rpi-connect-lite
+    fi
+
+    UNIT_DIR="$HOME_DIR/.config/systemd/user"
+    install -d -m 0755 -o "$USER_NAME" -g "$USER_GROUP" "$HOME_DIR/.config"
+    install -d -m 0755 -o "$USER_NAME" -g "$USER_GROUP" "$HOME_DIR/.config/systemd"
+    install -d -m 0755 -o "$USER_NAME" -g "$USER_GROUP" "$UNIT_DIR"
+    install -d -m 0755 -o "$USER_NAME" -g "$USER_GROUP" "$UNIT_DIR/default.target.wants"
+    install -d -m 0755 -o "$USER_NAME" -g "$USER_GROUP" "$UNIT_DIR/paths.target.wants"
+    ln -sfn /usr/lib/systemd/user/rpi-connect.service        "$UNIT_DIR/default.target.wants/rpi-connect.service"
+    ln -sfn /usr/lib/systemd/user/rpi-connect-signin.path    "$UNIT_DIR/paths.target.wants/rpi-connect-signin.path"
+    chown -h "$USER_NAME:$USER_GROUP" "$UNIT_DIR/default.target.wants/rpi-connect.service" \
+                                     "$UNIT_DIR/paths.target.wants/rpi-connect-signin.path"
+
+    install -d -m 0755 /var/lib/systemd/linger
+    loginctl enable-linger "$USER_NAME" 2>/dev/null || install -m 0644 /dev/null "/var/lib/systemd/linger/$USER_NAME"
+
+    AUTH_KEY=$(conf_get Install.RemoteAdmin.ConnectAuthKey "")
+    CONNECT_DIR="$HOME_DIR/.config/com.raspberrypi.connect"
+    install -d -m 0700 -o "$USER_NAME" -g "$USER_GROUP" "$CONNECT_DIR"
+    if [ -n "$AUTH_KEY" ]; then
+        printf '%s\n' "$AUTH_KEY" > "$CONNECT_DIR/auth.key"
+        chown "$USER_NAME:$USER_GROUP" "$CONNECT_DIR/auth.key"
+        chmod 0600 "$CONNECT_DIR/auth.key"
+        log "Connect auth key written; the device will link itself"
+    fi
+
+    systemctl --quiet --user --machine="$USER_NAME@.host" daemon-reload 2>/dev/null || true
+    systemctl --quiet --user --machine="$USER_NAME@.host" start rpi-connect.service 2>/dev/null || true
+
+    if [ -z "$AUTH_KEY" ]; then
+        MOTD_FILE=/etc/motd.d/30-ogn-connect motd_set <<EOF
+
+  Raspberry Pi Connect is installed but not yet linked to an account.
+  Run this as $USER_NAME and follow the link it prints:
+
+      rpi-connect signin
+
+EOF
+    else
+        rm -f /etc/motd.d/30-ogn-connect
+    fi
+else
+    rm -f /etc/motd.d/30-ogn-connect
+fi
+
+# ---------------------------------------------------------------------------
+# OGN core team reverse tunnel
+#
+# Opt-in only. This asks autossh.glidernet.org which port to use, then holds a
+# reverse tunnel so the OGN team can reach this receiver's SSH from outside.
+# They must have accepted this machine's key first — see the README. Driven by
+# a systemd timer rather than a cron entry, so its state and failures are
+# visible in the usual place.
+# ---------------------------------------------------------------------------
+if conf_bool Install.RemoteAdmin.OGNTeam; then
+    log "enabling the OGN core team reverse tunnel"
+    apt_install autossh
+
+    cat > /usr/local/sbin/ogn-team-tunnel <<'TUNEOF'
+#!/bin/bash
+# Hold a reverse SSH tunnel to the OGN core team's relay. Installed by
+# ogn-bootstrap, and only when Install.RemoteAdmin.OGNTeam is true.
+set -euo pipefail
+RELAY_HOST="autossh.glidernet.org"
+RELAY_USER="glidernet-assh"
+
+pgrep -x autossh >/dev/null && exit 0
+
+CALL=$(sed -n 's/^ *Call *= *"\([^"]*\)".*/\1/p' /boot/firmware/MyReceiver.conf 2>/dev/null | head -1)
+[ -n "$CALL" ] || CALL=$(hostname -s)
+
+IFACE=$(ip route show default 2>/dev/null | awk '{print $5; exit}')
+MAC=$(cat "/sys/class/net/${IFACE:-eth0}/address" 2>/dev/null || echo unknown)
+VERSION=$(basename "$(readlink -f /home/*/rtlsdr-ogn 2>/dev/null | head -1)" 2>/dev/null || echo unknown)
+
+PORT=$(curl --fail --silent --max-time 30 \
+    "http://$RELAY_HOST/remoteReceiver/?r=$CALL&m=$MAC&i=$VERSION") || {
+        echo "could not obtain a tunnel port from $RELAY_HOST" >&2; exit 1; }
+
+case "$PORT" in ''|*[!0-9]*) echo "relay returned '$PORT', not a port" >&2; exit 1 ;; esac
+
+exec autossh -M "${PORT}0" -N -f \
+    -R "${PORT}:localhost:22" \
+    -o "ServerAliveInterval 60" -o "ServerAliveCountMax 3" \
+    -o "ExitOnForwardFailure yes" -o "StrictHostKeyChecking accept-new" \
+    "$RELAY_USER@$RELAY_HOST"
+TUNEOF
+    chmod 0755 /usr/local/sbin/ogn-team-tunnel
+
+    cat > /etc/systemd/system/ogn-team-tunnel.service <<'EOF'
+[Unit]
+Description=OGN core team reverse SSH tunnel
+Documentation=https://github.com/glidernet/ogn-bootstrap
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=forking
+ExecStart=/usr/local/sbin/ogn-team-tunnel
+EOF
+    cat > /etc/systemd/system/ogn-team-tunnel.timer <<'EOF'
+[Unit]
+Description=Keep the OGN core team reverse tunnel up
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=10min
+
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl daemon-reload
+    systemctl enable --now ogn-team-tunnel.timer >/dev/null
+else
+    systemctl disable --now ogn-team-tunnel.timer >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/ogn-team-tunnel.timer \
+          /etc/systemd/system/ogn-team-tunnel.service \
+          /usr/local/sbin/ogn-team-tunnel
+fi
+OGN_PAYLOAD_ogn_remote_admin
+chmod 0755 /usr/local/sbin/ogn-remote-admin
+
+cat > /usr/local/sbin/ogn-calibrate <<'OGN_PAYLOAD_ogn_calibrate'
+#!/bin/bash
+#
+# ogn-calibrate — measure the SDR's crystal error in ppm using gsm_scan.
+#
+#   sudo ogn-calibrate            measure and report
+#   sudo ogn-calibrate --quiet    print just the number, for scripting
+#   sudo ogn-calibrate --apply    measure and write FreqCorr into the config
+#
+# gsm_scan listens to GSM base stations, whose carriers are held to a far
+# tighter tolerance than any TV dongle, and reports how far off yours is.
+# It needs the aerial connected and GSM coverage; on a rural site or a stick
+# with a TCXO the answer may simply be "no usable signal", which is fine —
+# leave FreqCorr unset and the decoder uses its default.
+#
+# Copyright (c) 2026 ifly7charlie. MIT licence, see LICENSE.
+
+set -euo pipefail
+
+LIBDIR="${OGN_LIBDIR:-/usr/local/lib/ogn-bootstrap}"
+# shellcheck source=src/ogn-common.sh
+. "$LIBDIR/ogn-common.sh"
+
+QUIET=0
+APPLY=0
+SCAN_TIMEOUT="${OGN_CALIBRATE_TIMEOUT:-180}"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --quiet)   QUIET=1; shift ;;
+        --apply)   APPLY=1; shift ;;
+        -h|--help) sed -n '3,14p' "$0"; exit 0 ;;
+        *)         die "unknown option: $1" ;;
+    esac
+done
+
+need_root
+OGN_USER=$(detect_ogn_user) || die "could not determine the user"
+INSTALL_DIR=$(readlink -f "$(user_home "$OGN_USER")/rtlsdr-ogn" 2>/dev/null) \
+    || die "the OGN software is not installed yet"
+[ -x "$INSTALL_DIR/gsm_scan" ] || die "no gsm_scan in $INSTALL_DIR"
+
+TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+cat > "$TMP/scan.conf" <<'EOF'
+RF:
+{ GSM:
+  { CenterFreq = 938.4;
+    Gain       =  25.0;
+  } ;
+} ;
+EOF
+
+[ "$QUIET" -eq 1 ] || log "scanning for GSM carriers (up to ${SCAN_TIMEOUT}s) — this needs the aerial connected"
+
+OUT=$(cd "$INSTALL_DIR" && timeout "$SCAN_TIMEOUT" ./gsm_scan "$TMP/scan.conf" 2>&1) || true
+
+# gsm_scan reports a line containing "Receiver Xtal correction" followed by the
+# figure in ppm. Pull the first number that follows that phrase rather than a
+# fixed field position, so a change in spacing or wording order does not
+# silently yield a wrong correction.
+PPM=$(printf '%s\n' "$OUT" \
+      | sed -n 's/.*[Xx]tal correction[^0-9+-]*\([+-]\?[0-9]\+\(\.[0-9]\+\)\?\).*/\1/p' \
+      | head -1)
+
+if [ -z "$PPM" ]; then
+    [ "$QUIET" -eq 1 ] || warn "no usable GSM signal found; leaving FreqCorr unset"
+    exit 1
+fi
+
+PPM=${PPM%.*}   # the config wants an integer
+
+if [ "$QUIET" -eq 1 ]; then
+    printf '%s\n' "$PPM"
+    exit 0
+fi
+
+log "measured frequency correction: ${PPM} ppm"
+
+if [ "$APPLY" -eq 1 ]; then
+    CONF="$INSTALL_DIR/MyReceiver.conf"
+    [ -f "$CONF" ] || die "no $CONF to update"
+    if grep -Eq '^\s*FreqCorr\s*=' "$CONF"; then
+        sed -i "s|^\( *FreqCorr *= *\).*|\1$PPM;   # measured by ogn-calibrate|" "$CONF"
+    else
+        sed -i "s|^\( *SampleRate *=\)|  FreqCorr = $PPM;   # measured by ogn-calibrate\n\1|" "$CONF"
+    fi
+    log "wrote FreqCorr = $PPM to $CONF"
+    systemctl is-active --quiet rtlsdr-ogn.service && systemctl restart rtlsdr-ogn.service
+fi
+OGN_PAYLOAD_ogn_calibrate
+chmod 0755 /usr/local/sbin/ogn-calibrate
+
+# Hand over to the installer. Its output goes to the cloud-init log, which is
+# /var/log/cloud-init-output.log, and to the journal.
+exec /usr/local/sbin/ogn-install

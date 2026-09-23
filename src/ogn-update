@@ -1,0 +1,149 @@
+#!/bin/bash
+#
+# ogn-update — install or upgrade the OGN decoder binaries.
+#
+#   sudo ogn-update --check          report what is installed and available
+#   sudo ogn-update                  upgrade to the configured channel
+#   sudo ogn-update --channel 0.3.2  install one exact version
+#
+# Integrity comes from versions.json, fetched from GitHub over TLS. The
+# binaries themselves come from download.glidernet.org, which has no working
+# HTTPS at all — and, worse, answers port 443 with cleartext, so a naive
+# "try TLS, fall back" would look like it had worked. The SHA256 in the
+# manifest is what actually protects this; upstream's MD5 is checked as well,
+# but only to catch a corrupt download.
+#
+# Copyright (c) 2026 ifly7charlie. MIT licence, see LICENSE.
+
+set -euo pipefail
+
+LIBDIR="${OGN_LIBDIR:-/usr/local/lib/ogn-bootstrap}"
+# shellcheck source=src/ogn-common.sh
+. "$LIBDIR/ogn-common.sh"
+
+CHANNEL=""
+CHECK_ONLY=0
+INSTALL_ONLY=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --channel)      CHANNEL="$2"; shift 2 ;;
+        --check)        CHECK_ONLY=1; shift ;;
+        --install-only) INSTALL_ONLY=1; shift ;;
+        -h|--help)      sed -n '3,16p' "$0"; exit 0 ;;
+        *)              die "unknown option: $1" ;;
+    esac
+done
+
+[ "$CHECK_ONLY" -eq 1 ] || need_root
+
+if [ -z "${OGN_USER:-}" ]; then
+    OGN_USER=$(detect_ogn_user) || die "could not work out which account to install for"
+fi
+[ -n "${OGN_HOME:-}" ] || OGN_HOME=$(user_home "$OGN_USER")
+OGN_GROUP=$(id -gn "$OGN_USER" 2>/dev/null || printf "%s" "$OGN_USER")
+LINK="$OGN_HOME/rtlsdr-ogn"
+
+if [ -z "$CHANNEL" ]; then
+    if [ -r "$BOOT_CONF" ]; then
+        conf_load "$BOOT_CONF"
+        CHANNEL=$(conf_get Install.UpdateChannel stable)
+    else
+        CHANNEL=stable
+    fi
+fi
+
+installed_version() {
+    local target
+    [ -L "$LINK" ] || { printf 'none'; return; }
+    target=$(basename "$(readlink -f "$LINK")")
+    printf '%s' "${target#rtlsdr-ogn-}"
+}
+
+INSTALLED=$(installed_version)
+
+manifest_fetch || die "could not fetch the version manifest from $MANIFEST_URL, and no cached copy exists"
+WANTED=$(manifest_resolve "$CHANNEL") \
+    || die "'$CHANNEL' is not a known channel or version in the manifest"
+
+ARCH=$(ogn_arch)
+
+if [ "$CHECK_ONLY" -eq 1 ]; then
+    printf 'installed=%s\nchannel=%s\navailable=%s\n' "$INSTALLED" "$CHANNEL" "$WANTED"
+    [ "$INSTALLED" = "$WANTED" ] && exit 0 || exit 10
+fi
+
+if [ "$INSTALLED" = "$WANTED" ]; then
+    log "rtlsdr-ogn $WANTED is already installed"
+    exit 0
+fi
+
+URL=$(manifest_field    "$WANTED" "$ARCH" url)    || die "the manifest has no $ARCH build for $WANTED"
+SHA=$(manifest_field    "$WANTED" "$ARCH" sha256) || die "the manifest has no SHA256 for $WANTED/$ARCH"
+MD5=$(manifest_field    "$WANTED" "$ARCH" md5 2>/dev/null || true)
+
+case "$SHA" in
+    ""|None|null|*[!0-9a-fA-F]*)
+        die "versions.json has no SHA256 for $WANTED/$ARCH, so the download cannot be verified.
+     Refusing to install. Populate it with:  tools/add-version $WANTED" ;;
+esac
+[ "${#SHA}" -eq 64 ] || die "the manifest SHA256 for $WANTED/$ARCH is not 64 hex characters"
+
+TMP=$(mktemp -d)
+cleanup() { rm -rf "$TMP"; }
+trap cleanup EXIT
+
+log "downloading rtlsdr-ogn $WANTED ($ARCH)"
+fetch "$URL" "$TMP/ogn.tgz" || die "download failed: $URL"
+verify_md5    "$TMP/ogn.tgz" "$MD5" || die "download appears corrupt"
+verify_sha256 "$TMP/ogn.tgz" "$SHA"
+log "checksum verified"
+
+# The upstream tarball contains rtlsdr-ogn-<version>/ *and* a sibling symlink
+# named rtlsdr-ogn pointing at it. Unpacked into the home directory that gives
+# exactly the versioned-directory-plus-symlink layout the fleet already uses,
+# so we let it, but extract to a staging area first so a failed download can
+# never leave a half-replaced install behind.
+tar xzf "$TMP/ogn.tgz" -C "$TMP"
+NEWDIR="$TMP/rtlsdr-ogn-$WANTED"
+[ -d "$NEWDIR" ] || die "the tarball did not contain rtlsdr-ogn-$WANTED as expected"
+
+DEST="$OGN_HOME/rtlsdr-ogn-$WANTED"
+if [ -d "$DEST" ]; then
+    log "replacing the existing $DEST"
+    rm -rf "$DEST"
+fi
+cp -a "$NEWDIR" "$DEST"
+chown -R "$OGN_USER:$OGN_GROUP" "$DEST"
+
+# Carry the configuration and the geoid grid across from the previous version,
+# so an upgrade never loses the site's settings.
+if [ -L "$LINK" ]; then
+    OLD=$(readlink -f "$LINK")
+    for keep in MyReceiver.conf WW15MGH.DAC; do
+        if [ -s "$OLD/$keep" ] && [ ! -s "$DEST/$keep" ]; then
+            cp -a "$OLD/$keep" "$DEST/$keep"
+            chown "$OGN_USER:$OGN_GROUP" "$DEST/$keep"
+            log "carried $keep over from $(basename "$OLD")"
+        fi
+    done
+fi
+
+# ogn-rf and gsm_scan need root to reach the GPU and to mmap; upstream ships
+# them expecting setuid.
+for b in ogn-rf gsm_scan; do
+    if [ -f "$DEST/$b" ]; then
+        chown root:root "$DEST/$b"
+        chmod a+s "$DEST/$b"
+    fi
+done
+[ -p "$DEST/ogn-rf.fifo" ] || { rm -f "$DEST/ogn-rf.fifo"; mkfifo -m 0600 "$DEST/ogn-rf.fifo"; }
+chown "$OGN_USER:$OGN_GROUP" "$DEST/ogn-rf.fifo"
+
+ln -sfn "$DEST" "$LINK"
+chown -h "$OGN_USER:$OGN_GROUP" "$LINK"
+log "installed rtlsdr-ogn $WANTED at $DEST"
+
+if [ "$INSTALL_ONLY" -eq 0 ] && systemctl is-enabled --quiet rtlsdr-ogn.service 2>/dev/null; then
+    log "restarting the receiver"
+    systemctl restart rtlsdr-ogn.service
+fi

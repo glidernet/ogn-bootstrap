@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+"""make-os-list — emit the JSON that puts this image in Raspberry Pi Imager.
+
+Imager reads a list of available images from a URL. The official one lives at
+downloads.raspberrypi.org; a custom one can be pointed at any URL, either from
+Imager's settings or with `rpi-imager --repo <url>`. This writes ours.
+
+    tools/make-os-list --meta dist/image-meta.json \\
+                       --url https://github.com/glidernet/ogn-bootstrap/releases/download/v3.0.0/ogn-receiver-2026-09-23-arm64.img.xz \\
+                       --out os-list.json
+
+The hashes and sizes come from image-meta.json, written by build-image.sh, so
+they describe the image that was actually built rather than one we hope was.
+Imager refuses to write an image whose extract_sha256 does not match, which
+makes that field the thing standing between a user and a corrupted download.
+
+Copyright (c) 2026 ifly7charlie. MIT licence, see LICENSE.
+"""
+
+import argparse
+import json
+import sys
+
+REPO = "https://github.com/glidernet/ogn-bootstrap"
+RAW = "https://raw.githubusercontent.com/glidernet/ogn-bootstrap/master"
+
+DESCRIPTION = (
+    "Raspberry Pi OS Lite with the Open Glider Network receiver software "
+    "preinstalled. Set the hostname to your receiver's name, then edit "
+    "MyReceiver.conf on the card to say where the aerial is."
+)
+
+# Matches the devices on Raspberry Pi's own arm64 Lite entry. The decoder is
+# 64-bit only, so there is no 32-bit variant to offer.
+DEVICES = ["pi5-64bit", "pi4-64bit", "pi3-64bit"]
+
+# Required fields, per doc/json-schema/os-list-schema.json in rpi-imager.
+REQUIRED = (
+    "name", "description", "icon", "url", "extract_size",
+    "extract_sha256", "image_download_size", "release_date", "devices",
+)
+
+
+def build_entry(meta, url):
+    entry = {
+        "name": meta["name"],
+        "description": DESCRIPTION,
+        "icon": f"{RAW}/doc/ogn-icon.png",
+        "url": url,
+        "extract_size": meta["extract_size"],
+        "extract_sha256": meta["extract_sha256"],
+        "image_download_size": meta["image_download_size"],
+        "image_download_sha256": meta["image_download_sha256"],
+        "release_date": meta["release_date"],
+        # Keeps the Imager customisation wizard — hostname, user, wifi, SSH
+        # keys, Raspberry Pi Connect — working exactly as it does on the stock
+        # image, because underneath this *is* the stock image.
+        "init_format": "cloudinit-rpi",
+        "devices": DEVICES,
+        "architecture": "armv8",
+        "capabilities": ["rpi_connect"],
+        "website": REPO,
+    }
+
+    missing = [k for k in REQUIRED if not entry.get(k)]
+    if missing:
+        sys.exit(f"entry is missing required fields: {', '.join(missing)}")
+    return entry
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--meta", required=True, help="image-meta.json from build-image.sh")
+    ap.add_argument("--url", required=True, help="public download URL of the .img.xz")
+    ap.add_argument("--out", default="os-list.json")
+    args = ap.parse_args()
+
+    with open(args.meta) as fh:
+        meta = json.load(fh)
+
+    if not args.url.startswith("https://"):
+        sys.exit("the download URL must be https — Imager users have no other "
+                 "way to know they got the image we built")
+    if not args.url.endswith(meta["file"]):
+        sys.exit(f"--url ends in something other than {meta['file']}; the hashes "
+                 "in image-meta.json would not describe what it points at")
+
+    doc = {"os_list": [build_entry(meta, args.url)]}
+
+    with open(args.out, "w") as fh:
+        json.dump(doc, fh, indent=2)
+        fh.write("\n")
+
+    print(f"wrote {args.out}")
+    print(json.dumps(doc, indent=2))
+
+
+if __name__ == "__main__":
+    main()

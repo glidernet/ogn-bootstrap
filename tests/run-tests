@@ -1,0 +1,187 @@
+#!/bin/bash
+#
+# run-tests — offline checks that need no Pi, no SDR and no network.
+#
+# These cover the parts that are pure logic: reading the config, validating a
+# receiver name, resolving the version manifest, and keeping boot/vendor-data
+# in step with src/. Installing packages, driving systemd and enabling the
+# overlay can only honestly be tested on real hardware; see the README.
+#
+# Copyright (c) 2026 ifly7charlie. MIT licence, see LICENSE.
+
+set -uo pipefail
+cd "$(dirname "$0")/.."
+
+PASS=0; FAIL=0
+ok()   { PASS=$((PASS+1)); printf '  ok   %s\n' "$1"; }
+bad()  { FAIL=$((FAIL+1)); printf '  FAIL %s\n' "$1"; [ $# -gt 1 ] && printf '       %s\n' "$2"; }
+is()   { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "expected [$3], got [$2]"; fi; }
+
+export OGN_LIBDIR="$PWD/src"
+# shellcheck source=src/ogn-common.sh
+. src/ogn-common.sh
+
+echo "== shell syntax =="
+for f in src/ogn-* tools/build-vendor-data tools/build-image.sh tests/run-tests boot/vendor-data; do
+    case "$f" in *ogn-common.sh) continue ;; esac
+    if bash -n "$f" 2>/dev/null; then ok "$f parses"; else bad "$f parses"; fi
+done
+bash -n src/ogn-common.sh && ok "src/ogn-common.sh parses" || bad "src/ogn-common.sh parses"
+
+echo "== shellcheck =="
+if command -v shellcheck >/dev/null; then
+    if shellcheck -S warning src/ogn-* tools/build-vendor-data tools/build-image.sh 2>&1; then
+        ok "shellcheck clean"
+    else
+        bad "shellcheck reported problems"
+    fi
+else
+    printf '  skip shellcheck not installed\n'
+fi
+
+echo "== config parser: the shipped template =="
+conf_load boot/MyReceiver.conf
+is "Call defaults to empty"        "$(conf_get APRS.Call '<none>')"            "<none>"
+is "Latitude"                      "$(conf_get Position.Latitude)"             "+0.0000"
+is "Altitude"                      "$(conf_get Position.Altitude)"             "0"
+is "SampleRate"                    "$(conf_get RF.SampleRate)"                 "2.0"
+is "nested CenterFreq"             "$(conf_get RF.OGN.CenterFreq)"             "868.8"
+is "HTTP port"                     "$(conf_get HTTP.Port)"                     "8080"
+is "UpdateChannel"                 "$(conf_get Install.UpdateChannel)"         "stable"
+is "MaintenanceWindow keeps spaces" "$(conf_get Install.MaintenanceWindow)"    "Sun *-*-* 03:00:00"
+is "deeply nested RemoteAdmin"     "$(conf_get Install.RemoteAdmin.Connect)"   "false"
+is "commented-out FreqCorr is absent" "$(conf_get RF.FreqCorr '<none>')"       "<none>"
+is "GeoidSepar deliberately absent"   "$(conf_get Position.GeoidSepar '<none>')" "<none>"
+conf_bool Install.ReadOnlyFS            && ok "ReadOnlyFS reads as true"  || bad "ReadOnlyFS reads as true"
+conf_bool Install.RemoteAdmin.OGNTeam   && bad "OGNTeam reads as false"   || ok "OGNTeam reads as false"
+conf_bool Nothing.At.All                && bad "missing key is false"     || ok "missing key is false"
+
+echo "== config parser: awkward input =="
+conf_load tests/fixtures/awkward.conf
+is "// inside a string survives"   "$(conf_get Strings.WithSlashes)" "http://example.com/not?a=comment"
+is "# inside a string survives"    "$(conf_get Strings.WithHash)"    "a # b"
+is "; inside a string survives"    "$(conf_get Strings.WithSemi)"    "a ; b"
+is "braces inside a string"        "$(conf_get Strings.WithBrace)"   "a } b {"
+is "escaped quotes"                "$(conf_get Strings.WithEscape)"  'she said \"hello\"'
+is "trailing // comment ignored"   "$(conf_get APRS.Call)"           "Tricky9"
+is "block comment ignored"         "$(conf_get Position.Latitude)"   "-33.9500"
+is "blank line does not reset"     "$(conf_get Position.Altitude)"   "128"
+is "three levels deep"             "$(conf_get Nest.Level2.Level3.Deep)" "42"
+is "sibling after a nested close"  "$(conf_get Nest.Sibling)"        "false"
+is "value after an array"          "$(conf_get Arrays.After)"        "7"
+is "empty string uses the default" "$(conf_get Strings.Empty 'dflt')" "dflt"
+
+echo "== receiver name validation =="
+check_name() { printf '%s' "$1" | grep -Eq '^[A-Za-z0-9]{1,9}$'; }
+for good in Lasham EGHL Salanda Lennrtsns9 a 123456789; do
+    case "$good" in Lennrtsns9) continue ;; esac
+    check_name "$good" && ok "accepts '$good'" || bad "accepts '$good'"
+done
+for bad_name in "" "Ten2Longer" "has space" "has-dash" "üml" "a_b"; do
+    check_name "$bad_name" && bad "rejects '$bad_name'" || ok "rejects '$bad_name'"
+done
+
+echo "== manifest =="
+python3 -c 'import json;json.load(open("versions.json"))' && ok "versions.json is valid JSON" || bad "versions.json is valid JSON"
+MANIFEST_CACHE="$PWD/versions.json"
+is "stable resolves"        "$(manifest_resolve stable)"   "0.3.2"
+is "exact version resolves" "$(manifest_resolve 0.3.2)"    "0.3.2"
+manifest_resolve 9.9.9 >/dev/null 2>&1 && bad "unknown version is rejected" || ok "unknown version is rejected"
+is "arm64 url"              "$(manifest_field 0.3.2 arm64 url)" \
+                            "http://download.glidernet.org/arm64/rtlsdr-ogn-bin-arm64-0.3.2.tgz"
+case "$(manifest_field 0.3.2 arm64 sha256)" in
+    None|null|"") ok "sha256 is still unset, so ogn-update will refuse to install" ;;
+    *)            ok "sha256 is populated" ;;
+esac
+
+echo "== SD card write protection =="
+for fn in boot_rw boot_ro boot_write; do
+    type "$fn" >/dev/null 2>&1 && ok "$fn is defined" || bad "$fn is defined"
+done
+grep -q 'Storage=volatile' src/ogn-install && ok "journal is pinned to RAM" || bad "journal is pinned to RAM"
+grep -q 'RuntimeMaxUse' src/ogn-install && ok "journal size is capped" || bad "journal size is capped"
+grep -q 'do_bootro 0' src/ogn-install && ok "boot partition is set read-only" || bad "boot partition is set read-only"
+grep -q 'rsyslog' src/ogn-install && ok "rsyslog is disabled if present" || bad "rsyslog is disabled if present"
+grep -q 'boot_write "$STATE_FILE"' src/ogn-maintenance && ok "marker writes go through boot_write" || bad "marker writes go through boot_write"
+grep -q '\[ -e "$STATE_FILE" \] || return 0' src/ogn-maintenance \
+    && ok "idle boots do not write to the card" || bad "idle boots do not write to the card"
+
+echo "== generated vendor-data is in step with src/ =="
+BEFORE=$(sha256sum boot/vendor-data 2>/dev/null || shasum -a 256 boot/vendor-data)
+./tools/build-vendor-data >/dev/null
+AFTER=$(sha256sum boot/vendor-data 2>/dev/null || shasum -a 256 boot/vendor-data)
+is "boot/vendor-data is up to date" "${AFTER%% *}" "${BEFORE%% *}"
+grep -q 'ogn-install' boot/vendor-data && ok "vendor-data hands over to ogn-install" || bad "vendor-data hands over to ogn-install"
+grep -q 'rpi-connect' boot/vendor-data && ok "vendor-data carries the remote-admin code" || bad "vendor-data carries the remote-admin code"
+
+echo "== image build =="
+# build-image.sh downloads 550 MB and chroots, so the only thing that can be
+# checked here is that it declines to do any of that on a workstation.
+if [ "$(id -u)" -ne 0 ]; then
+    OUT=$(./tools/build-image.sh 2>&1)
+    if [ $? -ne 0 ] && printf '%s' "$OUT" | grep -qiE 'only works on Linux|must run as root'; then
+        ok "build-image.sh refuses to run outside CI"
+    else
+        bad "build-image.sh refuses to run outside CI" "$OUT"
+    fi
+else
+    printf '  skip running as root, so the refusal path cannot be checked safely\n'
+fi
+
+TMP=$(mktemp -d)
+cat > "$TMP/meta.json" <<'JSON'
+{ "name": "OGN Receiver", "file": "ogn-receiver-2026-01-01-arm64.img.xz",
+  "extract_size": 3573547008, "extract_sha256": "beef",
+  "image_download_size": 600000000, "image_download_sha256": "cafe",
+  "release_date": "2026-01-01", "base_image": "base.img" }
+JSON
+URL="https://github.com/glidernet/ogn-bootstrap/releases/download/v3/ogn-receiver-2026-01-01-arm64.img.xz"
+
+if ./tools/make-os-list --meta "$TMP/meta.json" --url "$URL" --out "$TMP/os-list.json" >/dev/null; then
+    ok "make-os-list produces a list"
+    python3 - "$TMP/os-list.json" <<'PY' && ok "os-list.json has what Imager requires" || bad "os-list.json has what Imager requires"
+import json, sys
+e = json.load(open(sys.argv[1]))["os_list"][0]
+required = ("name", "description", "icon", "url", "extract_size",
+            "extract_sha256", "image_download_size", "release_date", "devices")
+missing = [k for k in required if not e.get(k)]
+assert not missing, missing
+# cloudinit-rpi is what keeps the Imager customisation wizard working.
+assert e["init_format"] == "cloudinit-rpi", e["init_format"]
+assert e["devices"] and all(d.endswith("-64bit") for d in e["devices"]), e["devices"]
+PY
+else
+    bad "make-os-list produces a list"
+fi
+
+./tools/make-os-list --meta "$TMP/meta.json" --url "${URL/https/http}" --out "$TMP/x.json" >/dev/null 2>&1 \
+    && bad "make-os-list rejects a plain-http download URL" \
+    || ok "make-os-list rejects a plain-http download URL"
+./tools/make-os-list --meta "$TMP/meta.json" --url "https://example.com/other.img.xz" --out "$TMP/x.json" >/dev/null 2>&1 \
+    && bad "make-os-list rejects a URL the hashes do not describe" \
+    || ok "make-os-list rejects a URL the hashes do not describe"
+rm -rf "$TMP"
+
+BEFORE=$(sha256sum doc/ogn-icon.png 2>/dev/null || shasum -a 256 doc/ogn-icon.png)
+python3 tools/make-icon >/dev/null
+AFTER=$(sha256sum doc/ogn-icon.png 2>/dev/null || shasum -a 256 doc/ogn-icon.png)
+is "doc/ogn-icon.png is reproducible" "${AFTER%% *}" "${BEFORE%% *}"
+
+# The build job runs other people's package scripts as root. It must not be
+# holding a token while it does. Guarding this in tests because it is the kind
+# of line that gets "tidied" back in later.
+W=.github/workflows/build-image.yml
+grep -q 'persist-credentials: false' "$W" \
+    && ok "checkout does not leave credentials for the chroot" \
+    || bad "checkout does not leave credentials for the chroot"
+python3 - "$W" <<'PY' && ok "the build job has no write permissions" || bad "the build job has no write permissions"
+import re, sys
+text = open(sys.argv[1]).read()
+build = text.split("  build:", 1)[1].split("\n  publish:", 1)[0]
+assert re.search(r"^\s+permissions:\s*\{\}\s*$", build, re.M), "build job is missing 'permissions: {}'"
+assert "contents: write" not in build, "build job grants contents: write"
+PY
+
+echo
+printf '%s passed, %s failed\n' "$PASS" "$FAIL"
+[ "$FAIL" -eq 0 ]

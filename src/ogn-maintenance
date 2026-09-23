@@ -1,0 +1,232 @@
+#!/bin/bash
+#
+# ogn-maintenance — apply updates in a window where the filesystem is writable.
+#
+#   sudo ogn-maintenance --now        run the cycle immediately
+#   sudo ogn-maintenance --status     show where the cycle has got to
+#
+# With the read-only overlay active, writes to the root filesystem go to RAM
+# and are thrown away at reboot, so updates have to happen with the overlay
+# out of the way. That means a two-reboot cycle:
+#
+#   overlay on  -> disable overlay, reboot
+#   overlay off -> apt security updates, ogn-update, enable overlay, reboot
+#   overlay on  -> normal running
+#
+# The state marker lives on the boot partition, which sits outside the root
+# overlay, so it survives the reboots that the cycle depends on. Every step
+# checks the marker first, so an interruption at any point resumes or aborts
+# to a known state rather than leaving the receiver unprotected.
+#
+# Copyright (c) 2026 ifly7charlie. MIT licence, see LICENSE.
+
+set -euo pipefail
+
+LIBDIR="${OGN_LIBDIR:-/usr/local/lib/ogn-bootstrap}"
+# shellcheck source=src/ogn-common.sh
+. "$LIBDIR/ogn-common.sh"
+
+STATE_FILE="$STATE_DIR/maintenance.state"
+UPDATE_MOTD=/etc/motd.d/20-ogn-updates
+MAX_ATTEMPTS=3
+
+state_read()  { [ -r "$STATE_FILE" ] && cut -d' ' -f1 "$STATE_FILE" || printf 'idle'; }
+state_count() { [ -r "$STATE_FILE" ] && cut -d' ' -f2 "$STATE_FILE" || printf '0'; }
+state_write() { printf '%s %s %s\n' "$1" "${2:-0}" "$(date -Is)" | boot_write "$STATE_FILE"; }
+# Only ever touch the card if there is actually something to remove: this runs
+# on every boot, and an unconditional rm is still a write to a FAT partition.
+state_clear() {
+    [ -e "$STATE_FILE" ] || return 0
+    boot_rw; rm -f "$STATE_FILE"; boot_ro
+}
+
+# --- overlay -------------------------------------------------------------
+# On Trixie raspi-config drives Debian's overlayroot with a plain
+# overlayroot=tmpfs kernel parameter. That is a real improvement on the old
+# scheme, which baked a uname-specific initrd name into config.txt and so
+# broke silently across kernel upgrades.
+overlay_active()    { grep -q 'overlayroot=tmpfs' /proc/cmdline; }
+overlay_next_boot() { grep -q 'overlayroot=tmpfs' "$BOOT_DIR/cmdline.txt" 2>/dev/null; }
+
+overlay_status() {
+    local now next
+    overlay_active    && now=active   || now=inactive
+    overlay_next_boot && next=enabled || next=disabled
+    printf '%s now=%s next_boot=%s\n' "$next" "$now" "$next"
+}
+
+overlay_set() {
+    # raspi-config's convention is inverted: 0 enables, 1 disables.
+    local want="$1"
+    command -v raspi-config >/dev/null || die "raspi-config is not installed; cannot manage the overlay"
+    if [ "$want" = enable ]; then
+        raspi-config nonint do_overlayfs 0
+    else
+        raspi-config nonint do_overlayfs 1
+    fi
+}
+
+# Swap on a tmpfs overlay is pathological: the backing file lives in the RAM
+# upper layer, so the system pins memory to hold a "disk" that is itself
+# memory, and the overlay slowly fills. Disable the units that recreate it
+# rather than just swapoff, or it returns at the next boot.
+swap_disable() {
+    local u
+    swapoff -a 2>/dev/null || true
+    for u in rpi-setup-loop@var-swap.service rpi-resize-swap-file.service dphys-swapfile.service; do
+        systemctl disable --now "$u" >/dev/null 2>&1 || true
+    done
+    rm -f /var/swap 2>/dev/null || true
+}
+
+# --- the actual updating -------------------------------------------------
+do_updates() {
+    # A kernel or firmware package writes to /boot/firmware, so open it for the
+    # duration of the pass rather than per-file.
+    boot_rw
+    log "applying security updates"
+    apt_wait
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq || warn "apt-get update failed; continuing"
+    apt_wait
+    unattended-upgrade -v 2>&1 | sed 's/^/  /' || warn "unattended-upgrade reported a problem; continuing"
+
+    log "checking for a new OGN release"
+    if ogn-update; then
+        log "OGN software is up to date"
+    else
+        warn "ogn-update failed; the previously installed version is still in place"
+    fi
+    boot_ro
+}
+
+report_available() {
+    local out installed available
+    if ! out=$(ogn-update --check 2>/dev/null); then
+        installed=$(printf '%s' "$out" | sed -n 's/^installed=//p')
+        available=$(printf '%s' "$out" | sed -n 's/^available=//p')
+        if [ -n "$available" ] && [ "$installed" != "$available" ]; then
+            mkdir -p "$(dirname "$UPDATE_MOTD")"
+            cat > "$UPDATE_MOTD" <<EOF
+
+  OGN $installed is installed; $available is available.
+  It will be installed automatically in the next maintenance window,
+  or now with:  sudo ogn-maintenance --now
+
+EOF
+            log "update available: $installed -> $available"
+            return 0
+        fi
+    fi
+    rm -f "$UPDATE_MOTD"
+    return 0
+}
+
+# --- cycle ---------------------------------------------------------------
+begin_cycle() {
+    local attempts
+    if [ "$(state_read)" != "idle" ]; then
+        log "a maintenance cycle is already in progress ($(state_read)); not starting another"
+        return 0
+    fi
+    if ! overlay_active; then
+        # Nothing to work around — just update in place.
+        log "overlay is not active; updating without rebooting"
+        do_updates
+        state_clear
+        return 0
+    fi
+    attempts=$(( $(state_count) + 1 ))
+    log "disabling the read-only overlay and rebooting to apply updates"
+    state_write updating "$attempts"
+    overlay_set disable
+    systemctl reboot
+}
+
+resume_cycle() {
+    local attempts
+    attempts=$(state_count)
+    if [ "$attempts" -gt "$MAX_ATTEMPTS" ]; then
+        warn "maintenance has failed $attempts times; giving up and restoring the overlay"
+        state_write restoring "$attempts"
+        overlay_set enable
+        state_clear
+        systemctl reboot
+        return 0
+    fi
+    if overlay_active; then
+        # We asked for the overlay to be off and it is still on: the disable
+        # did not take. Restore a known state rather than looping.
+        warn "expected the overlay to be off after rebooting, but it is active; aborting this cycle"
+        state_clear
+        return 0
+    fi
+    log "maintenance pass (attempt $attempts)"
+    do_updates
+    log "re-enabling the read-only overlay and rebooting"
+    state_write restoring "$attempts"
+    overlay_set enable
+    state_clear
+    systemctl reboot
+}
+
+boot_check() {
+    case "$(state_read)" in
+        updating)
+            resume_cycle
+            ;;
+        restoring)
+            # We were interrupted between enabling the overlay and rebooting.
+            if overlay_next_boot; then
+                log "maintenance finished"
+                state_clear
+            else
+                warn "the overlay was not re-enabled after maintenance; re-enabling now"
+                overlay_set enable
+                state_clear
+                systemctl reboot
+            fi
+            ;;
+        *)
+            state_clear
+            report_available
+            ;;
+    esac
+}
+
+# --- entry point ---------------------------------------------------------
+MODE=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --scheduled)      MODE=scheduled ;;
+        --boot-check)     MODE=boot-check ;;
+        --now)            MODE=now ;;
+        --status)         MODE=status ;;
+        --overlay-status) MODE=overlay-status ;;
+        --overlay-enable) MODE=overlay-enable ;;
+        --overlay-disable) MODE=overlay-disable ;;
+        -h|--help)        sed -n '3,20p' "$0"; exit 0 ;;
+        *)                die "unknown option: $1" ;;
+    esac
+    shift
+done
+
+case "$MODE" in
+    overlay-status) overlay_status; exit 0 ;;
+    status)
+        printf 'state:   %s (since %s)\n' "$(state_read)" "$([ -r "$STATE_FILE" ] && cut -d' ' -f3 "$STATE_FILE" || printf 'n/a')"
+        printf 'overlay: %s\n' "$(overlay_status)"
+        if [ "$(id -u)" -eq 0 ] || [ -r "$MANIFEST_CACHE" ]; then
+            ogn-update --check || true
+        fi
+        exit 0 ;;
+esac
+
+need_root
+
+case "$MODE" in
+    overlay-enable)  swap_disable; overlay_set enable ;;
+    overlay-disable) overlay_set disable ;;
+    boot-check)      boot_check ;;
+    scheduled|now)   begin_cycle ;;
+    *)               die "say what to do: --now, --status, or --boot-check" ;;
+esac

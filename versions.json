@@ -1,0 +1,40 @@
+{
+  "_comment": [
+    "Release manifest for the OGN decoder binaries.",
+    "",
+    "This file is the integrity anchor for every receiver. It is fetched from",
+    "raw.githubusercontent.com over TLS with a real certificate, which is what",
+    "makes the SHA256 below trustworthy. The binaries themselves come from",
+    "download.glidernet.org, which has no working HTTPS at all -- and answers",
+    "port 443 with cleartext, so a 'try TLS first' fallback would appear to",
+    "succeed while protecting nothing.",
+    "",
+    "The md5 values are upstream's own, from download.glidernet.org/md5.txt.",
+    "They are checked, but only to catch a corrupt or truncated download: an",
+    "attacker able to alter the tarball over plain HTTP could alter that file",
+    "just as easily. The sha256 is the one that matters.",
+    "",
+    "Add a release with:  tools/add-version <version>",
+    "Promote it with:     edit channels.stable"
+  ],
+  "channels": {
+    "stable": "0.3.2",
+    "latest": "0.3.2"
+  },
+  "releases": {
+    "0.3.2": {
+      "released": "2024-03-19",
+      "notes": "Drops the libjpeg8 dependency the older guides all work around; links libpng16 instead.",
+      "arm64": {
+        "url": "http://download.glidernet.org/arm64/rtlsdr-ogn-bin-arm64-0.3.2.tgz",
+        "md5": "ac659a05f45a27b59667758aac26b073",
+        "sha256": null
+      },
+      "armhf": {
+        "url": "http://download.glidernet.org/arm/rtlsdr-ogn-bin-ARM-0.3.2.tgz",
+        "md5": "33a1f70c74538660274fa653e9ba6503",
+        "sha256": null
+      }
+    }
+  }
+}

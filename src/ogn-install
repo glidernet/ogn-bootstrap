@@ -1,0 +1,463 @@
+#!/bin/bash
+#
+# ogn-install — set up an OGN receiver on Raspberry Pi OS Trixie.
+#
+# Normally run once, unattended, by cloud-init on first boot. Also safe to run
+# by hand on an already-configured Pi: every step is idempotent.
+#
+#   sudo ogn-install              use /boot/firmware/MyReceiver.conf
+#   sudo ogn-install --config X   use a different config file
+#   sudo ogn-install --no-reboot  ignore Install.RebootWhenDone
+#
+# Copyright (c) 2026 ifly7charlie. MIT licence, see LICENSE.
+
+set -euo pipefail
+
+LIBDIR="${OGN_LIBDIR:-/usr/local/lib/ogn-bootstrap}"
+# shellcheck source=src/ogn-common.sh
+. "$LIBDIR/ogn-common.sh"
+
+CONF_OVERRIDE=""
+FORCE_NO_REBOOT=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --config)    CONF_OVERRIDE="$2"; shift 2 ;;
+        --no-reboot) FORCE_NO_REBOOT=1; shift ;;
+        -h|--help)   sed -n '3,12p' "$0"; exit 0 ;;
+        *)           die "unknown option: $1" ;;
+    esac
+done
+[ -n "$CONF_OVERRIDE" ] && BOOT_CONF="$CONF_OVERRIDE"
+
+need_root
+mkdir -p /var/lib/ogn-bootstrap
+
+# ---------------------------------------------------------------------------
+# 1. Read and sanity-check the configuration
+# ---------------------------------------------------------------------------
+if [ ! -r "$BOOT_CONF" ]; then
+    motd_set <<EOF
+
+  OGN receiver: NOT CONFIGURED
+
+  No MyReceiver.conf was found at $BOOT_CONF.
+
+  Copy it from https://github.com/glidernet/ogn-bootstrap onto the boot
+  partition of the SD card, fill in the four TODO lines, and run:
+
+      sudo ogn-install
+
+EOF
+    die "no configuration at $BOOT_CONF — nothing installed"
+fi
+
+log "reading $BOOT_CONF"
+conf_load "$BOOT_CONF"
+trap conf_cleanup EXIT
+
+OGN_USER=$(detect_ogn_user) || die "could not work out which account to install for; pass OGN_USER_OVERRIDE"
+OGN_HOME=$(user_home "$OGN_USER")
+[ -d "$OGN_HOME" ] || die "home directory $OGN_HOME for $OGN_USER does not exist"
+OGN_GROUP=$(id -gn "$OGN_USER")
+log "installing for user $OGN_USER ($OGN_HOME)"
+
+# Receiver name: blank means "use the hostname", which is the one OGN setting
+# Raspberry Pi Imager can actually capture.
+CALL=$(conf_get APRS.Call "")
+CALL_SOURCE="MyReceiver.conf"
+if [ -z "$CALL" ]; then
+    CALL=$(hostname -s)
+    CALL_SOURCE="hostname"
+fi
+if ! printf '%s' "$CALL" | grep -Eq '^[A-Za-z0-9]{1,9}$'; then
+    die "receiver name '$CALL' (from $CALL_SOURCE) is not valid: up to 9 letters and digits, nothing else.
+     See http://wiki.glidernet.org/receiver-naming-convention"
+fi
+log "receiver name: $CALL (from $CALL_SOURCE)"
+
+# Position. A receiver reporting from a template default is worse than one that
+# is plainly switched off, so this gates the decoder rather than the install.
+LAT=$(conf_get Position.Latitude 0)
+LON=$(conf_get Position.Longitude 0)
+ALT=$(conf_get Position.Altitude 0)
+POSITION_OK=1
+if awk "BEGIN{exit !($LAT == 0 && $LON == 0)}" 2>/dev/null; then
+    POSITION_OK=0
+    warn "position is still 0,0 — the receiver will be installed but left stopped"
+elif awk "BEGIN{exit !($LAT < -90 || $LAT > 90 || $LON < -180 || $LON > 180)}" 2>/dev/null; then
+    POSITION_OK=0
+    warn "position $LAT,$LON is out of range — the receiver will be left stopped"
+else
+    log "position: $LAT, $LON at ${ALT} m AMSL"
+    # Not fatal: an aerial genuinely at 0 m AMSL is possible, just unusual
+    # enough to be worth saying out loud, since it is also what you get by
+    # filling in the position and forgetting the line underneath it.
+    awk "BEGIN{exit !($ALT == 0)}" 2>/dev/null \
+        && warn "altitude is 0 m — check Position.Altitude is the aerial's height above SEA level, in metres"
+fi
+
+READONLY_FS=0;    conf_bool Install.ReadOnlyFS    true && READONLY_FS=1
+REBOOT_WHEN_DONE=0; conf_bool Install.RebootWhenDone true && REBOOT_WHEN_DONE=1
+[ "$FORCE_NO_REBOOT" -eq 1 ] && REBOOT_WHEN_DONE=0
+CHANNEL=$(conf_get Install.UpdateChannel stable)
+WINDOW=$(conf_get Install.MaintenanceWindow "")
+
+# ---------------------------------------------------------------------------
+# 2. Packages
+#
+# Trixie substitutions worth knowing: libconfig9 -> libconfig11 (and the 0.3.2
+# binaries static-link it anyway), ntp/ntpdate are gone entirely, and the
+# decoder needs libpng16 rather than the libjpeg8 the old guides all mention.
+#
+# procServ and telnet are deliberately absent. The older images ran both
+# binaries inside procServ so you could telnet to ports 50000/50001 and watch
+# the console. Here they are ordinary systemd services, so the same output is
+# in the journal -- which survives, is rotated, and can be read remotely --
+# and there is no console to attach to. `journalctl -u ogn-decode -f`.
+# ---------------------------------------------------------------------------
+PACKAGES=(rtl-sdr librtlsdr0 libpng16-16t64 lynx curl ca-certificates unattended-upgrades)
+[ "$READONLY_FS" -eq 1 ] && PACKAGES+=(overlayroot)
+conf_bool Install.RemoteAdmin.OGNTeam && PACKAGES+=(autossh)
+apt_install "${PACKAGES[@]}"
+
+# ---------------------------------------------------------------------------
+# 3. Keep the DVB-T drivers off the SDR
+# ---------------------------------------------------------------------------
+BLACKLIST=/etc/modprobe.d/rtl-glidernet-blacklist.conf
+if [ ! -f "$BLACKLIST" ]; then
+    log "blacklisting the DVB-T kernel drivers"
+    cat > "$BLACKLIST" <<'EOF'
+# The RTL2832-based SDR sticks are claimed by the DVB-T drivers on plug-in,
+# which stops rtl-sdr from opening them. Installed by ogn-bootstrap.
+blacklist rtl2832
+blacklist r820t
+blacklist rtl2830
+blacklist dvb_usb_rtl28xxu
+EOF
+    for m in dvb_usb_rtl28xxu rtl2832 rtl2830 r820t; do
+        modprobe -r "$m" 2>/dev/null || true
+    done
+fi
+
+# ---------------------------------------------------------------------------
+# 4. Decoder binaries
+# ---------------------------------------------------------------------------
+OGN_USER="$OGN_USER" OGN_HOME="$OGN_HOME" ogn-update --channel "$CHANNEL" --install-only
+
+INSTALL_DIR="$OGN_HOME/rtlsdr-ogn"
+[ -d "$INSTALL_DIR" ] || die "expected $INSTALL_DIR after installing the binaries"
+REAL_DIR=$(readlink -f "$INSTALL_DIR")
+
+# ---------------------------------------------------------------------------
+# 5. Place the configuration
+#
+# Copied, not regenerated: what was edited on the card is what runs. Only two
+# values are ever rewritten, and only when the operator left them for us.
+# ---------------------------------------------------------------------------
+TARGET_CONF="$REAL_DIR/MyReceiver.conf"
+log "writing $TARGET_CONF"
+install -o "$OGN_USER" -g "$OGN_GROUP" -m 0644 "$BOOT_CONF" "$TARGET_CONF"
+
+if [ "$CALL_SOURCE" = "hostname" ]; then
+    sed -i "s|^\( *Call *= *\)\"\"|\1\"$CALL\"|" "$TARGET_CONF"
+fi
+
+if ! conf_has RF.FreqCorr && [ -x "$REAL_DIR/gsm_scan" ]; then
+    if PPM=$(ogn-calibrate --quiet 2>/dev/null) && [ -n "$PPM" ]; then
+        log "measured frequency correction: ${PPM} ppm"
+        sed -i "s|^\( *SampleRate *=\)|  FreqCorr = $PPM;   # measured by ogn-calibrate at install\n\1|" "$TARGET_CONF"
+    else
+        log "could not measure frequency correction; run 'sudo ogn-calibrate' once the aerial is connected"
+    fi
+fi
+
+# The geoid grid lets the decoder convert between ellipsoid and sea-level
+# heights properly, which is why GeoidSepar is deliberately absent from the
+# config template.
+if [ ! -s "$REAL_DIR/WW15MGH.DAC" ]; then
+    log "fetching the EGM96 geoid grid"
+    ( cd "$REAL_DIR" && runuser -u "$OGN_USER" -- bash ./getEGM.sh ) \
+        || warn "could not fetch WW15MGH.DAC; altitudes will be less accurate"
+fi
+
+# ---------------------------------------------------------------------------
+# 6. Services
+# ---------------------------------------------------------------------------
+install -d -m 0755 /etc/systemd/system
+
+write_unit() {
+    local name="$1" tmp
+    tmp=$(mktemp)
+    cat > "$tmp"
+    if ! cmp -s "$tmp" "/etc/systemd/system/$name"; then
+        install -m 0644 "$tmp" "/etc/systemd/system/$name"
+        log "updated $name"
+    fi
+    rm -f "$tmp"
+}
+
+write_unit ogn-rf.service <<EOF
+[Unit]
+Description=OGN receiver: RF front end
+Documentation=https://github.com/glidernet/ogn-bootstrap
+PartOf=rtlsdr-ogn.service
+After=time-sync.target
+Wants=time-sync.target
+
+[Service]
+Type=simple
+User=$OGN_USER
+WorkingDirectory=$REAL_DIR
+ExecStart=$REAL_DIR/ogn-rf MyReceiver.conf
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+EOF
+
+write_unit ogn-decode.service <<EOF
+[Unit]
+Description=OGN receiver: decoder and APRS uplink
+Documentation=https://github.com/glidernet/ogn-bootstrap
+PartOf=rtlsdr-ogn.service
+After=ogn-rf.service time-sync.target
+Wants=time-sync.target
+
+[Service]
+Type=simple
+User=$OGN_USER
+WorkingDirectory=$REAL_DIR
+ExecStart=$REAL_DIR/ogn-decode MyReceiver.conf
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+EOF
+
+# The grouping unit exists so that 'systemctl restart rtlsdr-ogn' does the
+# obvious thing. PartOf= on the two real units makes stop/restart propagate.
+write_unit rtlsdr-ogn.service <<EOF
+[Unit]
+Description=OGN receiver
+Documentation=https://github.com/glidernet/ogn-bootstrap
+Wants=ogn-rf.service ogn-decode.service
+After=ogn-rf.service ogn-decode.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Let the monitoring tooling restart the receiver without a password.
+SUDOERS=/etc/sudoers.d/010-ogn-receiver
+if [ ! -f "$SUDOERS" ] || ! grep -q "^$OGN_USER " "$SUDOERS"; then
+    printf '%s ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart rtlsdr-ogn\n' "$OGN_USER" > "$SUDOERS"
+    chmod 0440 "$SUDOERS"
+    visudo -cqf "$SUDOERS" || { rm -f "$SUDOERS"; die "generated an invalid sudoers file"; }
+fi
+
+# ---------------------------------------------------------------------------
+# 7. Clock
+#
+# The old guides run ntpdate from cron every ten minutes. On Trixie ntpdate is
+# not merely unnecessary, it does not exist: systemd-timesyncd is the time
+# source. What the decoder actually needs is to not start before the clock is
+# right, and time-sync.target alone does not guarantee that — it is reached
+# when synchronisation *starts*. systemd-time-wait-sync is what makes the
+# ordering mean what it looks like it means, and Debian ships it disabled.
+# ---------------------------------------------------------------------------
+systemctl enable --now systemd-timesyncd.service >/dev/null 2>&1 || true
+systemctl enable systemd-time-wait-sync.service  >/dev/null 2>&1 || true
+
+# ---------------------------------------------------------------------------
+# 8. Hardware watchdog
+#
+# A drop-in, rather than editing /etc/systemd/system.conf, which is deprecated.
+# ---------------------------------------------------------------------------
+install -d -m 0755 /etc/systemd/system.conf.d
+cat > /etc/systemd/system.conf.d/10-ogn-watchdog.conf <<'EOF'
+# Reboot if the kernel stops petting the watchdog. Installed by ogn-bootstrap.
+[Manager]
+RuntimeWatchdogSec=15
+RebootWatchdogSec=3min
+EOF
+
+# ---------------------------------------------------------------------------
+# 9. Logs
+#
+# The decoder is chatty, and a receiver runs for years, so the logs are the
+# most likely thing to wear out a card. Two things make that impossible
+# rather than merely unlikely:
+#
+#   Storage=volatile  the journal lives in /run, i.e. RAM, always. Not
+#                     "auto", which would start persisting the moment
+#                     something created /var/log/journal, and not reliant on
+#                     the overlay being switched on.
+#   RuntimeMaxUse     capped, because the flip side of a journal in RAM is a
+#                     journal competing with the decoder for RAM.
+#
+# This is also why the services log to the journal rather than running under
+# procServ as the older images did: procServ writes plain files under
+# /var/log, which persist whenever the overlay is off, and it never rotates
+# them.
+# ---------------------------------------------------------------------------
+install -d -m 0755 /etc/systemd/journald.conf.d
+cat > /etc/systemd/journald.conf.d/10-ogn.conf <<'EOF'
+# Keep the journal in RAM so it can never wear out the SD card.
+# Installed by ogn-bootstrap.
+[Journal]
+Storage=volatile
+RuntimeMaxUse=32M
+RuntimeMaxFileSize=8M
+EOF
+systemctl restart systemd-journald 2>/dev/null || true
+
+# Debian 13 does not install rsyslog, but if something pulled it in it would
+# write /var/log/syslog continuously and undo the above.
+if systemctl list-unit-files rsyslog.service >/dev/null 2>&1 \
+   && systemctl is-enabled --quiet rsyslog.service 2>/dev/null; then
+    log "disabling rsyslog: it writes to /var/log continuously"
+    systemctl disable --now rsyslog.service || true
+fi
+
+# ---------------------------------------------------------------------------
+# 10. Optional remote administration — all off unless explicitly enabled
+# ---------------------------------------------------------------------------
+ogn-remote-admin --config "$BOOT_CONF" --user "$OGN_USER"
+
+# ---------------------------------------------------------------------------
+# 11. Unattended security updates, and the maintenance timer
+# ---------------------------------------------------------------------------
+cat > /etc/apt/apt.conf.d/51ogn-unattended-upgrades <<'EOF'
+// Security updates only, and never an automatic reboot: the maintenance
+// cycle owns reboots, because it is the only thing that knows when the
+// read-only overlay is out of the way. Installed by ogn-bootstrap.
+Unattended-Upgrade::Origins-Pattern {
+    "origin=Debian,codename=${distro_codename}-security,label=Debian-Security";
+    "origin=Raspbian,codename=${distro_codename},label=Raspbian";
+};
+Unattended-Upgrade::Automatic-Reboot "false";
+APT::Periodic::Update-Package-Lists "0";
+APT::Periodic::Unattended-Upgrade "0";
+EOF
+
+if [ -n "$WINDOW" ]; then
+    write_unit ogn-maintenance.service <<'EOF'
+[Unit]
+Description=OGN receiver maintenance (updates, read-only overlay cycle)
+Documentation=https://github.com/glidernet/ogn-bootstrap
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ogn-maintenance --scheduled
+EOF
+    write_unit ogn-maintenance.timer <<EOF
+[Unit]
+Description=OGN receiver maintenance window
+
+[Timer]
+OnCalendar=$WINDOW
+RandomizedDelaySec=30m
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl enable ogn-maintenance.timer >/dev/null
+    log "maintenance window: $WINDOW"
+else
+    systemctl disable --now ogn-maintenance.timer >/dev/null 2>&1 || true
+    log "automatic updates disabled (MaintenanceWindow is empty)"
+fi
+
+# Resume any maintenance cycle that was interrupted, and report new versions.
+write_unit ogn-boot-check.service <<'EOF'
+[Unit]
+Description=OGN receiver boot check (resume maintenance, report updates)
+Documentation=https://github.com/glidernet/ogn-bootstrap
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ogn-maintenance --boot-check
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl enable ogn-boot-check.service >/dev/null
+
+systemctl daemon-reload
+
+# ---------------------------------------------------------------------------
+# 12. Start it, or explain why not
+# ---------------------------------------------------------------------------
+VERSION=$(basename "$REAL_DIR")
+if [ "$POSITION_OK" -eq 1 ]; then
+    systemctl enable rtlsdr-ogn.service >/dev/null
+    systemctl restart rtlsdr-ogn.service
+    log "receiver $CALL started ($VERSION)"
+    motd_set <<EOF
+
+  OGN receiver $CALL — $VERSION
+  Status page:  http://$(hostname -s).local:$(conf_get HTTP.Port 8080)/
+  Service:      systemctl status rtlsdr-ogn
+  Logs:         journalctl -u ogn-decode -f
+  Settings:     $TARGET_CONF
+
+EOF
+else
+    systemctl disable rtlsdr-ogn.service >/dev/null 2>&1 || true
+    motd_set <<EOF
+
+  OGN receiver $CALL: INSTALLED BUT NOT TRANSMITTING
+
+  The antenna position in MyReceiver.conf is still $LAT, $LON.
+
+  A receiver reporting a wrong position is worse than one that is switched
+  off, so nothing will be sent to the network until you set it. Edit:
+
+      $BOOT_CONF
+
+  (or $TARGET_CONF on this Pi), then run:
+
+      sudo ogn-install
+
+EOF
+    warn "receiver installed but NOT started: set the antenna position first"
+fi
+
+# ---------------------------------------------------------------------------
+# 13. Read-only root, last of all
+# ---------------------------------------------------------------------------
+if [ "$READONLY_FS" -eq 1 ]; then
+    # The boot partition is FAT, and FAT is what corrupts on an unclean power
+    # cycle. raspi-config refuses to change this once the overlay is active,
+    # so it has to happen first.
+    if ! grep -qE '^[^#]*/boot/firmware.*\bro\b' /etc/fstab; then
+        log "mounting the boot partition read-only"
+        raspi-config nonint do_bootro 0 || warn "could not set the boot partition read-only"
+    fi
+
+    if ogn-maintenance --overlay-status | grep -q '^enabled'; then
+        log "read-only overlay already enabled"
+    else
+        log "enabling the read-only overlay (takes effect at the next reboot)"
+        ogn-maintenance --overlay-enable
+        if [ "$REBOOT_WHEN_DONE" -eq 0 ]; then
+            warn "the read-only overlay is armed but will not be active until you reboot"
+        fi
+    fi
+fi
+
+date -Is | boot_write "$STATE_DIR/installed"
+log "setup complete"
+
+if [ "$REBOOT_WHEN_DONE" -eq 1 ]; then
+    log "rebooting"
+    systemctl reboot
+fi
