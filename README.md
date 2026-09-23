@@ -21,11 +21,24 @@ when the receiver lives in a locked container on the far side of an airfield.
 
 ### 1. Point Imager at this repository
 
-Once only. In Imager, open **Settings** and switch the image repository to:
+Once only. Open **APP OPTIONS**, at the bottom left of the Imager window:
+
+![The Imager device screen, with the APP OPTIONS button at the bottom left](doc/AppOptionsButton.png)
+
+Next to **Content Repository**, click **EDIT**:
+
+![The App Options dialog, with an EDIT button beside Content Repository](doc/ContentRepository.png)
+
+Choose **Use custom URL** and enter:
 
 ```
 https://raw.githubusercontent.com/glidernet/ogn-bootstrap/master/os-list.json
 ```
+
+![The Content Repository dialog set to Use custom URL, with the os-list.json URL entered](doc/ConfigureURL.png)
+
+Then **APPLY & RESTART**. Imager restarts and the title bar reads *Using data
+from raw.githubusercontent.com*, which is how you know it took.
 
 Or, if you are scripting it:
 
@@ -33,11 +46,21 @@ Or, if you are scripting it:
 rpi-imager --repo https://raw.githubusercontent.com/glidernet/ogn-bootstrap/master/os-list.json
 ```
 
-The same setting switches back to Raspberry Pi's list afterwards.
+The same setting switches back to Raspberry Pi's list afterwards — pick
+**Raspberry Pi (default)** in the same dialog.
 
 ### 2. Flash the card
 
-Choose **OGN Receiver**, then use the customisation wizard to set:
+Pick your Pi under **Device** and click **NEXT**:
+
+![The Select your Raspberry Pi device screen, with Raspberry Pi 3 selected](doc/SelectDeviceType.png)
+
+Under **OS**, there is one entry — **OGN Receiver**:
+
+![The Choose operating system screen, showing the OGN Receiver entry](doc/SelectOGNReceiver.png)
+
+Choose it, pick the card under **Storage**, then use the customisation wizard
+to set:
 
 - **hostname** — this doubles as the receiver's name on the OGN network, so
   make it something like `Lasham` or `EGHL` (up to 9 letters and digits)
