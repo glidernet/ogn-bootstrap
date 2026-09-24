@@ -49,6 +49,13 @@ BOOT_DIR="${OGN_BOOT_DIR:-/boot/firmware}"
 BOOT_CONF="$BOOT_DIR/MyReceiver.conf"
 # shellcheck disable=SC2034
 STATE_DIR="$BOOT_DIR/ogn-bootstrap"
+# What the card said when we last acted on it. On the boot partition, not in
+# /var/lib: under the overlay a marker on the root filesystem reverts at every
+# reboot, so the same edit would be re-detected for ever.
+# shellcheck disable=SC2034
+CONFIG_APPLIED="$STATE_DIR/config.applied"
+# shellcheck disable=SC2034
+INSTALL_APPLIED="$STATE_DIR/install.applied"
 MANIFEST_URL="${OGN_MANIFEST_URL:-https://raw.githubusercontent.com/glidernet/ogn-bootstrap/master/versions.json}"
 MANIFEST_CACHE="/var/lib/ogn-bootstrap/versions.json"
 MOTD_FILE="/etc/motd.d/10-ogn-bootstrap"
@@ -165,6 +172,74 @@ conf_bool() {
         true|yes|1|on) return 0 ;;
         *)             return 1 ;;
     esac
+}
+
+# --------------------------------------------------------------------------
+# Config digests
+#
+# Over the flattened settings, not the raw file, so re-indenting or fixing a
+# comment does not read as a change. Sorted: the flattener follows file order.
+# --------------------------------------------------------------------------
+sha256_stdin() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum | cut -d' ' -f1
+    else
+        shasum -a 256 | cut -d' ' -f1
+    fi
+}
+
+# conf_digest [section] — digest of everything, or of one top-level section
+conf_digest() {
+    if [ $# -eq 0 ]; then
+        LC_ALL=C sort "$OGN_CONF_CACHE" | sha256_stdin
+    else
+        { grep "^$1\." "$OGN_CONF_CACHE" || true; } | LC_ALL=C sort | sha256_stdin
+    fi
+}
+
+# conf_set_value <file> <key> <value> <comment> [block]
+#
+# Rewrite one "Key = ...;" in place, keeping its indentation. Scope it to a
+# block: CenterFreq and Gain are in both RF.GSM and RF.OGN, so an unscoped
+# substitution would retune the receiver while recording a calibration.
+# Returns 1 if the key is absent rather than guessing where to add it.
+conf_set_value() {
+    local file="$1" key="$2" value="$3" comment="$4" block="${5-}" tmp rc
+    tmp=$(mktemp)
+    LC_ALL=C awk -v key="$key" -v value="$value" -v comment="$comment" -v want="$block" '
+    {
+        line = $0
+        code = line
+        # libconfig takes # and // alike, and the templates in the wild use
+        # both. A brace inside a string value would corrupt the depth count,
+        # and no such line opens or closes a block anyway.
+        sub(/\/\/.*$/, "", code)
+        sub(/#.*$/, "", code)
+        countable = (index(code, "\"") == 0)
+        if (code ~ /^[ \t]*[A-Za-z_][A-Za-z0-9_]*[ \t]*:[ \t]*$/) {
+            lbl = code; gsub(/[ \t:]/, "", lbl); pending = lbl
+        }
+        opens = 0; closes = 0
+        if (countable) {
+            o = code; opens  = gsub(/\{/, "", o)
+            c = code; closes = gsub(/\}/, "", c)
+        }
+        for (i = 0; i < opens; i++) { depth++; stack[depth] = pending; pending = "" }
+        inblock = (want == "")
+        if (!inblock) { for (i = 1; i <= depth; i++) if (stack[i] == want) inblock = 1 }
+        if (!done && inblock && code ~ ("^[ \t]*" key "[ \t]*=")) {
+            match(line, /^[ \t]*/)
+            printf "%s%s = %s;   # %s\n", substr(line, 1, RLENGTH), key, value, comment
+            done = 1
+        } else print line
+        for (i = 0; i < closes; i++) { if (depth > 0) { delete stack[depth]; depth-- } }
+    }
+    END { exit(done ? 0 : 1) }
+    ' "$file" > "$tmp"
+    rc=$?
+    [ "$rc" -eq 0 ] && cat "$tmp" > "$file"
+    rm -f "$tmp"
+    return "$rc"
 }
 
 # --------------------------------------------------------------------------
@@ -361,6 +436,132 @@ boot_write() {
     return 0
 }
 
+# boot_replace <path> — replace a file on the boot partition with stdin
+#
+# Unlike boot_write this overwrites something the operator still needs. Written
+# alongside, flushed, then renamed, so a power cut on FAT leaves the old file
+# or the new one, never half of one.
+boot_replace() {
+    local dest="$1" tmp="$1.new" was_ro=0
+    findmnt -no OPTIONS "$BOOT_DIR" 2>/dev/null | grep -q '^ro\b\|,ro\b' && was_ro=1
+    [ "$was_ro" -eq 1 ] && boot_rw
+    if ! cat > "$tmp"; then
+        rm -f "$tmp"
+        [ "$was_ro" -eq 1 ] && boot_ro
+        return 1
+    fi
+    sync -f "$tmp" 2>/dev/null || sync
+    mv -f "$tmp" "$dest"
+    sync -f "$dest" 2>/dev/null || sync
+    [ "$was_ro" -eq 1 ] && boot_ro
+    return 0
+}
+
+# --------------------------------------------------------------------------
+# Wifi from the card
+#
+# Imager's wifi goes into cloud-init's network-config, read once per instance
+# and rendered to a NetworkManager keyfile on ext4 -- which no Mac or Windows
+# machine can open. Change the wifi password and a receiver linked only by that
+# wifi is unreachable by every route at once. So Network.Wifi is applied every
+# boot from the FAT partition, which any laptop can edit. Empty SSID, the
+# shipped default, does nothing and leaves Imager's wifi alone.
+#
+# The password is in clear on the card. So is Imager's, so this is not a new
+# exposure, but say it out loud.
+# --------------------------------------------------------------------------
+WIFI_CONN=ogn-wifi
+
+wifi_device() {
+    nmcli -t -f DEVICE,TYPE device 2>/dev/null | awk -F: '$2 == "wifi" { print $1; exit }'
+}
+
+# On a cold boot the sync service can beat NetworkManager to it.
+wifi_wait_for_nm() {
+    local waited=0
+    while ! nmcli general status >/dev/null 2>&1; do
+        [ "$waited" -ge 30 ] && return 1
+        sleep 2
+        waited=$((waited + 2))
+    done
+    return 0
+}
+
+# wifi_apply — make Network.Wifi the live wifi. Needs conf_load first. Never
+# fails the caller: a wifi problem must not stop a receiver on ethernet.
+wifi_apply() {
+    local ssid psk country hidden dev cur_ssid cur_psk cur_hidden
+
+    ssid=$(conf_get Network.Wifi.SSID "")
+    [ -n "$ssid" ] || return 0
+
+    if ! command -v nmcli >/dev/null 2>&1; then
+        warn "Network.Wifi is set but nmcli is not installed; leaving the network alone"
+        return 0
+    fi
+    if ! wifi_wait_for_nm; then
+        warn "NetworkManager did not come up; not applying Network.Wifi"
+        return 0
+    fi
+
+    psk=$(conf_get Network.Wifi.Password "")
+    country=$(conf_get Network.Wifi.Country "")
+    hidden=no
+    conf_bool Network.Wifi.Hidden false && hidden=yes
+
+    # The radio stays soft-blocked until a regulatory domain is set. Imager
+    # does that, so only touch it if the card asks.
+    if [ -n "$country" ]; then
+        if command -v raspi-config >/dev/null 2>&1; then
+            raspi-config nonint do_wifi_country "$country" >/dev/null 2>&1 \
+                || warn "could not set the wifi country to '$country'"
+        fi
+    fi
+    rfkill unblock wifi 2>/dev/null || true
+
+    dev=$(wifi_device)
+    if [ -z "$dev" ]; then
+        warn "Network.Wifi is set but this Pi has no wifi interface"
+        return 0
+    fi
+
+    # Already correct? Touch nothing: with the overlay off the connection
+    # persists, and rewriting it every boot is a pointless write to the card.
+    cur_ssid=$(nmcli -t -g 802-11-wireless.ssid connection show "$WIFI_CONN" 2>/dev/null || true)
+    cur_psk=$(nmcli -t -s -g 802-11-wireless-security.psk connection show "$WIFI_CONN" 2>/dev/null || true)
+    cur_hidden=$(nmcli -t -g 802-11-wireless.hidden connection show "$WIFI_CONN" 2>/dev/null || true)
+    if [ "$cur_ssid" = "$ssid" ] && [ "$cur_psk" = "$psk" ] && [ "$cur_hidden" = "$hidden" ]; then
+        return 0
+    fi
+
+    log "applying Network.Wifi from the card: SSID '$ssid' on $dev"
+    nmcli connection delete "$WIFI_CONN" >/dev/null 2>&1 || true
+
+    # Outrank whatever Imager left behind rather than hunting it down: under
+    # the overlay that connection comes back at every boot anyway.
+    if ! nmcli connection add type wifi con-name "$WIFI_CONN" ifname "$dev" \
+            ssid "$ssid" \
+            connection.autoconnect yes \
+            connection.autoconnect-priority 10 \
+            802-11-wireless.hidden "$hidden" >/dev/null 2>&1; then
+        warn "could not create the $WIFI_CONN connection"
+        return 0
+    fi
+
+    if [ -n "$psk" ]; then
+        if ! nmcli connection modify "$WIFI_CONN" \
+                802-11-wireless-security.key-mgmt wpa-psk \
+                802-11-wireless-security.psk "$psk" >/dev/null 2>&1; then
+            warn "could not set the wifi password"
+            return 0
+        fi
+    fi
+
+    nmcli connection up "$WIFI_CONN" >/dev/null 2>&1 \
+        || warn "wifi has not associated yet; NetworkManager will keep trying"
+    return 0
+}
+
 # --------------------------------------------------------------------------
 # MOTD
 # --------------------------------------------------------------------------
@@ -477,6 +678,12 @@ CHANNEL=$(conf_get Install.UpdateChannel stable)
 WINDOW=$(conf_get Install.MaintenanceWindow "")
 
 # ---------------------------------------------------------------------------
+# 1a. Wifi — before apt, which is the first thing that needs a network.
+# Does nothing unless Network.Wifi.SSID is set; see ogn-common.sh.
+# ---------------------------------------------------------------------------
+wifi_apply
+
+# ---------------------------------------------------------------------------
 # 2. Packages
 #
 # Trixie substitutions worth knowing: libconfig9 -> libconfig11 (and the 0.3.2
@@ -523,10 +730,19 @@ INSTALL_DIR="$OGN_HOME/rtlsdr-ogn"
 REAL_DIR=$(readlink -f "$INSTALL_DIR")
 
 # ---------------------------------------------------------------------------
+# 4a. Frequency calibration, only if the card asked for it
+#
+# Before step 5, not after: ogn-calibrate writes its results onto the card, so
+# the copy below picks them up and nothing needs patching afterwards.
+# ---------------------------------------------------------------------------
+ogn-calibrate --from-config || true
+conf_load "$BOOT_CONF"
+
+# ---------------------------------------------------------------------------
 # 5. Place the configuration
 #
-# Copied, not regenerated: what was edited on the card is what runs. Only two
-# values are ever rewritten, and only when the operator left them for us.
+# Copied, not regenerated: what was edited on the card is what runs. One value
+# is ever rewritten, and only when the operator left it for us.
 # ---------------------------------------------------------------------------
 TARGET_CONF="$REAL_DIR/MyReceiver.conf"
 log "writing $TARGET_CONF"
@@ -534,15 +750,6 @@ install -o "$OGN_USER" -g "$OGN_GROUP" -m 0644 "$BOOT_CONF" "$TARGET_CONF"
 
 if [ "$CALL_SOURCE" = "hostname" ]; then
     sed -i "s|^\( *Call *= *\)\"\"|\1\"$CALL\"|" "$TARGET_CONF"
-fi
-
-if ! conf_has RF.FreqCorr && [ -x "$REAL_DIR/gsm_scan" ]; then
-    if PPM=$(ogn-calibrate --quiet 2>/dev/null) && [ -n "$PPM" ]; then
-        log "measured frequency correction: ${PPM} ppm"
-        sed -i "s|^\( *SampleRate *=\)|  FreqCorr = $PPM;   # measured by ogn-calibrate at install\n\1|" "$TARGET_CONF"
-    else
-        log "could not measure frequency correction; run 'sudo ogn-calibrate' once the aerial is connected"
-    fi
 fi
 
 # The geoid grid lets the decoder convert between ellipsoid and sea-level
@@ -748,6 +955,29 @@ else
     log "automatic updates disabled (MaintenanceWindow is empty)"
 fi
 
+# Re-read MyReceiver.conf from the card, and apply any wifi it asks for.
+#
+# Separate from ogn-boot-check.service, which waits for network-online.target
+# to ask GitHub about releases. Waiting for the network is the wrong move when
+# the network is what the card was edited to fix.
+write_unit ogn-config-sync.service <<'EOF'
+[Unit]
+Description=OGN receiver config sync (MyReceiver.conf and wifi from the card)
+Documentation=https://github.com/glidernet/ogn-bootstrap
+After=NetworkManager.service
+Wants=NetworkManager.service
+Before=network-online.target rtlsdr-ogn.service ogn-rf.service ogn-decode.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/ogn-maintenance --config-sync
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl enable ogn-config-sync.service >/dev/null
+
 # Resume any maintenance cycle that was interrupted, and report new versions.
 write_unit ogn-boot-check.service <<'EOF'
 [Unit]
@@ -829,6 +1059,13 @@ if [ "$READONLY_FS" -eq 1 ]; then
 fi
 
 date -Is | boot_write "$STATE_DIR/installed"
+
+# What the card said when we last acted on it: ogn-config-sync watches the
+# first, ogn-boot-check the second. Written last, so a failed install does not
+# record itself as applied.
+conf_digest         | boot_write "$CONFIG_APPLIED"
+conf_digest Install | boot_write "$INSTALL_APPLIED"
+
 log "setup complete"
 
 if [ "$REBOOT_WHEN_DONE" -eq 1 ]; then
@@ -996,8 +1233,9 @@ cat > /usr/local/sbin/ogn-maintenance <<'OGN_PAYLOAD_ogn_maintenance'
 #
 # ogn-maintenance — apply updates in a window where the filesystem is writable.
 #
-#   sudo ogn-maintenance --now        run the cycle immediately
-#   sudo ogn-maintenance --status     show where the cycle has got to
+#   sudo ogn-maintenance --now          run the cycle immediately
+#   sudo ogn-maintenance --status       show where the cycle has got to
+#   sudo ogn-maintenance --config-sync  re-read MyReceiver.conf from the card
 #
 # With the read-only overlay active, writes to the root filesystem go to RAM
 # and are thrown away at reboot, so updates have to happen with the overlay
@@ -1115,6 +1353,90 @@ EOF
     return 0
 }
 
+# --- configuration resync -------------------------------------------------
+#
+# The receiver runs from a copy of MyReceiver.conf taken at install time. On a
+# read-only receiver the card is the only copy anyone can still edit, so it is
+# the one that wins. Runs early, before the receiver starts and before anything
+# waits on the network -- which is the point for the wifi.
+config_sync() {
+    local user group home link real target call lat lon old_freq
+
+    [ -r "$BOOT_CONF" ] || { log "no $BOOT_CONF on the card; nothing to sync"; return 0; }
+    trap conf_cleanup EXIT
+    conf_load "$BOOT_CONF"
+
+    # Wifi first and unconditionally: under the overlay NetworkManager's
+    # keyfiles are in RAM, so "unchanged" does not mean "still applied".
+    # wifi_apply is itself a no-op when the live config already matches.
+    wifi_apply
+
+    # Before the digest, and before the receiver starts: nothing else has the
+    # SDR yet. Disarms itself, so this is a no-op on all but the asked-for boot.
+    ogn-calibrate --from-config || true
+    conf_load "$BOOT_CONF"
+
+    local want_all
+    want_all=$(conf_digest)
+
+    user=$(detect_ogn_user) || { warn "could not work out which account to sync for"; return 0; }
+    home=$(user_home "$user")
+    link="$home/rtlsdr-ogn"
+    # Not installed yet -- first boot has not finished, and ogn-install will
+    # place the file itself.
+    [ -d "$link" ] || return 0
+    real=$(readlink -f "$link")
+    target="$real/MyReceiver.conf"
+
+    if [ "$want_all" = "$(cat "$CONFIG_APPLIED" 2>/dev/null || true)" ] && [ -s "$target" ]; then
+        return 0
+    fi
+
+    # An edited card is unreviewed input arriving unattended. Same checks the
+    # installer applies, so a typo cannot take a working receiver off the air.
+    call=$(conf_get APRS.Call "")
+    [ -n "$call" ] || call=$(hostname -s)
+    if ! printf '%s' "$call" | grep -Eq '^[A-Za-z0-9]{1,9}$'; then
+        warn "the MyReceiver.conf on the card names the receiver '$call', which is not valid"
+        warn "keeping the settings that are already installed"
+        return 0
+    fi
+    lat=$(conf_get Position.Latitude 0)
+    lon=$(conf_get Position.Longitude 0)
+    if ! printf '%s' "$lat$lon" | grep -Eq '^[-+0-9.]+$' \
+       || awk "BEGIN{exit !($lat == 0 && $lon == 0)}" 2>/dev/null \
+       || awk "BEGIN{exit !($lat < -90 || $lat > 90 || $lon < -180 || $lon > 180)}" 2>/dev/null; then
+        warn "the MyReceiver.conf on the card has no usable position ($lat, $lon)"
+        warn "keeping the settings that are already installed"
+        return 0
+    fi
+
+    # FreqCorr lives on the card now. This carries one forward for receivers
+    # set up before that was true, where it only reached the installed copy.
+    old_freq=""
+    [ -s "$target" ] && old_freq=$(sed -n 's/^ *FreqCorr *= *\([+-]\{0,1\}[0-9]\{1,\}\).*/\1/p' "$target" | head -1)
+
+    log "MyReceiver.conf on the card has changed; updating $target"
+    group=$(id -gn "$user")
+    install -o "$user" -g "$group" -m 0644 "$BOOT_CONF" "$target"
+
+    if [ -z "$(conf_get APRS.Call "")" ]; then
+        sed -i "s|^\( *Call *= *\)\"\"|\1\"$call\"|" "$target"
+    fi
+    if ! conf_has RF.FreqCorr && [ -n "$old_freq" ]; then
+        sed -i "s|^\( *SampleRate *=\)|  FreqCorr = $old_freq;   # measured by ogn-calibrate\n\1|" "$target"
+    fi
+
+    printf '%s\n' "$want_all" | boot_write "$CONFIG_APPLIED"
+
+    # At boot it has not started yet, so it simply starts with the new file.
+    # Run by hand, this picks the change up straight away.
+    if systemctl is-active --quiet rtlsdr-ogn.service; then
+        log "restarting the receiver with the new settings"
+        systemctl restart rtlsdr-ogn.service
+    fi
+}
+
 # --- cycle ---------------------------------------------------------------
 begin_cycle() {
     local attempts
@@ -1163,6 +1485,39 @@ resume_cycle() {
     systemctl reboot
 }
 
+# The Install section -- packages, the overlay, the maintenance window -- is
+# not something a file copy can change, so a change there re-runs the
+# installer. Here rather than in config_sync because ogn-install needs a
+# network. Always --no-reboot: RebootWhenDone defaults true, and rebooting
+# before the marker is written is how you build a boot loop.
+install_check() {
+    local want have
+    [ -r "$BOOT_CONF" ] || return 0
+    trap conf_cleanup EXIT
+    conf_load "$BOOT_CONF"
+    want=$(conf_digest Install)
+    have=$(cat "$INSTALL_APPLIED" 2>/dev/null || true)
+
+    [ "$want" = "$have" ] && return 0
+
+    # No marker: a receiver installed before this existed. Adopt its current
+    # state rather than re-running the installer under someone unasked.
+    if [ -z "$have" ]; then
+        log "recording the current Install settings as applied"
+        printf '%s\n' "$want" | boot_write "$INSTALL_APPLIED"
+        return 0
+    fi
+
+    log "the Install settings on the card have changed; re-running the installer"
+    if ogn-install --no-reboot; then
+        printf '%s\n' "$want" | boot_write "$INSTALL_APPLIED"
+        log "installer finished; reboot if you changed ReadOnlyFS"
+    else
+        warn "ogn-install failed; the receiver is still running its previous setup"
+        warn "the card will be tried again at the next boot"
+    fi
+}
+
 boot_check() {
     case "$(state_read)" in
         updating)
@@ -1182,6 +1537,7 @@ boot_check() {
             ;;
         *)
             state_clear
+            install_check
             report_available
             ;;
     esac
@@ -1193,12 +1549,13 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --scheduled)      MODE=scheduled ;;
         --boot-check)     MODE=boot-check ;;
+        --config-sync)    MODE=config-sync ;;
         --now)            MODE=now ;;
         --status)         MODE=status ;;
         --overlay-status) MODE=overlay-status ;;
         --overlay-enable) MODE=overlay-enable ;;
         --overlay-disable) MODE=overlay-disable ;;
-        -h|--help)        sed -n '3,20p' "$0"; exit 0 ;;
+        -h|--help)        sed -n '3,21p' "$0"; exit 0 ;;
         *)                die "unknown option: $1" ;;
     esac
     shift
@@ -1221,8 +1578,9 @@ case "$MODE" in
     overlay-enable)  swap_disable; overlay_set enable ;;
     overlay-disable) overlay_set disable ;;
     boot-check)      boot_check ;;
+    config-sync)     config_sync ;;
     scheduled|now)   begin_cycle ;;
-    *)               die "say what to do: --now, --status, or --boot-check" ;;
+    *)               die "say what to do: --now, --status, --config-sync, or --boot-check" ;;
 esac
 OGN_PAYLOAD_ogn_maintenance
 chmod 0755 /usr/local/sbin/ogn-maintenance
@@ -1428,15 +1786,25 @@ cat > /usr/local/sbin/ogn-calibrate <<'OGN_PAYLOAD_ogn_calibrate'
 #
 # ogn-calibrate — measure the SDR's crystal error in ppm using gsm_scan.
 #
-#   sudo ogn-calibrate            measure and report
-#   sudo ogn-calibrate --quiet    print just the number, for scripting
-#   sudo ogn-calibrate --apply    measure and write FreqCorr into the config
+#   sudo ogn-calibrate                measure and report
+#   sudo ogn-calibrate --quiet        print just the number, for scripting
+#   sudo ogn-calibrate --apply        measure and write FreqCorr into the config
+#   sudo ogn-calibrate --from-config  do nothing unless the card asked for it
 #
-# gsm_scan listens to GSM base stations, whose carriers are held to a far
-# tighter tolerance than any TV dongle, and reports how far off yours is.
-# It needs the aerial connected and GSM coverage; on a rural site or a stick
-# with a TCXO the answer may simply be "no usable signal", which is fine —
-# leave FreqCorr unset and the decoder uses its default.
+# gsm_scan listens to GSM base stations, whose carriers are far tighter than
+# any TV dongle, and reports the crystal error and which channel it heard.
+# Both are recorded: ogn-rf re-reads RF.GSM.CenterFreq while it decodes and
+# tracks the drift from there, so the channel is the durable half.
+#
+# Needs the aerial and GSM coverage. Rural sites, filtered masthead amplifiers
+# and TCXO sticks may simply find nothing, which is fine.
+#
+# It takes the SDR, so the receiver is stopped and restarted around it.
+#
+# --from-config is the unattended route, off unless the card sets
+# RF.Calibrate = true. It writes the results back to MyReceiver.conf on the
+# card and clears Calibrate, so a request runs once. Writing to the card is the
+# point: the journal is in RAM and the Pi is headless.
 #
 # Copyright (c) 2026 ifly7charlie. MIT licence, see LICENSE.
 
@@ -1448,46 +1816,147 @@ LIBDIR="${OGN_LIBDIR:-/usr/local/lib/ogn-bootstrap}"
 
 QUIET=0
 APPLY=0
+FROM_CONFIG=0
 SCAN_TIMEOUT="${OGN_CALIBRATE_TIMEOUT:-180}"
 while [ $# -gt 0 ]; do
     case "$1" in
-        --quiet)   QUIET=1; shift ;;
-        --apply)   APPLY=1; shift ;;
-        -h|--help) sed -n '3,14p' "$0"; exit 0 ;;
-        *)         die "unknown option: $1" ;;
+        --quiet)       QUIET=1; shift ;;
+        --apply)       APPLY=1; shift ;;
+        --from-config) FROM_CONFIG=1; shift ;;
+        -h|--help)     sed -n '3,26p' "$0"; exit 0 ;;
+        *)             die "unknown option: $1" ;;
     esac
 done
 
 need_root
+
+# Checked on every boot; the answer is almost always no.
+if [ "$FROM_CONFIG" -eq 1 ]; then
+    [ -r "$BOOT_CONF" ] || exit 0
+    conf_load "$BOOT_CONF"
+    conf_bool RF.Calibrate false || exit 0
+    APPLY=1
+    QUIET=0
+fi
 OGN_USER=$(detect_ogn_user) || die "could not determine the user"
 INSTALL_DIR=$(readlink -f "$(user_home "$OGN_USER")/rtlsdr-ogn" 2>/dev/null) \
     || die "the OGN software is not installed yet"
 [ -x "$INSTALL_DIR/gsm_scan" ] || die "no gsm_scan in $INSTALL_DIR"
 
-TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
-cat > "$TMP/scan.conf" <<'EOF'
-RF:
-{ GSM:
-  { CenterFreq = 938.4;
-    Gain       =  25.0;
-  } ;
-} ;
-EOF
+TMP=$(mktemp -d)
+
+# gsm_scan and ogn-rf both open the SDR. Put the receiver back however this
+# ends: timeout, failed scan or Ctrl-C.
+RESTART_RECEIVER=0
+restore_receiver() {
+    [ "$RESTART_RECEIVER" -eq 1 ] || return 0
+    systemctl start rtlsdr-ogn.service >/dev/null 2>&1 || true
+}
+trap 'rm -rf "$TMP"; restore_receiver' EXIT
+
+# card_writeback <ppm> <freq> <gain> <note>
+#
+# Record the results on the card and clear Calibrate. Empty ppm means the scan
+# found nothing: disarm anyway, with the reason, or a site with no GSM repeats
+# a three-minute scan at every boot.
+card_writeback() {
+    local ppm="$1" freq="$2" gain="$3" note="$4" stamp tmp
+    stamp=$(date -I)
+    tmp="$TMP/MyReceiver.conf"
+    cp "$BOOT_CONF" "$tmp" 2>/dev/null || { warn "could not read $BOOT_CONF"; return 1; }
+
+    if [ -n "$ppm" ]; then
+        conf_set_value "$tmp" FreqCorr   "$ppm"  "measured $stamp"     || warn "no FreqCorr line to set"
+        conf_set_value "$tmp" CenterFreq "$freq" "measured $stamp" GSM || warn "no GSM CenterFreq line to set"
+        conf_set_value "$tmp" Gain       "$gain" "measured $stamp" GSM || warn "no GSM Gain line to set"
+    fi
+
+    # Refuse rather than loop: no Calibrate line means no way to disarm.
+    if ! conf_set_value "$tmp" Calibrate false "$stamp: $note"; then
+        warn "no Calibrate line in $BOOT_CONF to switch off; nothing written back"
+        return 1
+    fi
+
+    if boot_replace "$BOOT_CONF" < "$tmp"; then
+        log "wrote the result back to $BOOT_CONF"
+        return 0
+    fi
+    warn "could not write to $BOOT_CONF — is the card write-protected?"
+    warn "Calibrate is still true there, so this will run again at the next boot"
+    return 1
+}
+
+if systemctl is-active --quiet rtlsdr-ogn.service 2>/dev/null; then
+    RESTART_RECEIVER=1
+    [ "$QUIET" -eq 1 ] || log "stopping the receiver while the scan runs"
+    systemctl stop rtlsdr-ogn.service >/dev/null 2>&1 || true
+fi
+# GSM-900 downlink by default; 915 MHz sites are in GSM-850 territory.
+BAND_OPT=""
+if awk "BEGIN{exit !($(conf_get RF.OGN.CenterFreq 868.8) > 900)}" 2>/dev/null; then
+    BAND_OPT="--gsm-850"
+fi
+
+# --ppm 0 deliberately, not a previous measurement: a stale estimate pulls the
+# scan off, and 0 is what a low-drift stick actually is.
+SCAN_GAIN=$(conf_get RF.GSM.Gain 25.0)
 
 [ "$QUIET" -eq 1 ] || log "scanning for GSM carriers (up to ${SCAN_TIMEOUT}s) — this needs the aerial connected"
 
-OUT=$(cd "$INSTALL_DIR" && timeout "$SCAN_TIMEOUT" ./gsm_scan "$TMP/scan.conf" 2>&1) || true
+# shellcheck disable=SC2086
+OUT=$(cd "$INSTALL_DIR" && timeout "$SCAN_TIMEOUT" \
+      ./gsm_scan --ppm 0 --gain "$SCAN_GAIN" $BAND_OPT 2>&1) || true
 
-# gsm_scan reports a line containing "Receiver Xtal correction" followed by the
-# figure in ppm. Pull the first number that follows that phrase rather than a
-# fixed field position, so a change in spacing or wording order does not
-# silently yield a wrong correction.
+# Too little or too much gain is gsm_scan's usual first answer. One pass cannot
+# fix that, so name the knob that can.
+GAIN_HINT=""
+case "$OUT" in
+    *"retry with higher gain"*)
+        GAIN_HINT="; raise RF.GSM.Gain above $SCAN_GAIN and try again" ;;
+    *"lower gain to reduce distortions"*)
+        GAIN_HINT="; lower RF.GSM.Gain below $SCAN_GAIN and try again" ;;
+esac
+
+# Match on the phrase, not a field position, so spacing changes cannot yield a
+# wrong correction.
 PPM=$(printf '%s\n' "$OUT" \
       | sed -n 's/.*[Xx]tal correction[^0-9+-]*\([+-]\?[0-9]\+\(\.[0-9]\+\)\?\).*/\1/p' \
       | head -1)
 
-if [ -z "$PPM" ]; then
-    [ "$QUIET" -eq 1 ] || warn "no usable GSM signal found; leaving FreqCorr unset"
+# Channel lines read roughly  938.6MHz ... +42.3dB: -0.4 -0.2 +0.1 ...
+# Score strength minus twice the mean absolute offset, drop anything drifting
+# by 4 or more. ogn-rf keeps using this channel to track the crystal, so a loud
+# but unsteady one is worse than none. Weighting is from the v2.1 configure.
+BEST=$(printf '%s\n' "$OUT" | awk '
+    /MHz.*dB:/ {
+        if (match($0, /[0-9]+\.?[0-9]*MHz/)) {
+            freq = substr($0, RSTART, RLENGTH - 3)
+        } else next
+        if (match($0, /\+[0-9]+\.?[0-9]*dB/)) {
+            strength = substr($0, RSTART + 1, RLENGTH - 3) + 0
+        } else next
+        tail = substr($0, index($0, "dB:") + 3)
+        n = split(tail, off, /[ \t]+/)
+        sum = 0; count = 0
+        for (i = 1; i <= n; i++) {
+            if (off[i] ~ /^[+-]?[0-9]+\.?[0-9]*$/) {
+                v = off[i] + 0
+                sum += (v < 0 ? -v : v)
+                count++
+            }
+        }
+        if (count == 0) next
+        mean = sum / count
+        if (mean >= 4) next
+        score = strength - 2 * mean
+        if (score > best_score || best_freq == "") { best_score = score; best_freq = freq }
+    }
+    END { if (best_freq != "") print best_freq }
+')
+
+if [ -z "$PPM" ] || [ -z "$BEST" ]; then
+    [ "$QUIET" -eq 1 ] || warn "no usable GSM signal found${GAIN_HINT}"
+    [ "$FROM_CONFIG" -eq 1 ] && card_writeback "" "" "" "no usable GSM signal found${GAIN_HINT}"
     exit 1
 fi
 
@@ -1498,18 +1967,20 @@ if [ "$QUIET" -eq 1 ]; then
     exit 0
 fi
 
-log "measured frequency correction: ${PPM} ppm"
+log "measured frequency correction: ${PPM} ppm on the ${BEST} MHz GSM channel"
 
 if [ "$APPLY" -eq 1 ]; then
     CONF="$INSTALL_DIR/MyReceiver.conf"
     [ -f "$CONF" ] || die "no $CONF to update"
-    if grep -Eq '^\s*FreqCorr\s*=' "$CONF"; then
-        sed -i "s|^\( *FreqCorr *= *\).*|\1$PPM;   # measured by ogn-calibrate|" "$CONF"
-    else
-        sed -i "s|^\( *SampleRate *=\)|  FreqCorr = $PPM;   # measured by ogn-calibrate\n\1|" "$CONF"
-    fi
-    log "wrote FreqCorr = $PPM to $CONF"
-    systemctl is-active --quiet rtlsdr-ogn.service && systemctl restart rtlsdr-ogn.service
+    conf_set_value "$CONF" FreqCorr   "$PPM"      "measured by ogn-calibrate"
+    conf_set_value "$CONF" CenterFreq "$BEST"     "measured by ogn-calibrate" GSM
+    conf_set_value "$CONF" Gain       "$SCAN_GAIN" "measured by ogn-calibrate" GSM
+    log "wrote the scan results to $CONF"
+fi
+
+if [ "$FROM_CONFIG" -eq 1 ]; then
+    card_writeback "$PPM" "$BEST" "$SCAN_GAIN" \
+        "${PPM} ppm on ${BEST} MHz at gain ${SCAN_GAIN}" || true
 fi
 OGN_PAYLOAD_ogn_calibrate
 chmod 0755 /usr/local/sbin/ogn-calibrate

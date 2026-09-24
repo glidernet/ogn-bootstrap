@@ -2,15 +2,25 @@
 #
 # ogn-calibrate — measure the SDR's crystal error in ppm using gsm_scan.
 #
-#   sudo ogn-calibrate            measure and report
-#   sudo ogn-calibrate --quiet    print just the number, for scripting
-#   sudo ogn-calibrate --apply    measure and write FreqCorr into the config
+#   sudo ogn-calibrate                measure and report
+#   sudo ogn-calibrate --quiet        print just the number, for scripting
+#   sudo ogn-calibrate --apply        measure and write FreqCorr into the config
+#   sudo ogn-calibrate --from-config  do nothing unless the card asked for it
 #
-# gsm_scan listens to GSM base stations, whose carriers are held to a far
-# tighter tolerance than any TV dongle, and reports how far off yours is.
-# It needs the aerial connected and GSM coverage; on a rural site or a stick
-# with a TCXO the answer may simply be "no usable signal", which is fine —
-# leave FreqCorr unset and the decoder uses its default.
+# gsm_scan listens to GSM base stations, whose carriers are far tighter than
+# any TV dongle, and reports the crystal error and which channel it heard.
+# Both are recorded: ogn-rf re-reads RF.GSM.CenterFreq while it decodes and
+# tracks the drift from there, so the channel is the durable half.
+#
+# Needs the aerial and GSM coverage. Rural sites, filtered masthead amplifiers
+# and TCXO sticks may simply find nothing, which is fine.
+#
+# It takes the SDR, so the receiver is stopped and restarted around it.
+#
+# --from-config is the unattended route, off unless the card sets
+# RF.Calibrate = true. It writes the results back to MyReceiver.conf on the
+# card and clears Calibrate, so a request runs once. Writing to the card is the
+# point: the journal is in RAM and the Pi is headless.
 #
 # Copyright (c) 2026 ifly7charlie. MIT licence, see LICENSE.
 
@@ -22,46 +32,147 @@ LIBDIR="${OGN_LIBDIR:-/usr/local/lib/ogn-bootstrap}"
 
 QUIET=0
 APPLY=0
+FROM_CONFIG=0
 SCAN_TIMEOUT="${OGN_CALIBRATE_TIMEOUT:-180}"
 while [ $# -gt 0 ]; do
     case "$1" in
-        --quiet)   QUIET=1; shift ;;
-        --apply)   APPLY=1; shift ;;
-        -h|--help) sed -n '3,14p' "$0"; exit 0 ;;
-        *)         die "unknown option: $1" ;;
+        --quiet)       QUIET=1; shift ;;
+        --apply)       APPLY=1; shift ;;
+        --from-config) FROM_CONFIG=1; shift ;;
+        -h|--help)     sed -n '3,26p' "$0"; exit 0 ;;
+        *)             die "unknown option: $1" ;;
     esac
 done
 
 need_root
+
+# Checked on every boot; the answer is almost always no.
+if [ "$FROM_CONFIG" -eq 1 ]; then
+    [ -r "$BOOT_CONF" ] || exit 0
+    conf_load "$BOOT_CONF"
+    conf_bool RF.Calibrate false || exit 0
+    APPLY=1
+    QUIET=0
+fi
 OGN_USER=$(detect_ogn_user) || die "could not determine the user"
 INSTALL_DIR=$(readlink -f "$(user_home "$OGN_USER")/rtlsdr-ogn" 2>/dev/null) \
     || die "the OGN software is not installed yet"
 [ -x "$INSTALL_DIR/gsm_scan" ] || die "no gsm_scan in $INSTALL_DIR"
 
-TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
-cat > "$TMP/scan.conf" <<'EOF'
-RF:
-{ GSM:
-  { CenterFreq = 938.4;
-    Gain       =  25.0;
-  } ;
-} ;
-EOF
+TMP=$(mktemp -d)
+
+# gsm_scan and ogn-rf both open the SDR. Put the receiver back however this
+# ends: timeout, failed scan or Ctrl-C.
+RESTART_RECEIVER=0
+restore_receiver() {
+    [ "$RESTART_RECEIVER" -eq 1 ] || return 0
+    systemctl start rtlsdr-ogn.service >/dev/null 2>&1 || true
+}
+trap 'rm -rf "$TMP"; restore_receiver' EXIT
+
+# card_writeback <ppm> <freq> <gain> <note>
+#
+# Record the results on the card and clear Calibrate. Empty ppm means the scan
+# found nothing: disarm anyway, with the reason, or a site with no GSM repeats
+# a three-minute scan at every boot.
+card_writeback() {
+    local ppm="$1" freq="$2" gain="$3" note="$4" stamp tmp
+    stamp=$(date -I)
+    tmp="$TMP/MyReceiver.conf"
+    cp "$BOOT_CONF" "$tmp" 2>/dev/null || { warn "could not read $BOOT_CONF"; return 1; }
+
+    if [ -n "$ppm" ]; then
+        conf_set_value "$tmp" FreqCorr   "$ppm"  "measured $stamp"     || warn "no FreqCorr line to set"
+        conf_set_value "$tmp" CenterFreq "$freq" "measured $stamp" GSM || warn "no GSM CenterFreq line to set"
+        conf_set_value "$tmp" Gain       "$gain" "measured $stamp" GSM || warn "no GSM Gain line to set"
+    fi
+
+    # Refuse rather than loop: no Calibrate line means no way to disarm.
+    if ! conf_set_value "$tmp" Calibrate false "$stamp: $note"; then
+        warn "no Calibrate line in $BOOT_CONF to switch off; nothing written back"
+        return 1
+    fi
+
+    if boot_replace "$BOOT_CONF" < "$tmp"; then
+        log "wrote the result back to $BOOT_CONF"
+        return 0
+    fi
+    warn "could not write to $BOOT_CONF — is the card write-protected?"
+    warn "Calibrate is still true there, so this will run again at the next boot"
+    return 1
+}
+
+if systemctl is-active --quiet rtlsdr-ogn.service 2>/dev/null; then
+    RESTART_RECEIVER=1
+    [ "$QUIET" -eq 1 ] || log "stopping the receiver while the scan runs"
+    systemctl stop rtlsdr-ogn.service >/dev/null 2>&1 || true
+fi
+# GSM-900 downlink by default; 915 MHz sites are in GSM-850 territory.
+BAND_OPT=""
+if awk "BEGIN{exit !($(conf_get RF.OGN.CenterFreq 868.8) > 900)}" 2>/dev/null; then
+    BAND_OPT="--gsm-850"
+fi
+
+# --ppm 0 deliberately, not a previous measurement: a stale estimate pulls the
+# scan off, and 0 is what a low-drift stick actually is.
+SCAN_GAIN=$(conf_get RF.GSM.Gain 25.0)
 
 [ "$QUIET" -eq 1 ] || log "scanning for GSM carriers (up to ${SCAN_TIMEOUT}s) — this needs the aerial connected"
 
-OUT=$(cd "$INSTALL_DIR" && timeout "$SCAN_TIMEOUT" ./gsm_scan "$TMP/scan.conf" 2>&1) || true
+# shellcheck disable=SC2086
+OUT=$(cd "$INSTALL_DIR" && timeout "$SCAN_TIMEOUT" \
+      ./gsm_scan --ppm 0 --gain "$SCAN_GAIN" $BAND_OPT 2>&1) || true
 
-# gsm_scan reports a line containing "Receiver Xtal correction" followed by the
-# figure in ppm. Pull the first number that follows that phrase rather than a
-# fixed field position, so a change in spacing or wording order does not
-# silently yield a wrong correction.
+# Too little or too much gain is gsm_scan's usual first answer. One pass cannot
+# fix that, so name the knob that can.
+GAIN_HINT=""
+case "$OUT" in
+    *"retry with higher gain"*)
+        GAIN_HINT="; raise RF.GSM.Gain above $SCAN_GAIN and try again" ;;
+    *"lower gain to reduce distortions"*)
+        GAIN_HINT="; lower RF.GSM.Gain below $SCAN_GAIN and try again" ;;
+esac
+
+# Match on the phrase, not a field position, so spacing changes cannot yield a
+# wrong correction.
 PPM=$(printf '%s\n' "$OUT" \
       | sed -n 's/.*[Xx]tal correction[^0-9+-]*\([+-]\?[0-9]\+\(\.[0-9]\+\)\?\).*/\1/p' \
       | head -1)
 
-if [ -z "$PPM" ]; then
-    [ "$QUIET" -eq 1 ] || warn "no usable GSM signal found; leaving FreqCorr unset"
+# Channel lines read roughly  938.6MHz ... +42.3dB: -0.4 -0.2 +0.1 ...
+# Score strength minus twice the mean absolute offset, drop anything drifting
+# by 4 or more. ogn-rf keeps using this channel to track the crystal, so a loud
+# but unsteady one is worse than none. Weighting is from the v2.1 configure.
+BEST=$(printf '%s\n' "$OUT" | awk '
+    /MHz.*dB:/ {
+        if (match($0, /[0-9]+\.?[0-9]*MHz/)) {
+            freq = substr($0, RSTART, RLENGTH - 3)
+        } else next
+        if (match($0, /\+[0-9]+\.?[0-9]*dB/)) {
+            strength = substr($0, RSTART + 1, RLENGTH - 3) + 0
+        } else next
+        tail = substr($0, index($0, "dB:") + 3)
+        n = split(tail, off, /[ \t]+/)
+        sum = 0; count = 0
+        for (i = 1; i <= n; i++) {
+            if (off[i] ~ /^[+-]?[0-9]+\.?[0-9]*$/) {
+                v = off[i] + 0
+                sum += (v < 0 ? -v : v)
+                count++
+            }
+        }
+        if (count == 0) next
+        mean = sum / count
+        if (mean >= 4) next
+        score = strength - 2 * mean
+        if (score > best_score || best_freq == "") { best_score = score; best_freq = freq }
+    }
+    END { if (best_freq != "") print best_freq }
+')
+
+if [ -z "$PPM" ] || [ -z "$BEST" ]; then
+    [ "$QUIET" -eq 1 ] || warn "no usable GSM signal found${GAIN_HINT}"
+    [ "$FROM_CONFIG" -eq 1 ] && card_writeback "" "" "" "no usable GSM signal found${GAIN_HINT}"
     exit 1
 fi
 
@@ -72,16 +183,18 @@ if [ "$QUIET" -eq 1 ]; then
     exit 0
 fi
 
-log "measured frequency correction: ${PPM} ppm"
+log "measured frequency correction: ${PPM} ppm on the ${BEST} MHz GSM channel"
 
 if [ "$APPLY" -eq 1 ]; then
     CONF="$INSTALL_DIR/MyReceiver.conf"
     [ -f "$CONF" ] || die "no $CONF to update"
-    if grep -Eq '^\s*FreqCorr\s*=' "$CONF"; then
-        sed -i "s|^\( *FreqCorr *= *\).*|\1$PPM;   # measured by ogn-calibrate|" "$CONF"
-    else
-        sed -i "s|^\( *SampleRate *=\)|  FreqCorr = $PPM;   # measured by ogn-calibrate\n\1|" "$CONF"
-    fi
-    log "wrote FreqCorr = $PPM to $CONF"
-    systemctl is-active --quiet rtlsdr-ogn.service && systemctl restart rtlsdr-ogn.service
+    conf_set_value "$CONF" FreqCorr   "$PPM"      "measured by ogn-calibrate"
+    conf_set_value "$CONF" CenterFreq "$BEST"     "measured by ogn-calibrate" GSM
+    conf_set_value "$CONF" Gain       "$SCAN_GAIN" "measured by ogn-calibrate" GSM
+    log "wrote the scan results to $CONF"
+fi
+
+if [ "$FROM_CONFIG" -eq 1 ]; then
+    card_writeback "$PPM" "$BEST" "$SCAN_GAIN" \
+        "${PPM} ppm on ${BEST} MHz at gain ${SCAN_GAIN}" || true
 fi

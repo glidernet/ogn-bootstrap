@@ -2,8 +2,9 @@
 #
 # ogn-maintenance — apply updates in a window where the filesystem is writable.
 #
-#   sudo ogn-maintenance --now        run the cycle immediately
-#   sudo ogn-maintenance --status     show where the cycle has got to
+#   sudo ogn-maintenance --now          run the cycle immediately
+#   sudo ogn-maintenance --status       show where the cycle has got to
+#   sudo ogn-maintenance --config-sync  re-read MyReceiver.conf from the card
 #
 # With the read-only overlay active, writes to the root filesystem go to RAM
 # and are thrown away at reboot, so updates have to happen with the overlay
@@ -121,6 +122,90 @@ EOF
     return 0
 }
 
+# --- configuration resync -------------------------------------------------
+#
+# The receiver runs from a copy of MyReceiver.conf taken at install time. On a
+# read-only receiver the card is the only copy anyone can still edit, so it is
+# the one that wins. Runs early, before the receiver starts and before anything
+# waits on the network -- which is the point for the wifi.
+config_sync() {
+    local user group home link real target call lat lon old_freq
+
+    [ -r "$BOOT_CONF" ] || { log "no $BOOT_CONF on the card; nothing to sync"; return 0; }
+    trap conf_cleanup EXIT
+    conf_load "$BOOT_CONF"
+
+    # Wifi first and unconditionally: under the overlay NetworkManager's
+    # keyfiles are in RAM, so "unchanged" does not mean "still applied".
+    # wifi_apply is itself a no-op when the live config already matches.
+    wifi_apply
+
+    # Before the digest, and before the receiver starts: nothing else has the
+    # SDR yet. Disarms itself, so this is a no-op on all but the asked-for boot.
+    ogn-calibrate --from-config || true
+    conf_load "$BOOT_CONF"
+
+    local want_all
+    want_all=$(conf_digest)
+
+    user=$(detect_ogn_user) || { warn "could not work out which account to sync for"; return 0; }
+    home=$(user_home "$user")
+    link="$home/rtlsdr-ogn"
+    # Not installed yet -- first boot has not finished, and ogn-install will
+    # place the file itself.
+    [ -d "$link" ] || return 0
+    real=$(readlink -f "$link")
+    target="$real/MyReceiver.conf"
+
+    if [ "$want_all" = "$(cat "$CONFIG_APPLIED" 2>/dev/null || true)" ] && [ -s "$target" ]; then
+        return 0
+    fi
+
+    # An edited card is unreviewed input arriving unattended. Same checks the
+    # installer applies, so a typo cannot take a working receiver off the air.
+    call=$(conf_get APRS.Call "")
+    [ -n "$call" ] || call=$(hostname -s)
+    if ! printf '%s' "$call" | grep -Eq '^[A-Za-z0-9]{1,9}$'; then
+        warn "the MyReceiver.conf on the card names the receiver '$call', which is not valid"
+        warn "keeping the settings that are already installed"
+        return 0
+    fi
+    lat=$(conf_get Position.Latitude 0)
+    lon=$(conf_get Position.Longitude 0)
+    if ! printf '%s' "$lat$lon" | grep -Eq '^[-+0-9.]+$' \
+       || awk "BEGIN{exit !($lat == 0 && $lon == 0)}" 2>/dev/null \
+       || awk "BEGIN{exit !($lat < -90 || $lat > 90 || $lon < -180 || $lon > 180)}" 2>/dev/null; then
+        warn "the MyReceiver.conf on the card has no usable position ($lat, $lon)"
+        warn "keeping the settings that are already installed"
+        return 0
+    fi
+
+    # FreqCorr lives on the card now. This carries one forward for receivers
+    # set up before that was true, where it only reached the installed copy.
+    old_freq=""
+    [ -s "$target" ] && old_freq=$(sed -n 's/^ *FreqCorr *= *\([+-]\{0,1\}[0-9]\{1,\}\).*/\1/p' "$target" | head -1)
+
+    log "MyReceiver.conf on the card has changed; updating $target"
+    group=$(id -gn "$user")
+    install -o "$user" -g "$group" -m 0644 "$BOOT_CONF" "$target"
+
+    if [ -z "$(conf_get APRS.Call "")" ]; then
+        sed -i "s|^\( *Call *= *\)\"\"|\1\"$call\"|" "$target"
+    fi
+    if ! conf_has RF.FreqCorr && [ -n "$old_freq" ]; then
+        sed -i "s|^\( *SampleRate *=\)|  FreqCorr = $old_freq;   # measured by ogn-calibrate\n\1|" "$target"
+    fi
+
+    printf '%s\n' "$want_all" | boot_write "$CONFIG_APPLIED"
+
+    # At boot it has not started yet, so it simply starts with the new file.
+    # Run by hand, this picks the change up straight away.
+    if systemctl is-active --quiet rtlsdr-ogn.service; then
+        log "restarting the receiver with the new settings"
+        systemctl restart rtlsdr-ogn.service
+    fi
+}
+
 # --- cycle ---------------------------------------------------------------
 begin_cycle() {
     local attempts
@@ -169,6 +254,39 @@ resume_cycle() {
     systemctl reboot
 }
 
+# The Install section -- packages, the overlay, the maintenance window -- is
+# not something a file copy can change, so a change there re-runs the
+# installer. Here rather than in config_sync because ogn-install needs a
+# network. Always --no-reboot: RebootWhenDone defaults true, and rebooting
+# before the marker is written is how you build a boot loop.
+install_check() {
+    local want have
+    [ -r "$BOOT_CONF" ] || return 0
+    trap conf_cleanup EXIT
+    conf_load "$BOOT_CONF"
+    want=$(conf_digest Install)
+    have=$(cat "$INSTALL_APPLIED" 2>/dev/null || true)
+
+    [ "$want" = "$have" ] && return 0
+
+    # No marker: a receiver installed before this existed. Adopt its current
+    # state rather than re-running the installer under someone unasked.
+    if [ -z "$have" ]; then
+        log "recording the current Install settings as applied"
+        printf '%s\n' "$want" | boot_write "$INSTALL_APPLIED"
+        return 0
+    fi
+
+    log "the Install settings on the card have changed; re-running the installer"
+    if ogn-install --no-reboot; then
+        printf '%s\n' "$want" | boot_write "$INSTALL_APPLIED"
+        log "installer finished; reboot if you changed ReadOnlyFS"
+    else
+        warn "ogn-install failed; the receiver is still running its previous setup"
+        warn "the card will be tried again at the next boot"
+    fi
+}
+
 boot_check() {
     case "$(state_read)" in
         updating)
@@ -188,6 +306,7 @@ boot_check() {
             ;;
         *)
             state_clear
+            install_check
             report_available
             ;;
     esac
@@ -199,12 +318,13 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --scheduled)      MODE=scheduled ;;
         --boot-check)     MODE=boot-check ;;
+        --config-sync)    MODE=config-sync ;;
         --now)            MODE=now ;;
         --status)         MODE=status ;;
         --overlay-status) MODE=overlay-status ;;
         --overlay-enable) MODE=overlay-enable ;;
         --overlay-disable) MODE=overlay-disable ;;
-        -h|--help)        sed -n '3,20p' "$0"; exit 0 ;;
+        -h|--help)        sed -n '3,21p' "$0"; exit 0 ;;
         *)                die "unknown option: $1" ;;
     esac
     shift
@@ -227,6 +347,7 @@ case "$MODE" in
     overlay-enable)  swap_disable; overlay_set enable ;;
     overlay-disable) overlay_set disable ;;
     boot-check)      boot_check ;;
+    config-sync)     config_sync ;;
     scheduled|now)   begin_cycle ;;
-    *)               die "say what to do: --now, --status, or --boot-check" ;;
+    *)               die "say what to do: --now, --status, --config-sync, or --boot-check" ;;
 esac

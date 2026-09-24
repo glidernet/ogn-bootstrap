@@ -79,10 +79,10 @@ A volume called `bootfs` appears, with `MyReceiver.conf` already on it.
 Open it in any text editor. There are four lines marked `TODO`:
 
 ```c
-Call       = "";          // blank = use the hostname you set in Imager
-Latitude   =    +0.0000;  // where the AERIAL is, decimal degrees
+Call       = "";          # blank = use the hostname you set in Imager
+Latitude   =    +0.0000;  # where the AERIAL is, decimal degrees
 Longitude  =    +0.0000;
-Altitude   =          0;  // metres above sea level, to the aerial
+Altitude   =          0;  # metres above sea level, to the aerial
 ```
 
 The file explains each one in full, including the traps: decimal degrees
@@ -97,7 +97,9 @@ reason.
 Eject, put the card in the Pi, power on. The packages are already in the image,
 so first boot is mostly waiting for the network: it fetches the decoder (about
 350 kB) and the geoid table, then reboots itself once to bring up the read-only
-filesystem. A minute or two, not five.
+filesystem. A minute or two, not five — unless you asked for
+[calibration](#calibrating-the-sdr), which adds up to three minutes of
+listening before the receiver starts.
 
 Check it worked:
 
@@ -119,6 +121,7 @@ Within a few minutes the receiver should appear on
 | Read-only root | the single most effective way to stop SD cards dying in the field |
 | Hardware watchdog | reboots the Pi if it wedges |
 | Weekly maintenance | security updates and OGN upgrades, in a window you choose |
+| Config resync | `MyReceiver.conf` is re-read from the card at every boot, so an edit takes effect without a login |
 | Geoid data | `WW15MGH.DAC`, so altitudes are right without hand-tuning |
 
 Nothing is exposed to the internet, and no remote access is enabled, unless
@@ -151,8 +154,11 @@ The practical upshot: between maintenance windows, a receiver running with
 whenever you like.
 
 The cost is the usual one — changes you make by hand disappear at the next
-reboot. Edit `MyReceiver.conf` on the card, or use `sudo ogn-maintenance --now`
-to get a writable window.
+reboot. That is why `MyReceiver.conf` is re-read from the card on every boot
+rather than only at install time: the card is the one copy that survives, so it
+is the one that wins. See [Changing settings later](#changing-settings-later).
+For anything outside that file, `sudo ogn-maintenance --now` gives you a
+writable window.
 
 ## How the image is built
 
@@ -227,6 +233,110 @@ All three are **off by default**, in the `Install.RemoteAdmin` section:
 | `OGNTeam` | A reverse SSH tunnel letting the OGN core team log in to help diagnose problems. They must accept this machine's key first — ask on the OGN forum. **This grants a third party access to a machine on your club's network.** Worth it for a receiver nobody local can maintain; your decision either way. |
 | `ExtraSSHKeys` | Additional authorised keys. Setting any also turns off SSH password login. |
 
+## Changing settings later
+
+`MyReceiver.conf` is read from the boot partition at **every** boot, not just
+the first. So the way to change a receiver's settings is the same as the way
+you set them: put the card in any laptop and edit the file on `bootfs`.
+
+`ogn-config-sync.service` reads it early in the boot — before anything waits
+for the network, and before the decoder starts — so the change is simply live,
+with no restart and nothing written back to the card. An unchanged file does no
+work at all. On a Pi you can still log in to, `sudo ogn-maintenance
+--config-sync` applies an edit without rebooting.
+
+The **`Install`** section is different, because it describes how the machine
+was built — which packages are on it, whether the overlay is armed, when the
+maintenance window is. None of that can be changed by copying a file into
+place, so a change there re-runs the installer instead. That happens from
+`ogn-boot-check.service`, which waits for the network, and always with
+`--no-reboot`: `RebootWhenDone` defaults to true, and an installer that reboots
+before it has recorded what it applied is how you build a boot loop. If you
+change `ReadOnlyFS`, reboot yourself.
+
+The markers recording what was last applied live on the **boot partition**,
+next to the maintenance marker, and that placement is load-bearing: with the
+overlay on, anything written to the root filesystem is discarded at the next
+reboot, so a marker kept there would revert and the same edit would be
+re-applied on every boot for ever.
+
+A file that fails the same checks the installer applies — an invalid receiver
+name, a position still at 0,0 — is refused, with the reason in the journal, and
+the settings already installed keep running. A typo on the card cannot take a
+working receiver off the air.
+
+### Changing the wifi on a receiver you cannot reach
+
+This is the case that has no other answer. The wifi you give to Imager ends up
+in cloud-init's `network-config`, which is read **once**, then rendered into a
+NetworkManager keyfile on the Linux partition. If the club later changes the
+wifi password, a receiver whose only link is that wifi becomes unreachable by
+every route at once — and the keyfile is on ext4, which Windows and macOS
+cannot open.
+
+So `Network.Wifi` in `MyReceiver.conf` is applied from the FAT partition, which
+any laptop can edit, on every boot:
+
+```c
+Network:
+{
+  Wifi:
+  {
+    SSID     = "Clubhouse";
+    Password = "the new one";
+    Country  = "";          # only if the receiver has changed country
+    Hidden   = false;
+  } ;
+} ;
+```
+
+Leave `SSID` empty — as the shipped template does — and none of this runs, and
+whatever Imager configured is left exactly as it is. Set it and it wins, by
+autoconnect priority, over the connection Imager wrote; you do not have to find
+and delete that one first.
+
+The password sits in clear on a partition anyone holding the card can read.
+Imager writes it in clear on the same partition, so this is not a new exposure,
+but do not hand the card to someone you would not give the wifi password to.
+
+### Calibrating the SDR
+
+Most receivers never need this. The sticks recommended above have a TCXO and
+are accurate out of the box; plain black or blue R820T sticks are often 40 to
+80 ppm out and drift as they warm up, and those are worth measuring.
+
+It is off unless you ask for it, in `RF`:
+
+```c
+Calibrate  = false;      # set true, reboot, read the answer back here
+```
+
+Set it to `true`, put the card back, and power up. The receiver measures the
+stick against the local GSM carriers, writes the result into the `FreqCorr`
+line **in that same file on the card**, and sets `Calibrate` back to `false`
+so it runs once rather than at every boot.
+
+Writing the answer to the card is the point. A receiver has no screen, and its
+journal is kept in RAM and thrown away at every reboot, so anything that is
+only logged is effectively not reported at all. The card is the one place a
+result survives for you to find.
+
+What it costs while it runs: the aerial has to be connected, there has to be
+GSM coverage at the site, and the receiver is stopped for up to three minutes
+because `gsm_scan` needs the SDR that `ogn-rf` is holding. It is put back
+afterwards however the scan ends.
+
+A masthead amplifier or a filtered antenna will normally block the band it
+listens to, so on that kind of installation it finds nothing. That is not a
+fault. It still switches itself off, and says why on the `Calibrate` line:
+
+```c
+Calibrate  = false;   # 2026-09-23: no usable GSM signal found; FreqCorr left unset
+```
+
+`sudo ogn-calibrate` measures and reports without touching anything;
+`sudo ogn-calibrate --apply` writes the result to the running receiver.
+
 ## Updating
 
 With a read-only root, updates have to happen with the overlay out of the way,
@@ -243,9 +353,10 @@ interruption at any point resumes or backs out cleanly rather than leaving the
 receiver unprotected.
 
 ```sh
-sudo ogn-maintenance --status    # where things stand
-sudo ogn-maintenance --now       # run the cycle immediately
-sudo ogn-update --check          # installed vs available
+sudo ogn-maintenance --status       # where things stand
+sudo ogn-maintenance --now          # run the cycle immediately
+sudo ogn-maintenance --config-sync  # re-read MyReceiver.conf from the card
+sudo ogn-update --check             # installed vs available
 ```
 
 Set `MaintenanceWindow = ""` to never update automatically.

@@ -50,7 +50,9 @@ is "HTTP port"                     "$(conf_get HTTP.Port)"                     "
 is "UpdateChannel"                 "$(conf_get Install.UpdateChannel)"         "stable"
 is "MaintenanceWindow keeps spaces" "$(conf_get Install.MaintenanceWindow)"    "Sun *-*-* 03:00:00"
 is "deeply nested RemoteAdmin"     "$(conf_get Install.RemoteAdmin.Connect)"   "false"
-is "commented-out FreqCorr is absent" "$(conf_get RF.FreqCorr '<none>')"       "<none>"
+is "FreqCorr ships as zero"        "$(conf_get RF.FreqCorr)"                   "+0"
+is "GSM channel ships as a default" "$(conf_get RF.GSM.CenterFreq)"            "938.6"
+is "GSM gain is not the OGN gain"  "$(conf_get RF.GSM.Gain)"                   "25.0"
 is "GeoidSepar deliberately absent"   "$(conf_get Position.GeoidSepar '<none>')" "<none>"
 conf_bool Install.ReadOnlyFS            && ok "ReadOnlyFS reads as true"  || bad "ReadOnlyFS reads as true"
 conf_bool Install.RemoteAdmin.OGNTeam   && bad "OGNTeam reads as false"   || ok "OGNTeam reads as false"
@@ -105,6 +107,206 @@ grep -q 'rsyslog' src/ogn-install && ok "rsyslog is disabled if present" || bad 
 grep -q 'boot_write "$STATE_FILE"' src/ogn-maintenance && ok "marker writes go through boot_write" || bad "marker writes go through boot_write"
 grep -q '\[ -e "$STATE_FILE" \] || return 0' src/ogn-maintenance \
     && ok "idle boots do not write to the card" || bad "idle boots do not write to the card"
+
+echo "== wifi from the card =="
+conf_load boot/MyReceiver.conf
+is "shipped template leaves SSID empty" "$(conf_get Network.Wifi.SSID '<empty>')" "<empty>"
+is "shipped template leaves the country empty" "$(conf_get Network.Wifi.Country '<empty>')" "<empty>"
+conf_bool Network.Wifi.Hidden && bad "Hidden defaults to false" || ok "Hidden defaults to false"
+
+# A stub nmcli, so the logic can be exercised without a radio. It records the
+# command line and reports that nothing is configured yet.
+STUB=$(mktemp -d)
+export NMCLI_LOG="$STUB/calls"
+: > "$NMCLI_LOG"
+cat > "$STUB/nmcli" <<'STUBEOF'
+#!/bin/bash
+printf '%s\n' "$*" >> "$NMCLI_LOG"
+case "$*" in
+    "general status")            exit 0 ;;
+    *"-f DEVICE,TYPE device"*)   printf 'eth0:ethernet\nwlan0:wifi\n'; exit 0 ;;
+    *"connection show"*)         exit 1 ;;   # nothing configured yet
+    *)                           exit 0 ;;
+esac
+STUBEOF
+chmod +x "$STUB/nmcli"
+OLD_PATH="$PATH"; PATH="$STUB:$PATH"
+
+# The shipped template must not touch the network at all: the wifi Imager
+# configured is the normal case, and this option exists only to override it.
+wifi_apply >/dev/null 2>&1
+is "an empty SSID calls nmcli not at all" "$(wc -l < "$NMCLI_LOG" | tr -d ' ')" "0"
+
+conf_load tests/fixtures/wifi.conf
+is "SSID with a space survives"   "$(conf_get Network.Wifi.SSID)"     "Clubhouse 5G"
+is "password with a space survives" "$(conf_get Network.Wifi.Password)" "correct horse"
+conf_bool Network.Wifi.Hidden && ok "Hidden reads as true" || bad "Hidden reads as true"
+
+wifi_apply >/dev/null 2>&1
+CALLS=$(cat "$NMCLI_LOG")
+case "$CALLS" in
+    *"connection add type wifi con-name ogn-wifi ifname wlan0 ssid Clubhouse 5G"*)
+        ok "creates ogn-wifi on the wifi interface" ;;
+    *)  bad "creates ogn-wifi on the wifi interface" "$CALLS" ;;
+esac
+case "$CALLS" in
+    *"802-11-wireless-security.psk correct horse"*) ok "sets the password" ;;
+    *) bad "sets the password" "$CALLS" ;;
+esac
+case "$CALLS" in
+    *"802-11-wireless.hidden yes"*) ok "passes Hidden through" ;;
+    *) bad "passes Hidden through" "$CALLS" ;;
+esac
+case "$CALLS" in
+    *"connection up ogn-wifi"*) ok "brings the connection up" ;;
+    *) bad "brings the connection up" "$CALLS" ;;
+esac
+case "$CALLS" in
+    *"autoconnect-priority 10"*) ok "outranks whatever Imager configured" ;;
+    *) bad "outranks whatever Imager configured" "$CALLS" ;;
+esac
+
+# Already correct: nothing to do, and in particular no write to a persisted
+# NetworkManager keyfile on every boot.
+cat > "$STUB/nmcli" <<'STUBEOF'
+#!/bin/bash
+printf '%s\n' "$*" >> "$NMCLI_LOG"
+case "$*" in
+    "general status")                exit 0 ;;
+    *"-f DEVICE,TYPE device"*)       printf 'wlan0:wifi\n'; exit 0 ;;
+    *"802-11-wireless.ssid connection show"*)           printf 'Clubhouse 5G\n'; exit 0 ;;
+    *"802-11-wireless-security.psk connection show"*)   printf 'correct horse\n'; exit 0 ;;
+    *"802-11-wireless.hidden connection show"*)         printf 'yes\n'; exit 0 ;;
+    *"connection add"*|*"connection delete"*|*"connection up"*) printf 'CHANGED\n' >> "$NMCLI_LOG"; exit 0 ;;
+    *)                               exit 0 ;;
+esac
+STUBEOF
+: > "$NMCLI_LOG"
+wifi_apply >/dev/null 2>&1
+grep -q CHANGED "$NMCLI_LOG" && bad "an already-correct wifi is left alone" || ok "an already-correct wifi is left alone"
+
+# No wifi interface at all (a Pi on ethernet with the option set by mistake):
+# warn, do not fail the boot.
+cat > "$STUB/nmcli" <<'STUBEOF'
+#!/bin/bash
+case "$*" in
+    "general status")          exit 0 ;;
+    *"-f DEVICE,TYPE device"*) printf 'eth0:ethernet\n'; exit 0 ;;
+    *)                         exit 0 ;;
+esac
+STUBEOF
+wifi_apply >/dev/null 2>&1 && ok "no wifi interface is survivable" || bad "no wifi interface is survivable"
+
+PATH="$OLD_PATH"; rm -rf "$STUB"; unset NMCLI_LOG
+
+echo "== config resync =="
+grep -q 'config-sync)     config_sync' src/ogn-maintenance \
+    && ok "ogn-maintenance has a --config-sync mode" || bad "ogn-maintenance has a --config-sync mode"
+grep -q 'ogn-config-sync.service' src/ogn-install \
+    && ok "the installer writes the sync unit" || bad "the installer writes the sync unit"
+# The whole point is that it runs before anything waits for a network that may
+# be exactly what the edited card is trying to fix.
+python3 - <<'PY' && ok "the sync unit runs before the network is waited on" || bad "the sync unit runs before the network is waited on"
+import re, sys
+unit = open("src/ogn-install").read().split("write_unit ogn-config-sync.service <<'EOF'", 1)[1].split("\nEOF", 1)[0]
+assert re.search(r"^Before=.*network-online\.target", unit, re.M), "missing Before=network-online.target"
+assert re.search(r"^Before=.*rtlsdr-ogn\.service", unit, re.M), "missing Before=rtlsdr-ogn.service"
+assert "After=network-online.target" not in unit, "must not wait for the network"
+PY
+grep -q 'conf_digest         | boot_write "$CONFIG_APPLIED"' src/ogn-install \
+    && ok "the installer records what the card said" || bad "the installer records what the card said"
+grep -q 'conf_digest Install | boot_write "$INSTALL_APPLIED"' src/ogn-install \
+    && ok "and records the Install settings separately" \
+    || bad "and records the Install settings separately"
+grep -q 'cat "$CONFIG_APPLIED"' src/ogn-maintenance \
+    && ok "an unchanged card does no work" || bad "an unchanged card does no work"
+# The marker has to outlive the overlay, or every boot re-detects the same
+# edit for ever. /var/lib is in RAM once the overlay is on; the card is not.
+grep -q 'CONFIG_APPLIED="$STATE_DIR/config.applied"' src/ogn-common.sh \
+    && ok "the applied-config marker lives on the boot partition" \
+    || bad "the applied-config marker lives on the boot partition"
+grep -q 'ogn-install --no-reboot' src/ogn-maintenance \
+    && ok "an installer re-run never reboots on its own" \
+    || bad "an installer re-run never reboots on its own"
+grep -q 'systemctl is-active --quiet rtlsdr-ogn.service' src/ogn-maintenance \
+    && ok "the receiver is only restarted if it is already running" \
+    || bad "the receiver is only restarted if it is already running"
+
+echo "== calibration =="
+conf_load boot/MyReceiver.conf
+is "calibration is off by default"   "$(conf_get RF.Calibrate)"            "false"
+is "FreqCorr starts at zero"         "$(conf_get RF.FreqCorr)"             "+0"
+
+grep -q 'no Calibrate line in' src/ogn-calibrate \
+    && ok "a card with no Calibrate line is refused, not looped" \
+    || bad "a card with no Calibrate line is refused, not looped"
+
+# The real write-back, through the real function. CenterFreq and Gain exist in
+# both RF.GSM and RF.OGN, so an unscoped substitution would retune the receiver
+# while recording a calibration -- the reason conf_set_value takes a block.
+T=$(mktemp -d)
+cp boot/MyReceiver.conf "$T/card.conf"
+conf_set_value "$T/card.conf" Calibrate  true    "asked for"    || bad "arming Calibrate"
+conf_set_value "$T/card.conf" FreqCorr   "+52"   "measured"     || bad "setting FreqCorr"
+conf_set_value "$T/card.conf" CenterFreq "941.2" "measured" GSM || bad "setting GSM CenterFreq"
+conf_set_value "$T/card.conf" Gain       "35.0"  "measured" GSM || bad "setting GSM Gain"
+conf_load "$T/card.conf"
+is "write-back sets FreqCorr"        "$(conf_get RF.FreqCorr)"       "+52"
+is "write-back sets the GSM channel" "$(conf_get RF.GSM.CenterFreq)" "941.2"
+is "write-back sets the GSM gain"    "$(conf_get RF.GSM.Gain)"       "35.0"
+is "the OGN channel is untouched"    "$(conf_get RF.OGN.CenterFreq)" "868.8"
+is "the OGN gain is untouched"       "$(conf_get RF.OGN.Gain)"       "50.0"
+is "and SampleRate is untouched"     "$(conf_get RF.SampleRate)"     "2.0"
+
+# Measuring again replaces the value rather than stacking a second line.
+conf_set_value "$T/card.conf" FreqCorr "-3" "measured again" || bad "re-setting FreqCorr"
+is "a second measurement replaces the first" \
+    "$(grep -c '^ *FreqCorr *=' "$T/card.conf" | tr -d ' ')" "1"
+conf_load "$T/card.conf"
+is "and the new value is the one that counts" "$(conf_get RF.FreqCorr)" "-3"
+
+# Disarming is what stops a three-minute scan repeating at every boot.
+conf_set_value "$T/card.conf" Calibrate false "2026-01-01: measured" || bad "disarming"
+conf_load "$T/card.conf"
+is "write-back disarms Calibrate" "$(conf_get RF.Calibrate)" "false"
+
+# An absent key is reported, never invented.
+cp "$T/card.conf" "$T/before"
+conf_set_value "$T/card.conf" Nonexistent 1 x \
+    && bad "an absent key is refused" || ok "an absent key is refused"
+cmp -s "$T/before" "$T/card.conf" \
+    && ok "and the file is left alone" || bad "and the file is left alone"
+rm -rf "$T"
+
+# The config is libconfig, and upstream's own examples comment with #.
+grep -q '^[[:space:]]*//' boot/MyReceiver.conf \
+    && bad "the template comments with #, as upstream does" \
+    || ok "the template comments with #, as upstream does"
+grep -q 'printf "%s%s = %s;   # %s' src/ogn-common.sh \
+    && ok "and the write-back emits # too" || bad "and the write-back emits # too"
+
+# gsm_scan takes command-line flags. Every example says so: v2.1's configure
+# called it that way, and upstream's own conf says "gsm_scan --gsm-850".
+grep -q 'gsm_scan --ppm' src/ogn-calibrate \
+    && ok "gsm_scan is called with flags, as the examples show" \
+    || bad "gsm_scan is called with flags, as the examples show"
+
+grep -q 'conf_has RF.FreqCorr' src/ogn-install \
+    && bad "the installer no longer calibrates unasked" \
+    || ok "the installer no longer calibrates unasked"
+grep -q 'ogn-calibrate --from-config' src/ogn-install \
+    && ok "the installer honours a card that asks" \
+    || bad "the installer honours a card that asks"
+grep -q 'ogn-calibrate --from-config' src/ogn-maintenance \
+    && ok "so does every later boot" || bad "so does every later boot"
+grep -q 'systemctl stop rtlsdr-ogn.service' src/ogn-calibrate \
+    && ok "calibration takes the SDR back from the receiver" \
+    || bad "calibration takes the SDR back from the receiver"
+grep -q 'trap .*restore_receiver. EXIT' src/ogn-calibrate \
+    && ok "and gives it back however the scan ends" \
+    || bad "and gives it back however the scan ends"
+grep -q 'card_writeback "" ' src/ogn-calibrate \
+    && ok "a failed scan still disarms itself" || bad "a failed scan still disarms itself"
 
 echo "== generated vendor-data is in step with src/ =="
 BEFORE=$(sha256sum boot/vendor-data 2>/dev/null || shasum -a 256 boot/vendor-data)

@@ -15,6 +15,13 @@ BOOT_DIR="${OGN_BOOT_DIR:-/boot/firmware}"
 BOOT_CONF="$BOOT_DIR/MyReceiver.conf"
 # shellcheck disable=SC2034
 STATE_DIR="$BOOT_DIR/ogn-bootstrap"
+# What the card said when we last acted on it. On the boot partition, not in
+# /var/lib: under the overlay a marker on the root filesystem reverts at every
+# reboot, so the same edit would be re-detected for ever.
+# shellcheck disable=SC2034
+CONFIG_APPLIED="$STATE_DIR/config.applied"
+# shellcheck disable=SC2034
+INSTALL_APPLIED="$STATE_DIR/install.applied"
 MANIFEST_URL="${OGN_MANIFEST_URL:-https://raw.githubusercontent.com/glidernet/ogn-bootstrap/master/versions.json}"
 MANIFEST_CACHE="/var/lib/ogn-bootstrap/versions.json"
 MOTD_FILE="/etc/motd.d/10-ogn-bootstrap"
@@ -131,6 +138,74 @@ conf_bool() {
         true|yes|1|on) return 0 ;;
         *)             return 1 ;;
     esac
+}
+
+# --------------------------------------------------------------------------
+# Config digests
+#
+# Over the flattened settings, not the raw file, so re-indenting or fixing a
+# comment does not read as a change. Sorted: the flattener follows file order.
+# --------------------------------------------------------------------------
+sha256_stdin() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum | cut -d' ' -f1
+    else
+        shasum -a 256 | cut -d' ' -f1
+    fi
+}
+
+# conf_digest [section] — digest of everything, or of one top-level section
+conf_digest() {
+    if [ $# -eq 0 ]; then
+        LC_ALL=C sort "$OGN_CONF_CACHE" | sha256_stdin
+    else
+        { grep "^$1\." "$OGN_CONF_CACHE" || true; } | LC_ALL=C sort | sha256_stdin
+    fi
+}
+
+# conf_set_value <file> <key> <value> <comment> [block]
+#
+# Rewrite one "Key = ...;" in place, keeping its indentation. Scope it to a
+# block: CenterFreq and Gain are in both RF.GSM and RF.OGN, so an unscoped
+# substitution would retune the receiver while recording a calibration.
+# Returns 1 if the key is absent rather than guessing where to add it.
+conf_set_value() {
+    local file="$1" key="$2" value="$3" comment="$4" block="${5-}" tmp rc
+    tmp=$(mktemp)
+    LC_ALL=C awk -v key="$key" -v value="$value" -v comment="$comment" -v want="$block" '
+    {
+        line = $0
+        code = line
+        # libconfig takes # and // alike, and the templates in the wild use
+        # both. A brace inside a string value would corrupt the depth count,
+        # and no such line opens or closes a block anyway.
+        sub(/\/\/.*$/, "", code)
+        sub(/#.*$/, "", code)
+        countable = (index(code, "\"") == 0)
+        if (code ~ /^[ \t]*[A-Za-z_][A-Za-z0-9_]*[ \t]*:[ \t]*$/) {
+            lbl = code; gsub(/[ \t:]/, "", lbl); pending = lbl
+        }
+        opens = 0; closes = 0
+        if (countable) {
+            o = code; opens  = gsub(/\{/, "", o)
+            c = code; closes = gsub(/\}/, "", c)
+        }
+        for (i = 0; i < opens; i++) { depth++; stack[depth] = pending; pending = "" }
+        inblock = (want == "")
+        if (!inblock) { for (i = 1; i <= depth; i++) if (stack[i] == want) inblock = 1 }
+        if (!done && inblock && code ~ ("^[ \t]*" key "[ \t]*=")) {
+            match(line, /^[ \t]*/)
+            printf "%s%s = %s;   # %s\n", substr(line, 1, RLENGTH), key, value, comment
+            done = 1
+        } else print line
+        for (i = 0; i < closes; i++) { if (depth > 0) { delete stack[depth]; depth-- } }
+    }
+    END { exit(done ? 0 : 1) }
+    ' "$file" > "$tmp"
+    rc=$?
+    [ "$rc" -eq 0 ] && cat "$tmp" > "$file"
+    rm -f "$tmp"
+    return "$rc"
 }
 
 # --------------------------------------------------------------------------
@@ -324,6 +399,132 @@ boot_write() {
     cat > "$dest"
     sync -f "$dest" 2>/dev/null || sync
     [ "$was_ro" -eq 1 ] && boot_ro
+    return 0
+}
+
+# boot_replace <path> — replace a file on the boot partition with stdin
+#
+# Unlike boot_write this overwrites something the operator still needs. Written
+# alongside, flushed, then renamed, so a power cut on FAT leaves the old file
+# or the new one, never half of one.
+boot_replace() {
+    local dest="$1" tmp="$1.new" was_ro=0
+    findmnt -no OPTIONS "$BOOT_DIR" 2>/dev/null | grep -q '^ro\b\|,ro\b' && was_ro=1
+    [ "$was_ro" -eq 1 ] && boot_rw
+    if ! cat > "$tmp"; then
+        rm -f "$tmp"
+        [ "$was_ro" -eq 1 ] && boot_ro
+        return 1
+    fi
+    sync -f "$tmp" 2>/dev/null || sync
+    mv -f "$tmp" "$dest"
+    sync -f "$dest" 2>/dev/null || sync
+    [ "$was_ro" -eq 1 ] && boot_ro
+    return 0
+}
+
+# --------------------------------------------------------------------------
+# Wifi from the card
+#
+# Imager's wifi goes into cloud-init's network-config, read once per instance
+# and rendered to a NetworkManager keyfile on ext4 -- which no Mac or Windows
+# machine can open. Change the wifi password and a receiver linked only by that
+# wifi is unreachable by every route at once. So Network.Wifi is applied every
+# boot from the FAT partition, which any laptop can edit. Empty SSID, the
+# shipped default, does nothing and leaves Imager's wifi alone.
+#
+# The password is in clear on the card. So is Imager's, so this is not a new
+# exposure, but say it out loud.
+# --------------------------------------------------------------------------
+WIFI_CONN=ogn-wifi
+
+wifi_device() {
+    nmcli -t -f DEVICE,TYPE device 2>/dev/null | awk -F: '$2 == "wifi" { print $1; exit }'
+}
+
+# On a cold boot the sync service can beat NetworkManager to it.
+wifi_wait_for_nm() {
+    local waited=0
+    while ! nmcli general status >/dev/null 2>&1; do
+        [ "$waited" -ge 30 ] && return 1
+        sleep 2
+        waited=$((waited + 2))
+    done
+    return 0
+}
+
+# wifi_apply — make Network.Wifi the live wifi. Needs conf_load first. Never
+# fails the caller: a wifi problem must not stop a receiver on ethernet.
+wifi_apply() {
+    local ssid psk country hidden dev cur_ssid cur_psk cur_hidden
+
+    ssid=$(conf_get Network.Wifi.SSID "")
+    [ -n "$ssid" ] || return 0
+
+    if ! command -v nmcli >/dev/null 2>&1; then
+        warn "Network.Wifi is set but nmcli is not installed; leaving the network alone"
+        return 0
+    fi
+    if ! wifi_wait_for_nm; then
+        warn "NetworkManager did not come up; not applying Network.Wifi"
+        return 0
+    fi
+
+    psk=$(conf_get Network.Wifi.Password "")
+    country=$(conf_get Network.Wifi.Country "")
+    hidden=no
+    conf_bool Network.Wifi.Hidden false && hidden=yes
+
+    # The radio stays soft-blocked until a regulatory domain is set. Imager
+    # does that, so only touch it if the card asks.
+    if [ -n "$country" ]; then
+        if command -v raspi-config >/dev/null 2>&1; then
+            raspi-config nonint do_wifi_country "$country" >/dev/null 2>&1 \
+                || warn "could not set the wifi country to '$country'"
+        fi
+    fi
+    rfkill unblock wifi 2>/dev/null || true
+
+    dev=$(wifi_device)
+    if [ -z "$dev" ]; then
+        warn "Network.Wifi is set but this Pi has no wifi interface"
+        return 0
+    fi
+
+    # Already correct? Touch nothing: with the overlay off the connection
+    # persists, and rewriting it every boot is a pointless write to the card.
+    cur_ssid=$(nmcli -t -g 802-11-wireless.ssid connection show "$WIFI_CONN" 2>/dev/null || true)
+    cur_psk=$(nmcli -t -s -g 802-11-wireless-security.psk connection show "$WIFI_CONN" 2>/dev/null || true)
+    cur_hidden=$(nmcli -t -g 802-11-wireless.hidden connection show "$WIFI_CONN" 2>/dev/null || true)
+    if [ "$cur_ssid" = "$ssid" ] && [ "$cur_psk" = "$psk" ] && [ "$cur_hidden" = "$hidden" ]; then
+        return 0
+    fi
+
+    log "applying Network.Wifi from the card: SSID '$ssid' on $dev"
+    nmcli connection delete "$WIFI_CONN" >/dev/null 2>&1 || true
+
+    # Outrank whatever Imager left behind rather than hunting it down: under
+    # the overlay that connection comes back at every boot anyway.
+    if ! nmcli connection add type wifi con-name "$WIFI_CONN" ifname "$dev" \
+            ssid "$ssid" \
+            connection.autoconnect yes \
+            connection.autoconnect-priority 10 \
+            802-11-wireless.hidden "$hidden" >/dev/null 2>&1; then
+        warn "could not create the $WIFI_CONN connection"
+        return 0
+    fi
+
+    if [ -n "$psk" ]; then
+        if ! nmcli connection modify "$WIFI_CONN" \
+                802-11-wireless-security.key-mgmt wpa-psk \
+                802-11-wireless-security.psk "$psk" >/dev/null 2>&1; then
+            warn "could not set the wifi password"
+            return 0
+        fi
+    fi
+
+    nmcli connection up "$WIFI_CONN" >/dev/null 2>&1 \
+        || warn "wifi has not associated yet; NetworkManager will keep trying"
     return 0
 }
 

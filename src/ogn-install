@@ -103,6 +103,12 @@ CHANNEL=$(conf_get Install.UpdateChannel stable)
 WINDOW=$(conf_get Install.MaintenanceWindow "")
 
 # ---------------------------------------------------------------------------
+# 1a. Wifi — before apt, which is the first thing that needs a network.
+# Does nothing unless Network.Wifi.SSID is set; see ogn-common.sh.
+# ---------------------------------------------------------------------------
+wifi_apply
+
+# ---------------------------------------------------------------------------
 # 2. Packages
 #
 # Trixie substitutions worth knowing: libconfig9 -> libconfig11 (and the 0.3.2
@@ -149,10 +155,19 @@ INSTALL_DIR="$OGN_HOME/rtlsdr-ogn"
 REAL_DIR=$(readlink -f "$INSTALL_DIR")
 
 # ---------------------------------------------------------------------------
+# 4a. Frequency calibration, only if the card asked for it
+#
+# Before step 5, not after: ogn-calibrate writes its results onto the card, so
+# the copy below picks them up and nothing needs patching afterwards.
+# ---------------------------------------------------------------------------
+ogn-calibrate --from-config || true
+conf_load "$BOOT_CONF"
+
+# ---------------------------------------------------------------------------
 # 5. Place the configuration
 #
-# Copied, not regenerated: what was edited on the card is what runs. Only two
-# values are ever rewritten, and only when the operator left them for us.
+# Copied, not regenerated: what was edited on the card is what runs. One value
+# is ever rewritten, and only when the operator left it for us.
 # ---------------------------------------------------------------------------
 TARGET_CONF="$REAL_DIR/MyReceiver.conf"
 log "writing $TARGET_CONF"
@@ -160,15 +175,6 @@ install -o "$OGN_USER" -g "$OGN_GROUP" -m 0644 "$BOOT_CONF" "$TARGET_CONF"
 
 if [ "$CALL_SOURCE" = "hostname" ]; then
     sed -i "s|^\( *Call *= *\)\"\"|\1\"$CALL\"|" "$TARGET_CONF"
-fi
-
-if ! conf_has RF.FreqCorr && [ -x "$REAL_DIR/gsm_scan" ]; then
-    if PPM=$(ogn-calibrate --quiet 2>/dev/null) && [ -n "$PPM" ]; then
-        log "measured frequency correction: ${PPM} ppm"
-        sed -i "s|^\( *SampleRate *=\)|  FreqCorr = $PPM;   # measured by ogn-calibrate at install\n\1|" "$TARGET_CONF"
-    else
-        log "could not measure frequency correction; run 'sudo ogn-calibrate' once the aerial is connected"
-    fi
 fi
 
 # The geoid grid lets the decoder convert between ellipsoid and sea-level
@@ -374,6 +380,29 @@ else
     log "automatic updates disabled (MaintenanceWindow is empty)"
 fi
 
+# Re-read MyReceiver.conf from the card, and apply any wifi it asks for.
+#
+# Separate from ogn-boot-check.service, which waits for network-online.target
+# to ask GitHub about releases. Waiting for the network is the wrong move when
+# the network is what the card was edited to fix.
+write_unit ogn-config-sync.service <<'EOF'
+[Unit]
+Description=OGN receiver config sync (MyReceiver.conf and wifi from the card)
+Documentation=https://github.com/glidernet/ogn-bootstrap
+After=NetworkManager.service
+Wants=NetworkManager.service
+Before=network-online.target rtlsdr-ogn.service ogn-rf.service ogn-decode.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/ogn-maintenance --config-sync
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl enable ogn-config-sync.service >/dev/null
+
 # Resume any maintenance cycle that was interrupted, and report new versions.
 write_unit ogn-boot-check.service <<'EOF'
 [Unit]
@@ -455,6 +484,13 @@ if [ "$READONLY_FS" -eq 1 ]; then
 fi
 
 date -Is | boot_write "$STATE_DIR/installed"
+
+# What the card said when we last acted on it: ogn-config-sync watches the
+# first, ogn-boot-check the second. Written last, so a failed install does not
+# record itself as applied.
+conf_digest         | boot_write "$CONFIG_APPLIED"
+conf_digest Install | boot_write "$INSTALL_APPLIED"
+
 log "setup complete"
 
 if [ "$REBOOT_WHEN_DONE" -eq 1 ]; then
