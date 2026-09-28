@@ -45,9 +45,14 @@ GROW_MB="${GROW_MB:-512}"
 OUT_DIR="${OUT_DIR:-$REPO_ROOT/dist}"
 WORK_DIR="${WORK_DIR:-$REPO_ROOT/.build}"
 
-# Mirrors the PACKAGES list in src/ogn-install, including both optional ones.
+# Mirrors the PACKAGES list in src/ogn-install, including the optional ones.
 # ogn-install re-runs apt_install on first boot; because that is idempotent,
 # anything already here makes first boot a no-op instead of a download.
+#
+# wireguard-tools is here for a stronger reason than saving a download:
+# Network.WireGuard is read from the card at every boot and never re-runs the
+# installer, so a tunnel switched on later has to work with no network and no
+# apt. The kernel side is a module in the stock Raspberry Pi OS kernel.
 PACKAGES=(
     rtl-sdr
     librtlsdr0
@@ -58,6 +63,7 @@ PACKAGES=(
     unattended-upgrades
     overlayroot
     autossh
+    wireguard-tools
 )
 
 log()  { printf '\n=== %s\n' "$*"; }
@@ -242,7 +248,8 @@ install_scripts() {
     install -m 0644 src/ogn-common.sh "$MNT/usr/local/lib/ogn-bootstrap/"
     local f
     for f in src/ogn-install src/ogn-update src/ogn-maintenance \
-             src/ogn-remote-admin src/ogn-calibrate src/ogn-overlay; do
+             src/ogn-remote-admin src/ogn-calibrate src/ogn-overlay \
+             src/ogn-wireguard; do
         install -m 0755 "$f" "$MNT/usr/local/sbin/"
     done
 

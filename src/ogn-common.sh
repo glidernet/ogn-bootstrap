@@ -435,13 +435,52 @@ CMDLINE_FILE="$BOOT_DIR/cmdline.txt"
 CONFIG_TXT="$BOOT_DIR/config.txt"
 OVERLAY_PARAM="overlayroot=tmpfs"
 
-overlay_active()    { grep -qw -- "$OVERLAY_PARAM" /proc/cmdline 2>/dev/null; }
-overlay_next_boot() { grep -qw -- "$OVERLAY_PARAM" "$CMDLINE_FILE" 2>/dev/null; }
+# What this boot did is in /proc/cmdline, which anybody can read. What the
+# next boot will do is in cmdline.txt on the boot partition, which is mounted
+# root-only so that the credentials beside it stay that way — see
+# boot_partition_options in ogn-install. So the answer is published at every
+# boot, and whenever it changes, to a file anyone can read.
+#
+# In /run deliberately: it is a cache of something authoritative elsewhere, and
+# tmpfs means it cannot survive a reboot into disagreeing with the card.
+OVERLAY_STATE="${OGN_OVERLAY_STATE:-/run/ogn-bootstrap/overlay-next-boot}"
+
+overlay_active() { grep -qw -- "$OVERLAY_PARAM" /proc/cmdline 2>/dev/null; }
+
+overlay_next_boot() {
+    if [ -r "$CMDLINE_FILE" ]; then
+        grep -qw -- "$OVERLAY_PARAM" "$CMDLINE_FILE" 2>/dev/null
+    else
+        grep -qx 'enabled' "$OVERLAY_STATE" 2>/dev/null
+    fi
+}
+
+# overlay_next_boot_known — false when neither source can be read, so that a
+# status display can say "cannot tell" rather than quietly saying "disabled".
+overlay_next_boot_known() { [ -r "$CMDLINE_FILE" ] || [ -r "$OVERLAY_STATE" ]; }
+
+# overlay_state_publish — refresh that cache. Called at every boot, and by
+# cmdline_write, which is the only thing that changes the answer.
+overlay_state_publish() {
+    [ -r "$CMDLINE_FILE" ] || return 0
+    install -d -m 0755 "$(dirname "$OVERLAY_STATE")" 2>/dev/null || return 0
+    if grep -qw -- "$OVERLAY_PARAM" "$CMDLINE_FILE" 2>/dev/null; then
+        printf 'enabled\n' > "$OVERLAY_STATE"
+    else
+        printf 'disabled\n' > "$OVERLAY_STATE"
+    fi
+    chmod 0644 "$OVERLAY_STATE" 2>/dev/null || true
+    return 0
+}
 
 overlay_status() {
     local now next
-    overlay_active    && now=active   || now=inactive
-    overlay_next_boot && next=enabled || next=disabled
+    overlay_active && now=active || now=inactive
+    if overlay_next_boot_known; then
+        overlay_next_boot && next=enabled || next=disabled
+    else
+        next=unknown
+    fi
     printf '%s now=%s next_boot=%s\n' "$next" "$now" "$next"
 }
 
@@ -465,7 +504,8 @@ cmdline_write() {
     case "$out" in
         ""|"$OVERLAY_PARAM") warn "refusing to write a suspiciously short $CMDLINE_FILE"; return 1 ;;
     esac
-    printf '%s\n' "$out" | boot_replace "$CMDLINE_FILE"
+    printf '%s\n' "$out" | boot_replace "$CMDLINE_FILE" || return 1
+    overlay_state_publish
 }
 
 # The parameter is inert without an initramfs to act on it, and that failure is
@@ -662,6 +702,240 @@ wifi_apply() {
 
     nmcli connection up "$WIFI_CONN" >/dev/null 2>&1 \
         || warn "wifi has not associated yet; NetworkManager will keep trying"
+    return 0
+}
+
+# --------------------------------------------------------------------------
+# WireGuard from the card
+#
+# The same argument as the wifi above: a tunnel that exists so you can reach
+# an unreachable receiver is no use if fixing it needs you to reach the
+# receiver. So Network.WireGuard is applied from the FAT partition at every
+# boot, and /etc/wireguard is treated as a rendering of the card rather than
+# as configuration in its own right — which it has to be anyway, since under
+# the read-only overlay /etc is RAM and forgets itself at every reboot.
+#
+# The private key is in clear on the card. Say it out loud, in the template
+# and in the README, and keep it out of the world-readable copy of
+# MyReceiver.conf that the decoder gets.
+# --------------------------------------------------------------------------
+WG_IFACE="${OGN_WG_IFACE:-wg-ogn}"
+WG_DIR="${OGN_WG_DIR:-/etc/wireguard}"
+WG_CONF="$WG_DIR/$WG_IFACE.conf"
+WG_MOTD="${OGN_WG_MOTD:-/etc/motd.d/40-ogn-wireguard}"
+# [s] without a handshake before the endpoint is re-resolved. Longer than the
+# 2-minute interval WireGuard itself retries a handshake at, so this only
+# fires once WireGuard has given up rather than racing it.
+WG_STALE=300
+
+# A WireGuard key is 32 bytes of base64: 43 characters and a '='.
+wg_key_ok() { printf '%s' "$1" | grep -Eq '^[A-Za-z0-9+/]{43}=$'; }
+
+wg_up() { ip link show "$WG_IFACE" >/dev/null 2>&1; }
+
+# wireguard_render — print a wg-quick config from the loaded card settings.
+#
+# Pure: reads the config, writes stdout, touches nothing. Returns 1, saying
+# what is missing, rather than rendering something that cannot work.
+wireguard_render() {
+    local key addr mtu pub psk endpoint allowed keepalive ok=1
+
+    key=$(conf_get Network.WireGuard.PrivateKey "")
+    addr=$(conf_get Network.WireGuard.Address "")
+    mtu=$(conf_get Network.WireGuard.MTU 0)
+    pub=$(conf_get Network.WireGuard.Peer.PublicKey "")
+    psk=$(conf_get Network.WireGuard.Peer.PresharedKey "")
+    endpoint=$(conf_get Network.WireGuard.Peer.Endpoint "")
+    allowed=$(conf_get Network.WireGuard.Peer.AllowedIPs "")
+    keepalive=$(conf_get Network.WireGuard.Peer.PersistentKeepalive 25)
+
+    [ -n "$key" ]      || { warn "Network.WireGuard.PrivateKey is empty"; ok=0; }
+    [ -n "$addr" ]     || { warn "Network.WireGuard.Address is empty"; ok=0; }
+    [ -n "$pub" ]      || { warn "Network.WireGuard.Peer.PublicKey is empty"; ok=0; }
+    [ -n "$endpoint" ] || { warn "Network.WireGuard.Peer.Endpoint is empty"; ok=0; }
+    [ -n "$allowed" ]  || { warn "Network.WireGuard.Peer.AllowedIPs is empty"; ok=0; }
+    [ "$ok" -eq 1 ] || return 1
+
+    wg_key_ok "$key" || { warn "Network.WireGuard.PrivateKey is not a WireGuard key (44 characters of base64)"; ok=0; }
+    wg_key_ok "$pub" || { warn "Network.WireGuard.Peer.PublicKey is not a WireGuard key (44 characters of base64)"; ok=0; }
+    if [ -n "$psk" ] && ! wg_key_ok "$psk"; then
+        warn "Network.WireGuard.Peer.PresharedKey is not a WireGuard key (44 characters of base64)"; ok=0
+    fi
+    # The commonest way to get this wrong is to paste the private key into the
+    # peer, which otherwise fails silently: the tunnel comes up and no
+    # handshake ever completes.
+    if [ "$key" = "$pub" ]; then
+        warn "Network.WireGuard.Peer.PublicKey is this receiver's own key; it wants the SERVER's public key"; ok=0
+    fi
+    case "$addr" in
+        */*) ;;
+        *)   warn "Network.WireGuard.Address ('$addr') has no prefix length; it should look like 10.6.0.7/32"; ok=0 ;;
+    esac
+    case "$endpoint" in
+        *:[0-9]*) ;;
+        *)        warn "Network.WireGuard.Peer.Endpoint ('$endpoint') is not host:port"; ok=0 ;;
+    esac
+    case "$keepalive" in
+        ''|*[!0-9]*) warn "Network.WireGuard.Peer.PersistentKeepalive ('$keepalive') is not a number"; ok=0 ;;
+    esac
+    case "$mtu" in
+        ''|*[!0-9]*) warn "Network.WireGuard.MTU ('$mtu') is not a number"; ok=0 ;;
+    esac
+    [ "$ok" -eq 1 ] || return 1
+
+    printf '# Generated from %s by ogn-bootstrap. Edit the card, not this file:\n' "$BOOT_CONF"
+    printf '# this is rewritten from Network.WireGuard at every boot.\n\n'
+    printf '[Interface]\n'
+    printf 'PrivateKey = %s\n' "$key"
+    printf 'Address = %s\n' "$addr"
+    [ "$mtu" != "0" ] && printf 'MTU = %s\n' "$mtu"
+    printf '\n[Peer]\n'
+    printf 'PublicKey = %s\n' "$pub"
+    [ -n "$psk" ] && printf 'PresharedKey = %s\n' "$psk"
+    printf 'Endpoint = %s\n' "$endpoint"
+    printf 'AllowedIPs = %s\n' "$allowed"
+    [ "$keepalive" != "0" ] && printf 'PersistentKeepalive = %s\n' "$keepalive"
+    return 0
+}
+
+# conf_redact_secrets <file> — blank every credential in a copy of the config.
+#
+# The copy of MyReceiver.conf the decoder runs from is world-readable, and the
+# decoder has no use for any of these: the wifi password, a Raspberry Pi
+# Connect auth key, or the WireGuard keys. The card keeps the only copy that
+# needs them. Written through a temp file rather than `sed -i` so the target
+# keeps the ownership and mode it was installed with.
+#
+# Named by key, not by path, because the flattener is not available here and a
+# copy of this file is the one place a name collision could not do harm: every
+# one of these names appears exactly once in the template, and blanking one
+# line too many would only cost the decoder something it does not read.
+OGN_SECRET_KEYS="Password ConnectAuthKey PrivateKey PresharedKey"
+conf_redact_secrets() {
+    local file="$1" tmp key args=() note="blanked by ogn-bootstrap: it is on the card"
+    tmp=$(mktemp) || return 1
+    for key in $OGN_SECRET_KEYS; do
+        args+=(-e "s|^\\( *$key *= *\\)\"[^\"]*\"|\\1\"\";   # $note|")
+    done
+    sed "${args[@]}" "$file" > "$tmp" && cat "$tmp" > "$file" \
+        || warn "could not blank the credentials in $file; it still holds them"
+    rm -f "$tmp"
+    return 0
+}
+
+# wireguard_down — take the tunnel down and forget it.
+wireguard_down() {
+    if wg_up; then
+        log "taking the WireGuard tunnel $WG_IFACE down"
+        if command -v wg-quick >/dev/null 2>&1 && [ -s "$WG_CONF" ]; then
+            wg-quick down "$WG_IFACE" >/dev/null 2>&1 || ip link delete "$WG_IFACE" 2>/dev/null || true
+        else
+            ip link delete "$WG_IFACE" 2>/dev/null || true
+        fi
+    fi
+    rm -f "$WG_CONF" "$WG_MOTD"
+    return 0
+}
+
+# wireguard_refresh — re-resolve the endpoint if the handshake has stopped.
+#
+# WireGuard resolves Endpoint once, when the peer is configured, and never
+# again. A server on a dynamic address therefore takes the tunnel with it when
+# it moves — silently, and precisely when the tunnel is the only way in. One
+# `wg set` re-resolves the name without disturbing the interface, its routes,
+# or anything already running over it.
+wireguard_refresh() {
+    local pub endpoint last age
+    endpoint=$(conf_get Network.WireGuard.Peer.Endpoint "")
+    pub=$(conf_get Network.WireGuard.Peer.PublicKey "")
+    # A literal address cannot have moved, so there is nothing to re-resolve.
+    case "$endpoint" in ''|\[*) return 0 ;; [0-9]*.[0-9]*.[0-9]*.[0-9]*:*) return 0 ;; esac
+
+    last=$(wg show "$WG_IFACE" latest-handshakes 2>/dev/null | awk -v p="$pub" '$1 == p { print $2; exit }')
+    case "$last" in ''|*[!0-9]*) return 0 ;; esac
+    age=$(( $(date +%s) - last ))
+    [ "$age" -ge "$WG_STALE" ] || return 0
+
+    if [ "$last" -eq 0 ]; then
+        log "WireGuard has never completed a handshake; re-resolving $endpoint"
+    else
+        log "no WireGuard handshake for ${age}s; re-resolving $endpoint"
+    fi
+    wg set "$WG_IFACE" peer "$pub" endpoint "$endpoint" 2>/dev/null \
+        || warn "could not re-resolve the WireGuard endpoint '$endpoint'"
+    return 0
+}
+
+WG_MOTD_TEMPLATE='
+  WireGuard:   %s on %s, through %s
+               Is it talking?  sudo ogn-wireguard status
+
+'
+wireguard_motd_update() {
+    local tmp
+    mkdir -p "$(dirname "$WG_MOTD")" 2>/dev/null || return 0
+    tmp=$(mktemp) || return 0
+    # shellcheck disable=SC2059
+    printf "$WG_MOTD_TEMPLATE" \
+        "$(conf_get Network.WireGuard.Address "")" "$WG_IFACE" \
+        "$(conf_get Network.WireGuard.Peer.Endpoint "")" > "$tmp"
+    cmp -s "$tmp" "$WG_MOTD" || install -m 0644 "$tmp" "$WG_MOTD" 2>/dev/null || true
+    rm -f "$tmp"
+    return 0
+}
+
+# wireguard_apply — make Network.WireGuard the live tunnel. Needs conf_load
+# first. Returns 1 only when a tunnel was asked for and could not be provided,
+# so that the unit holding this reports a failure someone can see.
+wireguard_apply() {
+    local tmp out
+
+    if ! conf_bool Network.WireGuard.Enable false; then
+        wireguard_down
+        return 0
+    fi
+
+    if ! command -v wg-quick >/dev/null 2>&1; then
+        warn "Network.WireGuard is enabled but wireguard-tools is not installed"
+        return 1
+    fi
+
+    tmp=$(mktemp)
+    if ! wireguard_render > "$tmp"; then
+        rm -f "$tmp"
+        warn "WireGuard is enabled but not usably configured; leaving the network alone"
+        return 1
+    fi
+
+    # Unchanged and already up: nothing to do but check it is still talking.
+    if cmp -s "$tmp" "$WG_CONF" && wg_up; then
+        rm -f "$tmp"
+        wireguard_refresh
+        return 0
+    fi
+
+    install -d -m 0700 "$WG_DIR"
+    install -m 0600 "$tmp" "$WG_CONF"
+    rm -f "$tmp"
+
+    # wg-quick installs a kill-switch rule for a default route through the
+    # tunnel, and needs a firewall command to do it. Saying so here turns an
+    # obscure failure two lines down into an explicable one.
+    case "$(conf_get Network.WireGuard.Peer.AllowedIPs "")" in
+        *0.0.0.0/0*|*::/0*)
+            command -v nft >/dev/null 2>&1 || command -v iptables >/dev/null 2>&1 \
+                || warn "AllowedIPs routes everything through the tunnel, which needs nftables or iptables on this Pi" ;;
+    esac
+
+    log "bringing up the WireGuard tunnel $WG_IFACE"
+    wg-quick down "$WG_IFACE" >/dev/null 2>&1 || true
+    if ! out=$(wg-quick up "$WG_IFACE" 2>&1); then
+        printf '%s\n' "$out" | sed 's/^/  /' >&2
+        warn "could not bring up the WireGuard tunnel $WG_IFACE"
+        return 1
+    fi
+    [ -n "$out" ] && printf '%s\n' "$out" | sed 's/^/  /'
+    wireguard_motd_update
     return 0
 }
 

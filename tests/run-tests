@@ -122,7 +122,19 @@ for fn in boot_rw boot_ro boot_write; do
 done
 grep -q 'Storage=volatile' src/ogn-install && ok "journal is pinned to RAM" || bad "journal is pinned to RAM"
 grep -q 'RuntimeMaxUse' src/ogn-install && ok "journal size is capped" || bad "journal size is capped"
-grep -q 'boot_partition_ro' src/ogn-install && ok "boot partition is set read-only" || bad "boot partition is set read-only"
+grep -q 'boot_partition_options' src/ogn-install && ok "boot partition is set read-only" || bad "boot partition is set read-only"
+# The credentials on the card -- the wifi password Imager wrote, a WireGuard
+# key -- are readable by every account on the Pi without this, and it must not
+# be conditional on ReadOnlyFS the way the ro option is.
+python3 - <<'PY' && ok "and root-only, whatever else was asked for" || bad "and root-only, whatever else was asked for"
+import re
+src = open("src/ogn-install").read()
+m = re.search(r"^BOOT_OPTS=\((.*?)\)$", src, re.M)
+assert m, "no unconditional BOOT_OPTS line"
+assert "umask=0077" in m.group(1), m.group(1)
+# ro is the one that follows ReadOnlyFS.
+assert re.search(r'^\[ "\$READONLY_FS" -eq 1 \] && BOOT_OPTS\+=\(ro\)$', src, re.M)
+PY
 # raspi-config has no do_bootro entry point; enable_bootro is internal.
 code_of src/ogn-install | grep -q 'do_bootro' \
     && bad "no call to the non-existent raspi-config do_bootro" \
@@ -159,6 +171,7 @@ code_of src/ogn-* | grep -q 'overlayroot\.conf' \
 T=$(mktemp -d)
 BASE='console=serial0,115200 root=PARTUUID=abc rootfstype=ext4 fsck.repair=yes rootwait'
 CMDLINE_FILE="$T/cmdline.txt"
+OVERLAY_STATE="$T/next-boot"
 printf '%s\n' "$BASE" > "$CMDLINE_FILE"
 cmdline_write "$OVERLAY_PARAM" 1 >/dev/null 2>&1
 is "enabling appends the parameter" "$(cat "$CMDLINE_FILE")" "$BASE $OVERLAY_PARAM"
@@ -174,6 +187,47 @@ is "disabling twice is harmless" "$(cat "$CMDLINE_FILE")" "$BASE"
 cmdline_write "$OVERLAY_PARAM" 1 >/dev/null 2>&1 \
     && bad "an empty cmdline.txt is refused, not written" \
     || ok "an empty cmdline.txt is refused, not written"
+
+# cmdline.txt is root-only once the boot partition is mounted umask=0077, so
+# the answer `overlay status` needs is published where anyone can read it.
+# cmdline_write is the only thing that changes it, so it is the one place that
+# has to remember to say so.
+printf '%s\n' "$BASE" > "$CMDLINE_FILE"
+cmdline_write "$OVERLAY_PARAM" 1 >/dev/null 2>&1
+is "enabling publishes a readable copy"  "$(cat "$OVERLAY_STATE" 2>/dev/null)" "enabled"
+cmdline_write "$OVERLAY_PARAM" 0 >/dev/null 2>&1
+is "disabling publishes it too"          "$(cat "$OVERLAY_STATE" 2>/dev/null)" "disabled"
+MODE=$(stat -f '%Lp' "$OVERLAY_STATE" 2>/dev/null || stat -c '%a' "$OVERLAY_STATE")
+is "and anyone can read it"              "$MODE" "644"
+
+# With cmdline.txt readable it stays authoritative; without it, the published
+# copy is what is left. Neither: say so, rather than guessing "inactive".
+printf '%s %s\n' "$BASE" "$OVERLAY_PARAM" > "$CMDLINE_FILE"
+overlay_next_boot && ok "cmdline.txt wins while it can be read" || bad "cmdline.txt wins while it can be read"
+CMDLINE_FILE="$T/not-readable.txt"
+printf 'enabled\n' > "$OVERLAY_STATE"
+overlay_next_boot && ok "the published copy answers when it cannot" || bad "the published copy answers when it cannot"
+overlay_next_boot_known && ok "and that counts as knowing" || bad "and that counts as knowing"
+printf 'disabled\n' > "$OVERLAY_STATE"
+overlay_next_boot && bad "a disabled copy reads as disabled" || ok "a disabled copy reads as disabled"
+rm -f "$OVERLAY_STATE"
+overlay_next_boot_known && bad "with neither, it admits it does not know" || ok "with neither, it admits it does not know"
+case "$(overlay_status)" in
+    unknown*) ok "and the status line says unknown" ;;
+    *)        bad "and the status line says unknown" "$(overlay_status)" ;;
+esac
+grep -q 'overlay_next_boot_known' src/ogn-overlay \
+    && ok "the overlay command checks before answering" \
+    || bad "the overlay command checks before answering"
+grep -q 'overlay_state_publish' src/ogn-maintenance \
+    && ok "every boot republishes it" || bad "every boot republishes it"
+grep -q 'overlay_state_publish' src/ogn-install \
+    && ok "and so does the installer" || bad "and so does the installer"
+# /run, not /var/lib: a cache that outlived a reboot could disagree with the
+# card and never be corrected.
+grep -q 'OVERLAY_STATE="${OGN_OVERLAY_STATE:-/run/' src/ogn-common.sh \
+    && ok "the published copy lives on tmpfs" \
+    || bad "the published copy lives on tmpfs"
 rm -rf "$T"
 CMDLINE_FILE="$BOOT_DIR/cmdline.txt"
 
@@ -342,6 +396,202 @@ STUBEOF
 wifi_apply >/dev/null 2>&1 && ok "no wifi interface is survivable" || bad "no wifi interface is survivable"
 
 PATH="$OLD_PATH"; rm -rf "$STUB"; unset NMCLI_LOG
+
+echo "== WireGuard from the card =="
+conf_load boot/MyReceiver.conf
+conf_bool Network.WireGuard.Enable && bad "the shipped template ships it off" || ok "the shipped template ships it off"
+is "and with no key"            "$(conf_get Network.WireGuard.PrivateKey '<empty>')" "<empty>"
+is "keepalive is set for NAT"   "$(conf_get Network.WireGuard.Peer.PersistentKeepalive)" "25"
+is "MTU is worked out by default" "$(conf_get Network.WireGuard.MTU)"                 "0"
+wireguard_render >/dev/null 2>&1 && bad "an empty section renders nothing" || ok "an empty section renders nothing"
+
+conf_load tests/fixtures/wireguard.conf
+WG=$(wireguard_render 2>/dev/null) || bad "a filled-in section renders"
+for expect in \
+    "PrivateKey = FixturePrivateKeyNotARealKey000000000000000=" \
+    "Address = 10.6.0.7/32" \
+    "MTU = 1380" \
+    "PublicKey = FixtureServerPublicKeyNotReal00000000000000=" \
+    "Endpoint = vpn.example.org:51820" \
+    "AllowedIPs = 10.6.0.0/24" \
+    "PersistentKeepalive = 25"; do
+    case "$WG" in
+        *"$expect"*) ok "renders '$expect'" ;;
+        *)           bad "renders '$expect'" "$WG" ;;
+    esac
+done
+is "the interface section comes first" "$(printf '%s\n' "$WG" | grep -c '^\[Interface\]')" "1"
+is "and there is one peer"             "$(printf '%s\n' "$WG" | grep -c '^\[Peer\]')"      "1"
+# An empty PresharedKey is not the same as one set to nothing: wg-quick
+# rejects the line outright.
+printf '%s\n' "$WG" | grep -q 'PresharedKey' \
+    && bad "an unset PresharedKey is left out entirely" \
+    || ok "an unset PresharedKey is left out entirely"
+
+# Every field that must be there, taken away one at a time.
+WGT=$(mktemp -d)
+for field in PrivateKey Address Peer.PublicKey Peer.Endpoint Peer.AllowedIPs; do
+    sed "s|^\( *${field#Peer.} *=\).*|\1 \"\";|" tests/fixtures/wireguard.conf > "$WGT/c.conf"
+    conf_load "$WGT/c.conf"
+    wireguard_render >/dev/null 2>&1 \
+        && bad "an empty $field is refused" \
+        || ok "an empty $field is refused"
+done
+
+# The mistakes that otherwise fail silently: a tunnel that comes up and never
+# handshakes tells the operator nothing at all.
+check_rejects() {
+    sed "$2" tests/fixtures/wireguard.conf > "$WGT/c.conf"
+    conf_load "$WGT/c.conf"
+    if wireguard_render >/dev/null 2>&1; then bad "rejects $1"; else ok "rejects $1"; fi
+}
+check_rejects "a key that is not base64"        's|^\( *PrivateKey *=\).*|\1 "not a key";|'
+check_rejects "the private key in Peer"         's|^\( *PublicKey *=\).*|\1 "FixturePrivateKeyNotARealKey000000000000000=";|'
+check_rejects "an address with no prefix"       's|^\( *Address *=\).*|\1 "10.6.0.7";|'
+check_rejects "an endpoint with no port"        's|^\( *Endpoint *=\).*|\1 "vpn.example.org";|'
+check_rejects "a keepalive that is not a number" 's|^\( *PersistentKeepalive *=\).*|\1 "soon";|'
+check_rejects "an MTU that is not a number"     's|^\( *MTU *=\).*|\1 "big";|'
+rm -rf "$WGT"
+
+# The whole apply path, against stubbed tools. wg-quick is the only thing that
+# needs root and a kernel, and it is exactly what must not be called twice.
+STUB=$(mktemp -d)
+export WG_LOG="$STUB/calls"
+: > "$WG_LOG"
+cat > "$STUB/wg-quick" <<'STUBEOF'
+#!/bin/bash
+printf 'wg-quick %s\n' "$*" >> "$WG_LOG"
+[ "$1" = up ] && printf '%s\n' "$1" > "$WG_LOG.iface"
+[ "$1" = down ] && rm -f "$WG_LOG.iface"
+exit 0
+STUBEOF
+cat > "$STUB/ip" <<'STUBEOF'
+#!/bin/bash
+# "link show" succeeds only while the stub wg-quick has brought it up.
+case "$*" in *"link show"*) [ -f "$WG_LOG.iface" ] ;; *) exit 0 ;; esac
+STUBEOF
+cat > "$STUB/wg" <<'STUBEOF'
+#!/bin/bash
+printf 'wg %s\n' "$*" >> "$WG_LOG"
+case "$*" in *latest-handshakes*) printf '%s\t0\n' "$WG_PEER" ;; esac
+exit 0
+STUBEOF
+chmod +x "$STUB/wg-quick" "$STUB/ip" "$STUB/wg"
+OLD_PATH="$PATH"; PATH="$STUB:$PATH"
+WG_DIR="$STUB/wireguard"; WG_CONF="$WG_DIR/$WG_IFACE.conf"; WG_MOTD="$STUB/motd"
+
+conf_load tests/fixtures/wireguard.conf
+export WG_PEER="$(conf_get Network.WireGuard.Peer.PublicKey)"
+wireguard_apply >/dev/null 2>&1 && ok "applies cleanly" || bad "applies cleanly"
+grep -q 'wg-quick up' "$WG_LOG" && ok "brings the tunnel up" || bad "brings the tunnel up"
+[ -s "$WG_CONF" ] && ok "writes the wg-quick config" || bad "writes the wg-quick config"
+MODE=$(stat -f '%Lp' "$WG_CONF" 2>/dev/null || stat -c '%a' "$WG_CONF")
+is "and it is readable only by root" "$MODE" "600"
+[ -s "$WG_MOTD" ] && ok "says so in the login banner" || bad "says so in the login banner"
+
+# Applying again must not bounce a working tunnel: this runs every 10 minutes.
+: > "$WG_LOG"
+wireguard_apply >/dev/null 2>&1
+grep -q 'wg-quick up' "$WG_LOG" \
+    && bad "an unchanged, working tunnel is left alone" \
+    || ok "an unchanged, working tunnel is left alone"
+# ... but a peer that has stopped answering gets its endpoint re-resolved,
+# which is what a server on a dynamic address needs.
+grep -q "wg set $WG_IFACE peer .* endpoint vpn.example.org:51820" "$WG_LOG" \
+    && ok "a stale handshake re-resolves the endpoint" \
+    || bad "a stale handshake re-resolves the endpoint" "$(cat "$WG_LOG")"
+
+# A changed setting does bounce it.
+: > "$WG_LOG"
+sed 's|^\( *Address *=\).*|\1 "10.6.0.9/32";|' tests/fixtures/wireguard.conf > "$STUB/changed.conf"
+conf_load "$STUB/changed.conf"
+wireguard_apply >/dev/null 2>&1
+grep -q 'wg-quick up' "$WG_LOG" && ok "a changed address brings it back up" || bad "a changed address brings it back up"
+grep -q 'Address = 10.6.0.9/32' "$WG_CONF" && ok "with the new address" || bad "with the new address"
+
+# Switching it off on the card takes it down and removes the key.
+: > "$WG_LOG"
+conf_load boot/MyReceiver.conf
+wireguard_apply >/dev/null 2>&1 && ok "a card with it switched off applies cleanly" || bad "a card with it switched off applies cleanly"
+grep -q 'wg-quick down' "$WG_LOG" && ok "takes the tunnel down" || bad "takes the tunnel down"
+[ -e "$WG_CONF" ] && bad "and removes the rendered key" || ok "and removes the rendered key"
+[ -e "$WG_MOTD" ] && bad "and the banner with it" || ok "and the banner with it"
+
+# Enabled on a machine with no wireguard-tools: say so, and report failure, so
+# that the unit holding this does not look like it succeeded.
+rm -f "$STUB/wg-quick"
+conf_load tests/fixtures/wireguard.conf
+wireguard_apply >/dev/null 2>&1 \
+    && bad "a missing wireguard-tools is reported, not ignored" \
+    || ok "a missing wireguard-tools is reported, not ignored"
+
+PATH="$OLD_PATH"; rm -rf "$STUB"; unset WG_LOG WG_PEER
+WG_DIR=/etc/wireguard; WG_CONF="$WG_DIR/$WG_IFACE.conf"; WG_MOTD=/etc/motd.d/40-ogn-wireguard
+
+echo "== credentials do not follow the config around =="
+# The card is the only copy that needs any of these. The copy the decoder runs
+# from is 0644, and the decoder reads none of them.
+T=$(mktemp -d)
+sed 's|^\( *PresharedKey *=\).*|\1 "FixturePresharedKeyNotReal00000000000000000=";|' \
+    tests/fixtures/wireguard.conf > "$T/target.conf"
+conf_redact_secrets "$T/target.conf"
+grep -q 'FixturePrivateKey' "$T/target.conf" && bad "the private key is blanked" || ok "the private key is blanked"
+grep -q 'FixturePresharedKey' "$T/target.conf" && bad "so is the preshared key" || ok "so is the preshared key"
+conf_load "$T/target.conf"
+is "and what is left still parses" "$(conf_get Network.WireGuard.Address)" "10.6.0.7/32"
+is "the public key is untouched"   "$(conf_get Network.WireGuard.Peer.PublicKey)" \
+                                   "FixtureServerPublicKeyNotReal00000000000000="
+
+# Every credential the template can hold, filled in on a copy of the real
+# thing: the wifi password and a Connect auth key are secrets too, and were
+# riding along in that world-readable copy until they were named here.
+sed -e 's|^\( *Password *= *\)"";|\1"SECRET-wifi";|' \
+    -e 's|^\( *ConnectAuthKey *= *\)"";|\1"SECRET-connect";|' \
+    -e 's|^\( *PrivateKey *= *\)"";|\1"SECRET-wg";|' \
+    -e 's|^\( *PresharedKey *= *\)"";|\1"SECRET-psk";|' \
+    boot/MyReceiver.conf > "$T/card.conf"
+is "the template holds four credentials" \
+    "$(grep -c 'SECRET-' "$T/card.conf" | tr -d ' ')" "4"
+cp "$T/card.conf" "$T/decoder.conf"
+conf_redact_secrets "$T/decoder.conf"
+is "and the decoder's copy holds none" \
+    "$(grep -c 'SECRET-' "$T/decoder.conf" | tr -d ' ')" "0"
+is "while the card keeps all four" \
+    "$(grep -c 'SECRET-' "$T/card.conf" | tr -d ' ')" "4"
+conf_load "$T/decoder.conf"
+is "the redacted copy still parses"  "$(conf_get HTTP.Port)"        "8082"
+is "and keeps what is not secret"    "$(conf_get RF.OGN.CenterFreq)" "868.8"
+rm -rf "$T"
+grep -q 'conf_redact_secrets "$TARGET_CONF"' src/ogn-install \
+    && ok "the installer redacts the copy it places" \
+    || bad "the installer redacts the copy it places"
+grep -q 'conf_redact_secrets "$target"' src/ogn-maintenance \
+    && ok "and so does every later resync" || bad "and so does every later resync"
+
+echo "== WireGuard plumbing =="
+grep -q 'ogn-wireguard' boot/vendor-data && ok "vendor-data carries ogn-wireguard" || bad "vendor-data carries ogn-wireguard"
+grep -q 'src/ogn-wireguard' tools/build-image.sh && ok "and so does the image build" || bad "and so does the image build"
+grep -q 'wireguard-tools' tools/build-image.sh \
+    && ok "the image ships wireguard-tools, so the card alone can switch it on" \
+    || bad "the image ships wireguard-tools, so the card alone can switch it on"
+grep -q 'systemctl enable ogn-wireguard.service' src/ogn-install \
+    && ok "the service is enabled whatever the card says today" \
+    || bad "the service is enabled whatever the card says today"
+# Unlike the wifi, this one has to wait: wg-quick resolves the server's name.
+python3 - <<'PY' && ok "the tunnel unit waits for the network" || bad "the tunnel unit waits for the network"
+import re
+unit = open("src/ogn-install").read().split("write_unit ogn-wireguard.service <<'EOF'", 1)[1].split("\nEOF", 1)[0]
+assert re.search(r"^After=.*network-online\.target", unit, re.M), "missing After=network-online.target"
+assert re.search(r"^Wants=network-online\.target", unit, re.M), "missing Wants=network-online.target"
+# RemainAfterExit would make the unit unstartable by its own repair timer.
+assert "RemainAfterExit" not in unit, "RemainAfterExit stops the timer re-running it"
+PY
+grep -q 'ogn-wireguard.timer' src/ogn-wireguard \
+    && ok "the repair timer follows the card, not the installer" \
+    || bad "the repair timer follows the card, not the installer"
+grep -q 'wg_up' src/ogn-maintenance \
+    && ok "a live edit is picked up by the config resync" \
+    || bad "a live edit is picked up by the config resync"
 
 echo "== config resync =="
 grep -q 'config-sync)     config_sync' src/ogn-maintenance \

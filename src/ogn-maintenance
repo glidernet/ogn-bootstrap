@@ -108,8 +108,11 @@ config_sync() {
     local user group home link real target call lat lon old_freq
 
     # Before anything that can bail out: this runs at every boot, including the
-    # middle boot of a maintenance cycle where the receiver is writable.
+    # middle boot of a maintenance cycle where the receiver is writable. The
+    # published state is what `overlay status` reads without sudo, now that the
+    # boot partition it would otherwise read is root-only.
     overlay_motd_update
+    overlay_state_publish
 
     [ -r "$BOOT_CONF" ] || { log "no $BOOT_CONF on the card; nothing to sync"; return 0; }
     trap conf_cleanup EXIT
@@ -119,6 +122,16 @@ config_sync() {
     # keyfiles are in RAM, so "unchanged" does not mean "still applied".
     # wifi_apply is itself a no-op when the live config already matches.
     wifi_apply
+
+    # WireGuard belongs to ogn-wireguard.service, which waits for the network
+    # -- exactly what this must not do. What is left for here is the edit
+    # applied to a receiver that is already up: `ogn-maintenance --config-sync`
+    # by hand, with a tunnel running that the card has just changed. At boot
+    # the interface does not exist yet, so this stays out of the way.
+    if wg_up; then
+        ogn-wireguard --config "$BOOT_CONF" --apply \
+            || warn "could not re-apply Network.WireGuard; see journalctl -u ogn-wireguard"
+    fi
 
     # Before the digest, and before the receiver starts: nothing else has the
     # SDR yet. Disarms itself, so this is a no-op on all but the asked-for boot.
@@ -175,6 +188,7 @@ config_sync() {
     if ! conf_has RF.FreqCorr && [ -n "$old_freq" ]; then
         sed -i "s|^\( *SampleRate *=\)|  FreqCorr = $old_freq;   # measured by ogn-calibrate\n\1|" "$target"
     fi
+    conf_redact_secrets "$target"
 
     printf '%s\n' "$want_all" | boot_write "$CONFIG_APPLIED"
 
@@ -314,7 +328,15 @@ done
 case "$MODE" in
     overlay-status) overlay_status; exit 0 ;;
     status)
-        printf 'state:   %s (since %s)\n' "$(state_read)" "$([ -r "$STATE_FILE" ] && cut -d' ' -f3 "$STATE_FILE" || printf 'n/a')"
+        # The markers are on the boot partition, which is mounted root-only.
+        # Saying "idle" to someone who simply cannot see them would be a wrong
+        # answer dressed as a reassuring one.
+        if [ "$(id -u)" -eq 0 ] || [ -r "$STATE_DIR" ]; then
+            printf 'state:   %s (since %s)\n' "$(state_read)" "$([ -r "$STATE_FILE" ] && cut -d' ' -f3 "$STATE_FILE" || printf 'n/a')"
+        else
+            printf 'state:   unknown — the boot partition is readable only by root\n'
+            printf '         For a definite answer:  sudo ogn-maintenance --status\n'
+        fi
         printf 'overlay: %s\n' "$(overlay_status)"
         if [ "$(id -u)" -eq 0 ] || [ -r "$MANIFEST_CACHE" ]; then
             ogn-update --check || true

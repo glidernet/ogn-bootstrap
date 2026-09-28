@@ -51,6 +51,16 @@ if [ "$ACTION" = status ] || [ -z "$ACTION" ]; then
         printf 'now:        inactive — the root filesystem is writable.\n'
         printf '            Changes you make persist, and are written to the SD card.\n'
     fi
+    # cmdline.txt holds the answer and the boot partition is root-only, so for
+    # anyone else it comes from the copy published at boot. If that is missing
+    # too, say so: "inactive" would be a guess, and the wrong one is the one
+    # that reads as reassuring.
+    if ! overlay_next_boot_known; then
+        printf 'next boot:  unknown — cannot read %s,\n' "$CMDLINE_FILE"
+        printf '            and no published copy at %s\n' "$OVERLAY_STATE"
+        printf '\nFor a definite answer:  sudo overlay status\n'
+        exit 0
+    fi
     if overlay_next_boot; then
         printf 'next boot:  ACTIVE\n'
     else

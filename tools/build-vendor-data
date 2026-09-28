@@ -14,7 +14,7 @@ cd "$(dirname "$0")/.."
 
 OUT=boot/vendor-data
 LIB_FILES=(src/ogn-common.sh)
-BIN_FILES=(src/ogn-install src/ogn-update src/ogn-maintenance src/ogn-remote-admin src/ogn-calibrate src/ogn-overlay)
+BIN_FILES=(src/ogn-install src/ogn-update src/ogn-maintenance src/ogn-remote-admin src/ogn-calibrate src/ogn-overlay src/ogn-wireguard)
 
 emit_file() {
     local src="$1" dest="$2" mode="$3" marker

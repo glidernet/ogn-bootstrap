@@ -124,6 +124,10 @@ wifi_apply
 PACKAGES=(rtl-sdr librtlsdr0 libpng16-16t64 lynx curl ca-certificates unattended-upgrades)
 [ "$READONLY_FS" -eq 1 ] && PACKAGES+=(overlayroot)
 conf_bool Install.RemoteAdmin.OGNTeam && PACKAGES+=(autossh)
+# Network.WireGuard is not in the Install section, so switching it on later
+# never comes back through here. The image ships wireguard-tools for exactly
+# that reason; this line is for a Pi being set up by hand.
+conf_bool Network.WireGuard.Enable && PACKAGES+=(wireguard-tools)
 apt_install "${PACKAGES[@]}"
 
 # ---------------------------------------------------------------------------
@@ -166,8 +170,10 @@ conf_load "$BOOT_CONF"
 # ---------------------------------------------------------------------------
 # 5. Place the configuration
 #
-# Copied, not regenerated: what was edited on the card is what runs. One value
-# is ever rewritten, and only when the operator left it for us.
+# Copied, not regenerated: what was edited on the card is what runs. Two lines
+# are ever rewritten: the receiver name, when the operator left it for us, and
+# the WireGuard private key, which is blanked because this copy is readable by
+# anyone with an account on the Pi.
 # ---------------------------------------------------------------------------
 TARGET_CONF="$REAL_DIR/MyReceiver.conf"
 log "writing $TARGET_CONF"
@@ -176,6 +182,9 @@ install -o "$OGN_USER" -g "$OGN_GROUP" -m 0644 "$BOOT_CONF" "$TARGET_CONF"
 if [ "$CALL_SOURCE" = "hostname" ]; then
     sed -i "s|^\( *Call *= *\)\"\"|\1\"$CALL\"|" "$TARGET_CONF"
 fi
+
+# The decoder's copy is world-readable and has no use for a VPN key.
+conf_redact_secrets "$TARGET_CONF"
 
 # The geoid grid lets the decoder convert between ellipsoid and sea-level
 # heights properly, which is why GeoidSepar is deliberately absent from the
@@ -336,6 +345,50 @@ fi
 ogn-remote-admin --config "$BOOT_CONF" --user "$OGN_USER"
 
 # ---------------------------------------------------------------------------
+# 10a. WireGuard
+#
+# The units are written and the service enabled whatever the card currently
+# says, and ogn-wireguard does nothing at all while Network.WireGuard.Enable
+# is false. That is deliberate: WireGuard lives in the Network section, which
+# is re-read from the card at every boot and never re-runs this installer, so
+# turning the tunnel on later has to work with nothing but an edit on a
+# laptop. The timer, which is the only part with a running cost, is switched
+# on and off by ogn-wireguard itself to match.
+#
+# After network-online, unlike the wifi: wg-quick has to resolve the server's
+# name before it can configure the peer.
+# ---------------------------------------------------------------------------
+write_unit ogn-wireguard.service <<'EOF'
+[Unit]
+Description=OGN receiver WireGuard tunnel
+Documentation=https://github.com/glidernet/ogn-bootstrap
+After=network-online.target nss-lookup.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ogn-wireguard --apply
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Not RemainAfterExit: the timer re-runs this same service, and a service that
+# stays "active" after a successful run cannot be started again.
+write_unit ogn-wireguard.timer <<'EOF'
+[Unit]
+Description=Keep the OGN WireGuard tunnel up
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=10min
+
+[Install]
+WantedBy=timers.target
+EOF
+systemctl enable ogn-wireguard.service >/dev/null
+
+# ---------------------------------------------------------------------------
 # 11. Unattended security updates, and the maintenance timer
 # ---------------------------------------------------------------------------
 cat > /etc/apt/apt.conf.d/51ogn-unattended-upgrades <<'EOF'
@@ -422,6 +475,11 @@ systemctl enable ogn-boot-check.service >/dev/null
 
 systemctl daemon-reload
 
+# Now that the units exist, put the tunnel up (or take it down) to match the
+# card. Never fatal: a receiver that cannot reach a VPN server is still a
+# receiver, and the journal says why.
+ogn-wireguard --config "$BOOT_CONF" --apply || warn "the WireGuard tunnel is not up; see journalctl -u ogn-wireguard"
+
 # ---------------------------------------------------------------------------
 # 12. Start it, or explain why not
 # ---------------------------------------------------------------------------
@@ -469,36 +527,64 @@ EOF
 fi
 
 # ---------------------------------------------------------------------------
-# 13. Read-only root, last of all
+# 13. The boot partition, and read-only root, last of all
 # ---------------------------------------------------------------------------
-# The boot partition is FAT, and FAT is what corrupts on an unclean power
-# cycle, so it is mounted read-only and opened only to write.
+# Two mount options on /boot/firmware, for two different reasons:
+#
+#   ro            FAT is what corrupts on an unclean power cycle, so the
+#                 partition is opened only for the moment it takes to write.
+#                 Tied to ReadOnlyFS, since it is the same argument.
+#   umask=0077    everything on that partition is readable by every account on
+#                 the Pi otherwise -- including the wifi password Imager wrote
+#                 there, a WireGuard private key, and a Connect auth key.
+#                 Nothing but root has any business reading it, so this is set
+#                 whatever else was asked for.
+#
+# The umask takes effect at the NEXT boot and not before: vfat re-reads only
+# the ro flag on a remount, so the live mount keeps the permissions it was
+# mounted with. The ro option is the same, which is why boot_rw/boot_ro drive
+# the live mount directly rather than relying on this.
 #
 # Must run before the overlay goes on: /etc/fstab is on the root filesystem,
 # so an edit made with the overlay active is discarded.
-boot_partition_ro() {
+#
+# boot_partition_options <option...> — ensure each is on the /boot/firmware
+# line in /etc/fstab. An option already present, with any value, is left alone:
+# it was somebody's deliberate choice and this is not the place to overrule it.
+boot_partition_options() {
     local tmp rc=0
     if ! grep -qE '^[^#][^[:space:]]*[[:space:]]+/boot/firmware[[:space:]]' /etc/fstab; then
         warn "no /boot/firmware line in /etc/fstab; leaving the boot partition alone"
         return 0
     fi
     tmp=$(mktemp)
-    LC_ALL=C awk '
-        $1 !~ /^#/ && $2 == "/boot/firmware" && $4 !~ /(^|,)ro(,|$)/ { $4 = $4 ",ro"; changed = 1 }
+    LC_ALL=C awk -v want="$*" '
+        $1 !~ /^#/ && $2 == "/boot/firmware" {
+            n = split(want, opt, " ")
+            for (i = 1; i <= n; i++) {
+                name = opt[i]; sub(/=.*/, "", name)
+                if ($4 !~ "(^|,)" name "(=|,|$)") { $4 = $4 "," opt[i]; changed = 1 }
+            }
+        }
         { print }
         END { exit(changed ? 0 : 1) }
     ' /etc/fstab > "$tmp" || rc=$?
     if [ "$rc" -eq 0 ]; then
         install -m 0644 "$tmp" /etc/fstab
-        log "boot partition set read-only in /etc/fstab"
+        log "boot partition options in /etc/fstab: $* (from the next boot)"
     fi
     rm -f "$tmp"
     return 0
 }
 
-if [ "$READONLY_FS" -eq 1 ]; then
-    boot_partition_ro
+BOOT_OPTS=(umask=0077)
+[ "$READONLY_FS" -eq 1 ] && BOOT_OPTS+=(ro)
+boot_partition_options "${BOOT_OPTS[@]}"
+grep -qE '^[^#][^[:space:]]*[[:space:]]+/boot/firmware[[:space:]].*umask=0077' /etc/fstab \
+    || warn "/etc/fstab sets its own umask on /boot/firmware, so the wifi password and any
+     WireGuard key on the card stay readable by every account on this Pi"
 
+if [ "$READONLY_FS" -eq 1 ]; then
     if ogn-maintenance --overlay-status | grep -q '^enabled'; then
         log "read-only overlay already enabled"
     else
@@ -510,9 +596,10 @@ if [ "$READONLY_FS" -eq 1 ]; then
     fi
 fi
 
-# After step 13, so it reflects the overlay decision. Refreshed at every boot
+# After step 13, so both reflect the overlay decision. Refreshed at every boot
 # thereafter by ogn-config-sync.
 overlay_motd_update
+overlay_state_publish
 
 date -Is | boot_write "$STATE_DIR/installed"
 

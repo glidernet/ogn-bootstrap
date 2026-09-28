@@ -44,9 +44,17 @@ on:
   workflow_dispatch:
     inputs:
       publish:
-        description: 'Publish a release (on a branch: a pre-release test build with its own os-list.json)'
+        # On by default, because a run you cannot install is rarely the one
+        # you wanted: unticked, the run stops at a zipped artifact on the run
+        # page, which you can flash by hand but cannot point Imager at --
+        # there is no os-list.json and no public URL.
+        #
+        # Untick it for a bare "does it still build" check. On a branch this
+        # is a pre-release test build and does not touch the os-list.json
+        # real users follow, so the old reason to leave it off is gone.
+        description: 'Publish a release, so Imager has a URL (on a branch: a test build)'
         type: boolean
-        default: false
+        default: true
 
 permissions: {}
 
@@ -104,7 +112,9 @@ jobs:
             dist/image-meta.json
           retention-days: 7
 
-  # Only a tag, or a manual run that asked for it, gets published.
+  # Only a tag, or a manual run that asked for it, gets published. Skipping it
+  # leaves the artifact and nothing else, so a run you intend to test in Imager
+  # has to ask for this.
   #
   # A tag is a release: it updates os-list.json on master, which is the URL
   # every receiver's Imager is pointed at.

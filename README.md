@@ -123,6 +123,7 @@ Within a few minutes the receiver should appear on
 | Hardware watchdog | reboots the Pi if it wedges |
 | Weekly maintenance | security updates and OGN upgrades, in a window you choose |
 | Config resync | `MyReceiver.conf` is re-read from the card at every boot, so an edit takes effect without a login |
+| WireGuard | Optional, off by default: a tunnel out to a VPN server of your own, so you can reach the receiver from anywhere |
 | Geoid data | `WW15MGH.DAC`, so altitudes are right without hand-tuning |
 
 Nothing is exposed to the internet, and no remote access is enabled, unless
@@ -142,7 +143,7 @@ at all", so it is worth being precise about how that is achieved.
 | rsyslog | Not installed on Trixie. Disabled if something pulls it in, since it would write `/var/log/syslog` continuously. |
 | `atime` | Raspberry Pi OS already mounts root `noatime`. |
 | Swap | Disabled, along with the units that recreate it. A swapfile on a tmpfs overlay pins RAM to hold a "disk" that is itself RAM. |
-| Boot partition | Mounted **read-only**, and made writable only for the moment it takes to write the maintenance marker — a handful of writes per week, each flushed and dropped straight back to read-only. |
+| Boot partition | Mounted **read-only** — and `umask=0077`, so the credentials on it are root's alone; see [Credentials on the card](#credentials-on-the-card) — and made writable only for the moment it takes to write the maintenance marker — a handful of writes per week, each flushed and dropped straight back to read-only. |
 
 That last one matters most. The root filesystem can hide behind the overlay,
 but `/boot/firmware` cannot: cloud-init reads it, and the maintenance marker
@@ -234,6 +235,106 @@ All three are **off by default**, in the `Install.RemoteAdmin` section:
 | `OGNTeam` | A reverse SSH tunnel letting the OGN core team log in to help diagnose problems. They must accept this machine's key first — ask on the OGN forum. **This grants a third party access to a machine on your club's network.** Worth it for a receiver nobody local can maintain; your decision either way. |
 | `ExtraSSHKeys` | Additional authorised keys. Setting any also turns off SSH password login. |
 
+There is a fourth, in `Network.WireGuard` rather than `Install.RemoteAdmin`,
+because it is networking rather than something the installer builds in — see
+[below](#a-wireguard-tunnel-of-your-own).
+
+### A WireGuard tunnel of your own
+
+The three settings above all put somebody else in the path: Raspberry Pi's
+servers, or the OGN team's. `Network.WireGuard` is the fourth way in and the
+one that does not — the receiver dials out to a WireGuard server you run, so
+you reach it at a fixed address inside your own VPN, from anywhere, with
+nothing forwarded at the airfield end and no account anywhere.
+
+Set the server up first. It needs a `[Peer]` holding this receiver's **public**
+key and the address you are giving it. Generate the pair on any machine with
+`wireguard-tools`:
+
+```sh
+wg genkey | tee receiver.key | wg pubkey > receiver.pub
+```
+
+`receiver.key` goes on the card; `receiver.pub` goes on the server. Then, in
+`MyReceiver.conf`:
+
+```c
+Network:
+{
+  WireGuard:
+  {
+    Enable     = true;
+    PrivateKey = "<contents of receiver.key>";
+    Address    = "10.6.0.7/32";
+    MTU        = 0;
+
+    Peer:
+    {
+      PublicKey           = "<the SERVER's public key>";
+      Endpoint            = "vpn.example.org:51820";
+      AllowedIPs          = "10.6.0.0/24";
+      PresharedKey        = "";
+      PersistentKeepalive = 25;
+    } ;
+  } ;
+} ;
+```
+
+`AllowedIPs` is what gets routed *into* the tunnel. For reaching the receiver,
+that is your VPN subnet and nothing else. `0.0.0.0/0` instead sends everything
+— including the receiver's uplink to the OGN network — through your server,
+which makes your server a single point of failure for reception, and needs
+`nftables` or `iptables` on the Pi besides. `PersistentKeepalive` is what keeps
+the NAT at the airfield from forgetting the receiver, which is what lets you
+connect *in*; 25 seconds is the usual value.
+
+Then SSH to `10.6.0.7` from anywhere on the VPN, as if it were on the bench.
+
+| | |
+|---|---|
+| What runs it | `ogn-wireguard.service`, at every boot, after the network is up — unlike the wifi, `wg-quick` has to resolve the server's name before it can configure the peer |
+| Checking it | `sudo ogn-wireguard status` — up or down, and whether a handshake has ever completed, which is the difference between a tunnel and a tunnel-shaped hole |
+| When the server moves | `ogn-wireguard.timer` re-resolves the endpoint if the handshake stops, every 10 minutes, so a dynamic-DNS server does not take the tunnel with it. The timer exists only while the tunnel does |
+| Turning it off | `Enable = false` on the card. The interface goes at the next boot, or straight away with `sudo ogn-maintenance --config-sync` |
+| On the Pi | `wireguard-tools` is in the image already, so switching this on needs nothing but an edit on the card — no reinstall, and no network at the receiver end |
+
+The private key sits in clear on the boot partition, which is FAT and readable
+by anyone holding the card. There is no way around that on a machine that has
+to configure itself unattended, so give each receiver its own key: then losing
+a card revokes one receiver rather than the lot. See [Credentials on the
+card](#credentials-on-the-card) for what is done about everything short of
+someone holding it.
+
+### Credentials on the card
+
+Four things in `MyReceiver.conf` are secrets — the wifi password, a Raspberry
+Pi Connect auth key, and the WireGuard private and preshared keys — and Imager
+adds two more of its own to the same partition, the wifi PSK in
+`network-config` and the account's password hash in `user-data`.
+
+That partition is FAT, so anyone holding the card reads all of it on any
+laptop. Nothing the receiver does at runtime changes that, and it is the
+exposure worth planning around: give each receiver credentials of its own, so
+losing one card revokes one receiver, and prefer a receiver-only wifi or VLAN
+whose password you do not mind being in a box on an airfield.
+
+What *is* dealt with is everything short of physical possession:
+
+| | |
+|---|---|
+| On the Pi | `/boot/firmware` is mounted `umask=0077`, so the card is root's alone rather than readable by every account. Set whatever `ReadOnlyFS` says, unlike the `ro` option beside it, and it takes effect at the next boot — vfat re-reads only the `ro` flag on a remount |
+| The decoder's copy | `MyReceiver.conf` is copied to the decoder's directory 0644, and all four credentials are blanked on the way. The decoder reads none of them |
+| Over the network | The status pages on 8082 and 8083 serve a fixed set of paths and 404 the rest. The config file's *name* appears there; its contents do not |
+| In the journal | The tunnel logs its address and endpoint, never a key |
+
+One consequence of the root-only mount is that `overlay status` can no longer
+read `cmdline.txt` to say what the next boot will do. So the answer is
+published at every boot to `/run/ogn-bootstrap/overlay-next-boot`, which anyone
+can read — and when even that is missing, the status says `unknown` rather than
+guessing `inactive`, which is the comfortable wrong answer. `ogn-maintenance
+--status` does the same with the maintenance state.
+
+
 ## Changing settings later
 
 `MyReceiver.conf` is read from the boot partition at **every** boot, not just
@@ -299,6 +400,8 @@ and delete that one first.
 The password sits in clear on a partition anyone holding the card can read.
 Imager writes it in clear on the same partition, so this is not a new exposure,
 but do not hand the card to someone you would not give the wifi password to.
+On the Pi itself it is root's alone — see [Credentials on the
+card](#credentials-on-the-card).
 
 ### Calibrating the SDR
 
@@ -399,7 +502,10 @@ forgetting to switch it back is the easy mistake to make.
 
 The switch is the `overlayroot=tmpfs` kernel parameter in `cmdline.txt` on the
 boot partition — not `/etc/overlayroot.conf`, which is on the root filesystem
-and so is itself hidden by the overlay it would be configuring. `overlay on`
+and so is itself hidden by the overlay it would be configuring. That partition
+is root-only, so `overlay status` without sudo reads the copy published to
+`/run` at every boot, and says `unknown` rather than guessing if it is not
+there. `overlay on`
 refuses if the pieces it needs are not in place rather than arming a parameter
 that would quietly do nothing.
 
