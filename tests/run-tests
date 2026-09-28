@@ -517,6 +517,18 @@ fi
 ./tools/make-os-list --meta "$TMP/meta.json" --url "https://example.com/other.img.xz" --out "$TMP/x.json" >/dev/null 2>&1 \
     && bad "make-os-list rejects a URL the hashes do not describe" \
     || ok "make-os-list rejects a URL the hashes do not describe"
+
+# Imager shows the name and the description and nothing else, so those two
+# fields are the only place a test build can announce itself as one.
+./tools/make-os-list --meta "$TMP/meta.json" --url "$URL" --out "$TMP/test.json" \
+    --name "OGN Receiver TEST somebranch (abc1234)" \
+    --note "TEST BUILD -- not the released receiver image." >/dev/null \
+    && python3 - "$TMP/test.json" <<'PY' && ok "make-os-list labels a test build" || bad "make-os-list labels a test build"
+import json, sys
+e = json.load(open(sys.argv[1]))["os_list"][0]
+assert e["name"] == "OGN Receiver TEST somebranch (abc1234)", e["name"]
+assert e["description"].startswith("TEST BUILD"), e["description"]
+PY
 rm -rf "$TMP"
 
 BEFORE=$(sha256sum doc/ogn-icon.png 2>/dev/null || shasum -a 256 doc/ogn-icon.png)

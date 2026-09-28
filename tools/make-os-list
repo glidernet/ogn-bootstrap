@@ -41,10 +41,10 @@ REQUIRED = (
 )
 
 
-def build_entry(meta, url):
+def build_entry(meta, url, name=None, note=None):
     entry = {
-        "name": meta["name"],
-        "description": DESCRIPTION,
+        "name": name or meta["name"],
+        "description": f"{note} {DESCRIPTION}" if note else DESCRIPTION,
         "icon": f"{RAW}/doc/ogn-icon.png",
         "url": url,
         "extract_size": meta["extract_size"],
@@ -73,6 +73,11 @@ def main():
     ap.add_argument("--meta", required=True, help="image-meta.json from build-image.sh")
     ap.add_argument("--url", required=True, help="public download URL of the .img.xz")
     ap.add_argument("--out", default="os-list.json")
+    # A test build has to be obvious in Imager's list, because Imager shows the
+    # name and description and nothing else. Without these a branch build looks
+    # exactly like the one every receiver installs.
+    ap.add_argument("--name", help="entry name; defaults to the one in --meta")
+    ap.add_argument("--note", help="text prepended to the description")
     args = ap.parse_args()
 
     with open(args.meta) as fh:
@@ -85,7 +90,7 @@ def main():
         sys.exit(f"--url ends in something other than {meta['file']}; the hashes "
                  "in image-meta.json would not describe what it points at")
 
-    doc = {"os_list": [build_entry(meta, args.url)]}
+    doc = {"os_list": [build_entry(meta, args.url, args.name, args.note)]}
 
     with open(args.out, "w") as fh:
         json.dump(doc, fh, indent=2)

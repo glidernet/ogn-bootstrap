@@ -44,7 +44,7 @@ on:
   workflow_dispatch:
     inputs:
       publish:
-        description: 'Publish a release and update os-list.json'
+        description: 'Publish a release (on a branch: a pre-release test build with its own os-list.json)'
         type: boolean
         default: false
 
@@ -104,8 +104,15 @@ jobs:
             dist/image-meta.json
           retention-days: 7
 
-  # Only a tag, or a manual run that asked for it, gets published. A dev build
-  # stops at the artifact and leaves os-list.json alone.
+  # Only a tag, or a manual run that asked for it, gets published.
+  #
+  # A tag is a release: it updates os-list.json on master, which is the URL
+  # every receiver's Imager is pointed at.
+  #
+  # Anything else is a test build. It gets its own release, marked pre-release,
+  # with its own os-list.json attached as an asset -- so there is a URL to paste
+  # into Imager that does not touch the one real users follow. It is named after
+  # the branch in Imager's list so it cannot be mistaken for the live image.
   publish:
     needs: build
     if: github.ref_type == 'tag' || inputs.publish
@@ -114,9 +121,12 @@ jobs:
       contents: write
 
     steps:
+      # A release build edits master, so it checks master out. A test build
+      # must not, and checking out the branch also means make-os-list is the
+      # version being tested rather than whatever master happens to hold.
       - uses: actions/checkout@v4
         with:
-          ref: master
+          ref: ${{ github.ref_type == 'tag' && 'master' || github.ref_name }}
 
       - uses: actions/download-artifact@v4
         with:
@@ -135,37 +145,104 @@ jobs:
           [ "$want" = "$got" ] || { echo "artifact SHA256 mismatch: $want != $got"; exit 1; }
           echo "ok: $(basename "$img")"
 
-      - name: Publish the release
+      - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_type == 'tag' && github.ref_name || format('build-{0}', github.run_number) }}
         run: |
           set -euo pipefail
           img=$(ls dist/*.img.xz)
-          base=$(python3 -c 'import json; print(json.load(open("dist/image-meta.json"))["base_image"])')
+          meta() { python3 -c 'import json,sys; print(json.load(open("dist/image-meta.json"))[sys.argv[1]])' "$1"; }
+          base=$(meta base_image)
+
+          if [ "${{ github.ref_type }}" = tag ]; then
+            tag=${{ github.ref_name }}
+            prerelease=
+            target=
+            listing="https://raw.githubusercontent.com/${{ github.repository }}/master/os-list.json"
+            title=$tag
+          else
+            # Dated, not numbered. This is the build date out of image-meta.json
+            # rather than today's date on this runner: the build job ahead of
+            # this one can run for an hour and a half, so the two disagree
+            # across midnight, and it is the one already in the .img.xz filename.
+            #
+            # A second build of the same branch on the same day reuses the
+            # release and clobbers its assets, which keeps the URL you pasted
+            # into Imager working. Two *different* branches built on one day
+            # land on the same tag as well -- the title and the Imager entry
+            # name both say which branch, but the later one wins.
+            tag=$(meta release_date)
+            prerelease=--prerelease
+            # Without a target, gh creates the tag at the default branch, which
+            # is how build-5's tag ended up on master rather than on the commit
+            # that was actually built.
+            target="--target ${{ github.sha }}"
+            # The per-build list, attached below. Pointing a test build at the
+            # master URL is what made the last one indistinguishable from -- and
+            # in fact replace -- the live image.
+            listing="https://github.com/${{ github.repository }}/releases/download/$tag/os-list.json"
+            title="$tag (test build of ${{ github.ref_name }})"
+          fi
 
           notes=$(cat <<EOF
           Raspberry Pi OS Lite (64-bit) with the OGN receiver software preinstalled.
 
-          Add this to Raspberry Pi Imager as a custom repository:
+          Add this to Raspberry Pi Imager as a custom repository
+          (Settings, or \`rpi-imager --repo <url>\`):
 
-              https://raw.githubusercontent.com/${{ github.repository }}/master/os-list.json
+              $listing
 
-          Built from \`$base\`.
+          Built from \`$base\`, ref \`${{ github.ref_name }}\` (\`${{ github.sha }}\`).
           EOF
           )
 
-          gh release view "$TAG" >/dev/null 2>&1 \
-            || gh release create "$TAG" --title "$TAG" --notes "$notes"
-          gh release upload "$TAG" "$img" dist/image-meta.json --clobber
+          # Refresh title and notes on a reuse, so a same-day rebuild does not
+          # leave notes naming the previous commit. The tag itself stays where
+          # it was first created; the notes are what say which commit the
+          # attached image is from.
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release edit "$tag" --title "$title" --notes "$notes"
+          else
+            gh release create "$tag" --title "$title" --notes "$notes" $prerelease $target
+          fi
+          gh release upload "$tag" "$img" dist/image-meta.json --clobber
 
-          echo "DOWNLOAD_URL=https://github.com/${{ github.repository }}/releases/download/$TAG/$(basename "$img")" >> "$GITHUB_ENV"
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+          echo "DOWNLOAD_URL=https://github.com/${{ github.repository }}/releases/download/$tag/$(basename "$img")" >> "$GITHUB_ENV"
 
-      - name: Update os-list.json
+      # Both paths build the same file; only where it ends up differs.
+      - name: Build os-list.json
         run: |
           set -euo pipefail
-          tools/make-os-list --meta dist/image-meta.json --url "$DOWNLOAD_URL" --out os-list.json
+          if [ "${{ github.ref_type }}" = tag ]; then
+            tools/make-os-list --meta dist/image-meta.json --url "$DOWNLOAD_URL" --out os-list.json
+          else
+            short=$(echo '${{ github.sha }}' | cut -c1-7)
+            tools/make-os-list --meta dist/image-meta.json --url "$DOWNLOAD_URL" --out os-list.json \
+              --name "OGN Receiver TEST ${{ github.ref_name }} ($short)" \
+              --note "TEST BUILD -- not the released receiver image."
+          fi
 
+      # A test build stops here: the list rides along with the release it
+      # describes, and master keeps pointing at the last real image.
+      - name: Attach os-list.json to the test release
+        if: github.ref_type != 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" os-list.json --clobber
+          {
+            echo '## Test image'
+            echo 'Add this to Raspberry Pi Imager as a custom repository:'
+            echo
+            echo "    https://github.com/${{ github.repository }}/releases/download/$TAG/os-list.json"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Update os-list.json on master
+        if: github.ref_type == 'tag'
+        run: |
+          set -euo pipefail
           git config user.name  'github-actions[bot]'
           git config user.email 'github-actions[bot]@users.noreply.github.com'
 
