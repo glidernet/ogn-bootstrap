@@ -176,9 +176,9 @@ conf_set_value() {
     {
         line = $0
         code = line
-        # libconfig takes # and // alike, and the templates in the wild use
-        # both. A brace inside a string value would corrupt the depth count,
-        # and no such line opens or closes a block anyway.
+        # Our own stripper, not libconfig: # and // only, no /* */. A block
+        # comment, or a brace inside a string, corrupts the depth count —
+        # neither appears in the template.
         sub(/\/\/.*$/, "", code)
         sub(/#.*$/, "", code)
         countable = (index(code, "\"") == 0)
@@ -421,6 +421,143 @@ boot_replace() {
     sync -f "$dest" 2>/dev/null || sync
     [ "$was_ro" -eq 1 ] && boot_ro
     return 0
+}
+
+# --------------------------------------------------------------------------
+# The read-only root overlay
+#
+# Debian's overlayroot, switched with overlayroot=tmpfs in cmdline.txt on the
+# FAT partition. Not /etc/overlayroot.conf: /etc is on the root filesystem,
+# which the overlay hides, so an edit there is discarded by the reboot meant
+# to apply it and the overlay could never be switched off from inside itself.
+# --------------------------------------------------------------------------
+CMDLINE_FILE="$BOOT_DIR/cmdline.txt"
+CONFIG_TXT="$BOOT_DIR/config.txt"
+OVERLAY_PARAM="overlayroot=tmpfs"
+
+overlay_active()    { grep -qw -- "$OVERLAY_PARAM" /proc/cmdline 2>/dev/null; }
+overlay_next_boot() { grep -qw -- "$OVERLAY_PARAM" "$CMDLINE_FILE" 2>/dev/null; }
+
+overlay_status() {
+    local now next
+    overlay_active    && now=active   || now=inactive
+    overlay_next_boot && next=enabled || next=disabled
+    printf '%s now=%s next_boot=%s\n' "$next" "$now" "$next"
+}
+
+# cmdline_write <param> <1 to add, 0 to remove>
+#
+# cmdline.txt is one line of space-separated parameters. Rebuilt from its own
+# tokens rather than patched with sed: no escaping to get wrong, no duplicates,
+# and no stray second line, which the bootloader would ignore.
+cmdline_write() {
+    local param="$1" want="$2" out
+    [ -r "$CMDLINE_FILE" ] || { warn "cannot read $CMDLINE_FILE"; return 1; }
+    out=$(LC_ALL=C awk -v param="$param" -v want="$want" '
+        { for (i = 1; i <= NF; i++) if ($i != param) toks[++n] = $i }
+        END {
+            if (want == "1") toks[++n] = param
+            line = ""
+            for (i = 1; i <= n; i++) line = line (i > 1 ? " " : "") toks[i]
+            print line
+        }' "$CMDLINE_FILE")
+    # A truncated cmdline.txt is an unbootable Pi. Never write one.
+    case "$out" in
+        ""|"$OVERLAY_PARAM") warn "refusing to write a suspiciously short $CMDLINE_FILE"; return 1 ;;
+    esac
+    printf '%s\n' "$out" | boot_replace "$CMDLINE_FILE"
+}
+
+# The parameter is inert without an initramfs to act on it, and that failure is
+# silent — the Pi boots normally and keeps writing to the card. Check first.
+overlay_preflight() {
+    local problems=0
+    if ! dpkg-query -W -f='${Status}' overlayroot 2>/dev/null | grep -q "ok installed"; then
+        warn "the overlayroot package is not installed"
+        problems=1
+    fi
+    if ! grep -qE '^[[:space:]]*auto_initramfs=1' "$CONFIG_TXT" 2>/dev/null; then
+        warn "auto_initramfs=1 is not set in $CONFIG_TXT, so no initramfs will be loaded"
+        problems=1
+    fi
+    return "$problems"
+}
+
+# auto_initramfs=1 picks up whatever initramfs-tools last built, so it survives
+# kernel upgrades; naming one file does not.
+overlay_ensure_initramfs() {
+    grep -qE '^[[:space:]]*auto_initramfs=1' "$CONFIG_TXT" 2>/dev/null && return 0
+    [ -r "$CONFIG_TXT" ] || { warn "no $CONFIG_TXT; cannot enable the initramfs"; return 1; }
+    log "adding auto_initramfs=1 to $CONFIG_TXT"
+    { cat "$CONFIG_TXT"; printf '\n# Load the initramfs the overlay needs. Added by ogn-bootstrap.\nauto_initramfs=1\n'; } \
+        | boot_replace "$CONFIG_TXT"
+}
+
+OVERLAY_MOTD=/etc/motd.d/30-ogn-overlay
+
+# overlay_motd_update — report the overlay in the login banner.
+#
+# A file rewritten at boot, not a script run per login: the live state is fixed
+# by the initramfs, so it cannot change while the system is up. What the next
+# boot will do can, and everything that changes it calls this.
+overlay_motd_update() {
+    local tmp
+    mkdir -p "$(dirname "$OVERLAY_MOTD")" 2>/dev/null || return 0
+    tmp=$(mktemp) || return 0
+    if overlay_active && overlay_next_boot; then
+        cat > "$tmp" <<'EOF'
+
+  Filesystem:  READ-ONLY. Anything you change is discarded at the next reboot.
+               To make a change stick:  sudo overlay off --reboot
+
+EOF
+    elif overlay_active; then
+        cat > "$tmp" <<'EOF'
+
+  Filesystem:  READ-ONLY for now, but switched OFF for the next boot.
+               Reboot and this receiver comes up writable.
+               Changed your mind?  sudo overlay on
+
+EOF
+    elif overlay_next_boot; then
+        cat > "$tmp" <<'EOF'
+
+  Filesystem:  WRITABLE, and read-only again after the next reboot.
+               Finish what you are doing, then:  sudo reboot
+
+EOF
+    else
+        cat > "$tmp" <<'EOF'
+
+  *** Filesystem: WRITABLE. The read-only overlay is OFF. ***
+
+  This receiver is writing to its SD card. That is fine while you are working
+  on it, and a bad way to leave it: a card written to continuously, on a
+  machine that loses power without warning, is the commonest way a receiver
+  dies in the field.
+
+  When you have finished:  sudo overlay on --reboot
+
+EOF
+    fi
+    # Only touch the file if it actually changed. This runs at every boot, and
+    # with the overlay off it is a write to the SD card.
+    cmp -s "$tmp" "$OVERLAY_MOTD" || install -m 0644 "$tmp" "$OVERLAY_MOTD" 2>/dev/null || true
+    rm -f "$tmp"
+    return 0
+}
+
+# Swap on a tmpfs overlay is pathological: the backing file lives in the RAM
+# upper layer, so the system pins memory to hold a "disk" that is itself
+# memory, and the overlay slowly fills. Disable the units that recreate it
+# rather than just swapoff, or it returns at the next boot.
+swap_disable() {
+    local u
+    swapoff -a 2>/dev/null || true
+    for u in rpi-setup-loop@var-swap.service rpi-resize-swap-file.service dphys-swapfile.service; do
+        systemctl disable --now "$u" >/dev/null 2>&1 || true
+    done
+    rm -f /var/swap 2>/dev/null || true
 }
 
 # --------------------------------------------------------------------------

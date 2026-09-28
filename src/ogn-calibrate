@@ -113,15 +113,27 @@ if awk "BEGIN{exit !($(conf_get RF.OGN.CenterFreq 868.8) > 900)}" 2>/dev/null; t
     BAND_OPT="--gsm-850"
 fi
 
+# gsm_scan defaults to device 0, which on a two-dongle receiver may be the
+# ADS-B stick — and the result is written back as though it were right. Follow
+# the same selection ogn-rf uses: DeviceSerial wins where set.
+DEV_SERIAL=$(conf_get RF.DeviceSerial "")
+if [ -n "$DEV_SERIAL" ]; then
+    DEV_OPT="--serial $DEV_SERIAL"
+    DEV_DESC="serial $DEV_SERIAL"
+else
+    DEV_OPT="--device $(conf_get RF.Device 0)"
+    DEV_DESC="device $(conf_get RF.Device 0)"
+fi
+
 # --ppm 0 deliberately, not a previous measurement: a stale estimate pulls the
 # scan off, and 0 is what a low-drift stick actually is.
 SCAN_GAIN=$(conf_get RF.GSM.Gain 25.0)
 
-[ "$QUIET" -eq 1 ] || log "scanning for GSM carriers (up to ${SCAN_TIMEOUT}s) — this needs the aerial connected"
+[ "$QUIET" -eq 1 ] || log "scanning for GSM carriers on $DEV_DESC (up to ${SCAN_TIMEOUT}s) — this needs the aerial connected"
 
 # shellcheck disable=SC2086
 OUT=$(cd "$INSTALL_DIR" && timeout "$SCAN_TIMEOUT" \
-      ./gsm_scan --ppm 0 --gain "$SCAN_GAIN" $BAND_OPT 2>&1) || true
+      ./gsm_scan --ppm 0 --gain "$SCAN_GAIN" $DEV_OPT $BAND_OPT 2>&1) || true
 
 # Too little or too much gain is gsm_scan's usual first answer. One pass cannot
 # fix that, so name the knob that can.

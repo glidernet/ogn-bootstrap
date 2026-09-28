@@ -1,0 +1,126 @@
+#!/bin/bash
+#
+# ogn-overlay — turn the read-only root filesystem on and off by hand.
+#
+#   overlay status           what is on now, and after a reboot
+#   overlay off              come up writable at the next boot
+#   overlay on               go back to protected at the next boot
+#   overlay off --reboot     ... and reboot now
+#   overlay on  --reboot
+#
+# Also installed as `overlay`. For maintenance the weekly window does not
+# cover: with the overlay on, changes are discarded at the next boot.
+#
+#   sudo overlay off --reboot     # comes back writable
+#   ... do the work ...
+#   sudo overlay on --reboot      # back to protected
+#
+# Switching always takes effect at the next boot: the overlay is established by
+# the initramfs, before the root filesystem is mounted.
+#
+# Copyright (c) 2026 ifly7charlie. MIT licence, see LICENSE.
+
+set -euo pipefail
+
+LIBDIR="${OGN_LIBDIR:-/usr/local/lib/ogn-bootstrap}"
+# shellcheck source=src/ogn-common.sh
+. "$LIBDIR/ogn-common.sh"
+
+REBOOT=0
+ACTION=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        on|enable)    ACTION=on ;;
+        off|disable)  ACTION=off ;;
+        status)       ACTION=status ;;
+        --reboot)     REBOOT=1 ;;
+        -h|--help)    sed -n '3,19p' "$0"; exit 0 ;;
+        *)            die "unknown argument: $1  (try: overlay status)" ;;
+    esac
+    shift
+done
+
+# --------------------------------------------------------------------------
+# status — readable by anyone, so a check does not need sudo
+# --------------------------------------------------------------------------
+if [ "$ACTION" = status ] || [ -z "$ACTION" ]; then
+    if overlay_active; then
+        printf 'now:        ACTIVE — the root filesystem is read-only.\n'
+        printf '            Changes you make are discarded at the next reboot.\n'
+    else
+        printf 'now:        inactive — the root filesystem is writable.\n'
+        printf '            Changes you make persist, and are written to the SD card.\n'
+    fi
+    if overlay_next_boot; then
+        printf 'next boot:  ACTIVE\n'
+    else
+        printf 'next boot:  inactive\n'
+    fi
+    if overlay_active && ! overlay_next_boot; then
+        printf '\nA reboot will leave this receiver WRITABLE and unprotected.\n'
+        printf 'Run "sudo overlay on" to undo that.\n'
+    elif ! overlay_active && overlay_next_boot; then
+        printf '\nA reboot will make it read-only.\n'
+    fi
+    [ -z "$ACTION" ] && printf '\nTo change it:  sudo overlay off   |   sudo overlay on\n'
+    exit 0
+fi
+
+need_root
+
+# --------------------------------------------------------------------------
+# off — writable at the next boot
+# --------------------------------------------------------------------------
+if [ "$ACTION" = off ]; then
+    if ! overlay_next_boot; then
+        log "the overlay is already disabled for the next boot"
+    else
+        cmdline_write "$OVERLAY_PARAM" 0 || die "could not update $CMDLINE_FILE"
+        log "overlay disabled — the next boot will come up writable"
+    fi
+
+    overlay_motd_update
+
+    if overlay_active; then
+        warn "still read-only until you reboot"
+    fi
+    if [ "$REBOOT" -eq 1 ]; then
+        log "rebooting"
+        systemctl reboot
+    else
+        log "reboot when ready:  sudo reboot"
+    fi
+    exit 0
+fi
+
+# --------------------------------------------------------------------------
+# on — protected at the next boot
+# --------------------------------------------------------------------------
+overlay_ensure_initramfs || die "could not arrange for an initramfs to be loaded"
+
+if ! overlay_preflight; then
+    die "the overlay cannot be enabled safely yet — see the warnings above.
+     Fix those first: an overlayroot=tmpfs with nothing to act on boots
+     normally and keeps writing to the card, with nothing to tell you so."
+fi
+
+swap_disable
+
+if overlay_next_boot; then
+    log "the overlay is already enabled for the next boot"
+else
+    cmdline_write "$OVERLAY_PARAM" 1 || die "could not update $CMDLINE_FILE"
+    log "overlay enabled — the next boot will come up read-only"
+fi
+
+overlay_motd_update
+
+if ! overlay_active; then
+    warn "still writable until you reboot"
+fi
+if [ "$REBOOT" -eq 1 ]; then
+    log "rebooting"
+    systemctl reboot
+else
+    log "reboot when ready:  sudo reboot"
+fi

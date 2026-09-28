@@ -14,7 +14,7 @@ cd "$(dirname "$0")/.."
 
 OUT=boot/vendor-data
 LIB_FILES=(src/ogn-common.sh)
-BIN_FILES=(src/ogn-install src/ogn-update src/ogn-maintenance src/ogn-remote-admin src/ogn-calibrate)
+BIN_FILES=(src/ogn-install src/ogn-update src/ogn-maintenance src/ogn-remote-admin src/ogn-calibrate src/ogn-overlay)
 
 emit_file() {
     local src="$1" dest="$2" mode="$3" marker
@@ -71,6 +71,14 @@ done
 for f in "${BIN_FILES[@]}"; do
     emit_file "$f" "/usr/local/sbin/$(basename "$f")" 0755
 done
+
+cat <<'SYMLINK'
+# `overlay` is the name the documentation uses, and the one anyone logging in
+# to do a piece of maintenance will actually type. ogn-overlay is the script;
+# this is the name that is memorable at 2am on an airfield.
+ln -sfn ogn-overlay /usr/local/sbin/overlay
+
+SYMLINK
 
 cat <<'FOOTER'
 # Hand over to the installer. Its output goes to the cloud-init log, which is

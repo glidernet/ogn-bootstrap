@@ -42,42 +42,18 @@ state_clear() {
 }
 
 # --- overlay -------------------------------------------------------------
-# On Trixie raspi-config drives Debian's overlayroot with a plain
-# overlayroot=tmpfs kernel parameter. That is a real improvement on the old
-# scheme, which baked a uname-specific initrd name into config.txt and so
-# broke silently across kernel upgrades.
-overlay_active()    { grep -q 'overlayroot=tmpfs' /proc/cmdline; }
-overlay_next_boot() { grep -q 'overlayroot=tmpfs' "$BOOT_DIR/cmdline.txt" 2>/dev/null; }
-
-overlay_status() {
-    local now next
-    overlay_active    && now=active   || now=inactive
-    overlay_next_boot && next=enabled || next=disabled
-    printf '%s now=%s next_boot=%s\n' "$next" "$now" "$next"
-}
-
+# The mechanism lives in ogn-common.sh, shared with the `overlay` command, so
+# the two cannot disagree about what "enabled" means.
 overlay_set() {
-    # raspi-config's convention is inverted: 0 enables, 1 disables.
     local want="$1"
-    command -v raspi-config >/dev/null || die "raspi-config is not installed; cannot manage the overlay"
     if [ "$want" = enable ]; then
-        raspi-config nonint do_overlayfs 0
+        overlay_ensure_initramfs || { warn "could not arrange for an initramfs"; return 1; }
+        overlay_preflight        || { warn "not enabling an overlay that would not engage"; return 1; }
+        swap_disable
+        cmdline_write "$OVERLAY_PARAM" 1
     else
-        raspi-config nonint do_overlayfs 1
+        cmdline_write "$OVERLAY_PARAM" 0
     fi
-}
-
-# Swap on a tmpfs overlay is pathological: the backing file lives in the RAM
-# upper layer, so the system pins memory to hold a "disk" that is itself
-# memory, and the overlay slowly fills. Disable the units that recreate it
-# rather than just swapoff, or it returns at the next boot.
-swap_disable() {
-    local u
-    swapoff -a 2>/dev/null || true
-    for u in rpi-setup-loop@var-swap.service rpi-resize-swap-file.service dphys-swapfile.service; do
-        systemctl disable --now "$u" >/dev/null 2>&1 || true
-    done
-    rm -f /var/swap 2>/dev/null || true
 }
 
 # --- the actual updating -------------------------------------------------
@@ -130,6 +106,10 @@ EOF
 # waits on the network -- which is the point for the wifi.
 config_sync() {
     local user group home link real target call lat lon old_freq
+
+    # Before anything that can bail out: this runs at every boot, including the
+    # middle boot of a maintenance cycle where the receiver is writable.
+    overlay_motd_update
 
     [ -r "$BOOT_CONF" ] || { log "no $BOOT_CONF on the card; nothing to sync"; return 0; }
     trap conf_cleanup EXIT
@@ -223,7 +203,8 @@ begin_cycle() {
     attempts=$(( $(state_count) + 1 ))
     log "disabling the read-only overlay and rebooting to apply updates"
     state_write updating "$attempts"
-    overlay_set disable
+    # Warn rather than abort: resume_cycle re-checks after the reboot.
+    overlay_set disable || warn "could not disable the overlay; the cycle will abort after the reboot"
     systemctl reboot
 }
 
@@ -233,7 +214,7 @@ resume_cycle() {
     if [ "$attempts" -gt "$MAX_ATTEMPTS" ]; then
         warn "maintenance has failed $attempts times; giving up and restoring the overlay"
         state_write restoring "$attempts"
-        overlay_set enable
+        overlay_set enable || warn "the overlay could not be re-enabled; this receiver will come up WRITABLE"
         state_clear
         systemctl reboot
         return 0
@@ -249,7 +230,7 @@ resume_cycle() {
     do_updates
     log "re-enabling the read-only overlay and rebooting"
     state_write restoring "$attempts"
-    overlay_set enable
+    overlay_set enable || warn "the overlay could not be re-enabled; this receiver will come up WRITABLE"
     state_clear
     systemctl reboot
 }
@@ -299,7 +280,7 @@ boot_check() {
                 state_clear
             else
                 warn "the overlay was not re-enabled after maintenance; re-enabling now"
-                overlay_set enable
+                overlay_set enable || warn "the overlay could not be re-enabled; this receiver will come up WRITABLE"
                 state_clear
                 systemctl reboot
             fi
@@ -344,7 +325,8 @@ esac
 need_root
 
 case "$MODE" in
-    overlay-enable)  swap_disable; overlay_set enable ;;
+    # For the installer; `overlay on` is the front end for people.
+    overlay-enable)  overlay_set enable ;;
     overlay-disable) overlay_set disable ;;
     boot-check)      boot_check ;;
     config-sync)     config_sync ;;

@@ -242,9 +242,13 @@ install_scripts() {
     install -m 0644 src/ogn-common.sh "$MNT/usr/local/lib/ogn-bootstrap/"
     local f
     for f in src/ogn-install src/ogn-update src/ogn-maintenance \
-             src/ogn-remote-admin src/ogn-calibrate; do
+             src/ogn-remote-admin src/ogn-calibrate src/ogn-overlay; do
         install -m 0755 "$f" "$MNT/usr/local/sbin/"
     done
+
+    # `overlay` is the name the documentation uses and the one anyone logging
+    # in to do a piece of maintenance will actually type.
+    ln -sfn ogn-overlay "$MNT/usr/local/sbin/overlay"
 
     # A snapshot of the release manifest, so a receiver on a slow or blocked
     # link still has something to resolve UpdateChannel against. ogn-update

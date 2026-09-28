@@ -210,9 +210,9 @@ conf_set_value() {
     {
         line = $0
         code = line
-        # libconfig takes # and // alike, and the templates in the wild use
-        # both. A brace inside a string value would corrupt the depth count,
-        # and no such line opens or closes a block anyway.
+        # Our own stripper, not libconfig: # and // only, no /* */. A block
+        # comment, or a brace inside a string, corrupts the depth count —
+        # neither appears in the template.
         sub(/\/\/.*$/, "", code)
         sub(/#.*$/, "", code)
         countable = (index(code, "\"") == 0)
@@ -455,6 +455,143 @@ boot_replace() {
     sync -f "$dest" 2>/dev/null || sync
     [ "$was_ro" -eq 1 ] && boot_ro
     return 0
+}
+
+# --------------------------------------------------------------------------
+# The read-only root overlay
+#
+# Debian's overlayroot, switched with overlayroot=tmpfs in cmdline.txt on the
+# FAT partition. Not /etc/overlayroot.conf: /etc is on the root filesystem,
+# which the overlay hides, so an edit there is discarded by the reboot meant
+# to apply it and the overlay could never be switched off from inside itself.
+# --------------------------------------------------------------------------
+CMDLINE_FILE="$BOOT_DIR/cmdline.txt"
+CONFIG_TXT="$BOOT_DIR/config.txt"
+OVERLAY_PARAM="overlayroot=tmpfs"
+
+overlay_active()    { grep -qw -- "$OVERLAY_PARAM" /proc/cmdline 2>/dev/null; }
+overlay_next_boot() { grep -qw -- "$OVERLAY_PARAM" "$CMDLINE_FILE" 2>/dev/null; }
+
+overlay_status() {
+    local now next
+    overlay_active    && now=active   || now=inactive
+    overlay_next_boot && next=enabled || next=disabled
+    printf '%s now=%s next_boot=%s\n' "$next" "$now" "$next"
+}
+
+# cmdline_write <param> <1 to add, 0 to remove>
+#
+# cmdline.txt is one line of space-separated parameters. Rebuilt from its own
+# tokens rather than patched with sed: no escaping to get wrong, no duplicates,
+# and no stray second line, which the bootloader would ignore.
+cmdline_write() {
+    local param="$1" want="$2" out
+    [ -r "$CMDLINE_FILE" ] || { warn "cannot read $CMDLINE_FILE"; return 1; }
+    out=$(LC_ALL=C awk -v param="$param" -v want="$want" '
+        { for (i = 1; i <= NF; i++) if ($i != param) toks[++n] = $i }
+        END {
+            if (want == "1") toks[++n] = param
+            line = ""
+            for (i = 1; i <= n; i++) line = line (i > 1 ? " " : "") toks[i]
+            print line
+        }' "$CMDLINE_FILE")
+    # A truncated cmdline.txt is an unbootable Pi. Never write one.
+    case "$out" in
+        ""|"$OVERLAY_PARAM") warn "refusing to write a suspiciously short $CMDLINE_FILE"; return 1 ;;
+    esac
+    printf '%s\n' "$out" | boot_replace "$CMDLINE_FILE"
+}
+
+# The parameter is inert without an initramfs to act on it, and that failure is
+# silent — the Pi boots normally and keeps writing to the card. Check first.
+overlay_preflight() {
+    local problems=0
+    if ! dpkg-query -W -f='${Status}' overlayroot 2>/dev/null | grep -q "ok installed"; then
+        warn "the overlayroot package is not installed"
+        problems=1
+    fi
+    if ! grep -qE '^[[:space:]]*auto_initramfs=1' "$CONFIG_TXT" 2>/dev/null; then
+        warn "auto_initramfs=1 is not set in $CONFIG_TXT, so no initramfs will be loaded"
+        problems=1
+    fi
+    return "$problems"
+}
+
+# auto_initramfs=1 picks up whatever initramfs-tools last built, so it survives
+# kernel upgrades; naming one file does not.
+overlay_ensure_initramfs() {
+    grep -qE '^[[:space:]]*auto_initramfs=1' "$CONFIG_TXT" 2>/dev/null && return 0
+    [ -r "$CONFIG_TXT" ] || { warn "no $CONFIG_TXT; cannot enable the initramfs"; return 1; }
+    log "adding auto_initramfs=1 to $CONFIG_TXT"
+    { cat "$CONFIG_TXT"; printf '\n# Load the initramfs the overlay needs. Added by ogn-bootstrap.\nauto_initramfs=1\n'; } \
+        | boot_replace "$CONFIG_TXT"
+}
+
+OVERLAY_MOTD=/etc/motd.d/30-ogn-overlay
+
+# overlay_motd_update — report the overlay in the login banner.
+#
+# A file rewritten at boot, not a script run per login: the live state is fixed
+# by the initramfs, so it cannot change while the system is up. What the next
+# boot will do can, and everything that changes it calls this.
+overlay_motd_update() {
+    local tmp
+    mkdir -p "$(dirname "$OVERLAY_MOTD")" 2>/dev/null || return 0
+    tmp=$(mktemp) || return 0
+    if overlay_active && overlay_next_boot; then
+        cat > "$tmp" <<'EOF'
+
+  Filesystem:  READ-ONLY. Anything you change is discarded at the next reboot.
+               To make a change stick:  sudo overlay off --reboot
+
+EOF
+    elif overlay_active; then
+        cat > "$tmp" <<'EOF'
+
+  Filesystem:  READ-ONLY for now, but switched OFF for the next boot.
+               Reboot and this receiver comes up writable.
+               Changed your mind?  sudo overlay on
+
+EOF
+    elif overlay_next_boot; then
+        cat > "$tmp" <<'EOF'
+
+  Filesystem:  WRITABLE, and read-only again after the next reboot.
+               Finish what you are doing, then:  sudo reboot
+
+EOF
+    else
+        cat > "$tmp" <<'EOF'
+
+  *** Filesystem: WRITABLE. The read-only overlay is OFF. ***
+
+  This receiver is writing to its SD card. That is fine while you are working
+  on it, and a bad way to leave it: a card written to continuously, on a
+  machine that loses power without warning, is the commonest way a receiver
+  dies in the field.
+
+  When you have finished:  sudo overlay on --reboot
+
+EOF
+    fi
+    # Only touch the file if it actually changed. This runs at every boot, and
+    # with the overlay off it is a write to the SD card.
+    cmp -s "$tmp" "$OVERLAY_MOTD" || install -m 0644 "$tmp" "$OVERLAY_MOTD" 2>/dev/null || true
+    rm -f "$tmp"
+    return 0
+}
+
+# Swap on a tmpfs overlay is pathological: the backing file lives in the RAM
+# upper layer, so the system pins memory to hold a "disk" that is itself
+# memory, and the overlay slowly fills. Disable the units that recreate it
+# rather than just swapoff, or it returns at the next boot.
+swap_disable() {
+    local u
+    swapoff -a 2>/dev/null || true
+    for u in rpi-setup-loop@var-swap.service rpi-resize-swap-file.service dphys-swapfile.service; do
+        systemctl disable --now "$u" >/dev/null 2>&1 || true
+    done
+    rm -f /var/swap 2>/dev/null || true
 }
 
 # --------------------------------------------------------------------------
@@ -1001,6 +1138,13 @@ systemctl daemon-reload
 # 12. Start it, or explain why not
 # ---------------------------------------------------------------------------
 VERSION=$(basename "$REAL_DIR")
+
+# The decoder's page is always HTTP.Port + 1 and not separately configurable.
+PORT=$(conf_get HTTP.Port 8082)
+case "$PORT" in
+    ''|*[!0-9]*) warn "HTTP.Port '$PORT' is not a number; assuming 8082"; PORT=8082 ;;
+esac
+
 if [ "$POSITION_OK" -eq 1 ]; then
     systemctl enable rtlsdr-ogn.service >/dev/null
     systemctl restart rtlsdr-ogn.service
@@ -1008,7 +1152,8 @@ if [ "$POSITION_OK" -eq 1 ]; then
     motd_set <<EOF
 
   OGN receiver $CALL — $VERSION
-  Status page:  http://$(hostname -s).local:$(conf_get HTTP.Port 8080)/
+  RF page:      http://$(hostname -s).local:$PORT/
+  Decoder page: http://$(hostname -s).local:$((PORT + 1))/
   Service:      systemctl status rtlsdr-ogn
   Logs:         journalctl -u ogn-decode -f
   Settings:     $TARGET_CONF
@@ -1038,14 +1183,33 @@ fi
 # ---------------------------------------------------------------------------
 # 13. Read-only root, last of all
 # ---------------------------------------------------------------------------
-if [ "$READONLY_FS" -eq 1 ]; then
-    # The boot partition is FAT, and FAT is what corrupts on an unclean power
-    # cycle. raspi-config refuses to change this once the overlay is active,
-    # so it has to happen first.
-    if ! grep -qE '^[^#]*/boot/firmware.*\bro\b' /etc/fstab; then
-        log "mounting the boot partition read-only"
-        raspi-config nonint do_bootro 0 || warn "could not set the boot partition read-only"
+# The boot partition is FAT, and FAT is what corrupts on an unclean power
+# cycle, so it is mounted read-only and opened only to write.
+#
+# Must run before the overlay goes on: /etc/fstab is on the root filesystem,
+# so an edit made with the overlay active is discarded.
+boot_partition_ro() {
+    local tmp rc=0
+    if ! grep -qE '^[^#][^[:space:]]*[[:space:]]+/boot/firmware[[:space:]]' /etc/fstab; then
+        warn "no /boot/firmware line in /etc/fstab; leaving the boot partition alone"
+        return 0
     fi
+    tmp=$(mktemp)
+    LC_ALL=C awk '
+        $1 !~ /^#/ && $2 == "/boot/firmware" && $4 !~ /(^|,)ro(,|$)/ { $4 = $4 ",ro"; changed = 1 }
+        { print }
+        END { exit(changed ? 0 : 1) }
+    ' /etc/fstab > "$tmp" || rc=$?
+    if [ "$rc" -eq 0 ]; then
+        install -m 0644 "$tmp" /etc/fstab
+        log "boot partition set read-only in /etc/fstab"
+    fi
+    rm -f "$tmp"
+    return 0
+}
+
+if [ "$READONLY_FS" -eq 1 ]; then
+    boot_partition_ro
 
     if ogn-maintenance --overlay-status | grep -q '^enabled'; then
         log "read-only overlay already enabled"
@@ -1057,6 +1221,10 @@ if [ "$READONLY_FS" -eq 1 ]; then
         fi
     fi
 fi
+
+# After step 13, so it reflects the overlay decision. Refreshed at every boot
+# thereafter by ogn-config-sync.
+overlay_motd_update
 
 date -Is | boot_write "$STATE_DIR/installed"
 
@@ -1273,42 +1441,18 @@ state_clear() {
 }
 
 # --- overlay -------------------------------------------------------------
-# On Trixie raspi-config drives Debian's overlayroot with a plain
-# overlayroot=tmpfs kernel parameter. That is a real improvement on the old
-# scheme, which baked a uname-specific initrd name into config.txt and so
-# broke silently across kernel upgrades.
-overlay_active()    { grep -q 'overlayroot=tmpfs' /proc/cmdline; }
-overlay_next_boot() { grep -q 'overlayroot=tmpfs' "$BOOT_DIR/cmdline.txt" 2>/dev/null; }
-
-overlay_status() {
-    local now next
-    overlay_active    && now=active   || now=inactive
-    overlay_next_boot && next=enabled || next=disabled
-    printf '%s now=%s next_boot=%s\n' "$next" "$now" "$next"
-}
-
+# The mechanism lives in ogn-common.sh, shared with the `overlay` command, so
+# the two cannot disagree about what "enabled" means.
 overlay_set() {
-    # raspi-config's convention is inverted: 0 enables, 1 disables.
     local want="$1"
-    command -v raspi-config >/dev/null || die "raspi-config is not installed; cannot manage the overlay"
     if [ "$want" = enable ]; then
-        raspi-config nonint do_overlayfs 0
+        overlay_ensure_initramfs || { warn "could not arrange for an initramfs"; return 1; }
+        overlay_preflight        || { warn "not enabling an overlay that would not engage"; return 1; }
+        swap_disable
+        cmdline_write "$OVERLAY_PARAM" 1
     else
-        raspi-config nonint do_overlayfs 1
+        cmdline_write "$OVERLAY_PARAM" 0
     fi
-}
-
-# Swap on a tmpfs overlay is pathological: the backing file lives in the RAM
-# upper layer, so the system pins memory to hold a "disk" that is itself
-# memory, and the overlay slowly fills. Disable the units that recreate it
-# rather than just swapoff, or it returns at the next boot.
-swap_disable() {
-    local u
-    swapoff -a 2>/dev/null || true
-    for u in rpi-setup-loop@var-swap.service rpi-resize-swap-file.service dphys-swapfile.service; do
-        systemctl disable --now "$u" >/dev/null 2>&1 || true
-    done
-    rm -f /var/swap 2>/dev/null || true
 }
 
 # --- the actual updating -------------------------------------------------
@@ -1361,6 +1505,10 @@ EOF
 # waits on the network -- which is the point for the wifi.
 config_sync() {
     local user group home link real target call lat lon old_freq
+
+    # Before anything that can bail out: this runs at every boot, including the
+    # middle boot of a maintenance cycle where the receiver is writable.
+    overlay_motd_update
 
     [ -r "$BOOT_CONF" ] || { log "no $BOOT_CONF on the card; nothing to sync"; return 0; }
     trap conf_cleanup EXIT
@@ -1454,7 +1602,8 @@ begin_cycle() {
     attempts=$(( $(state_count) + 1 ))
     log "disabling the read-only overlay and rebooting to apply updates"
     state_write updating "$attempts"
-    overlay_set disable
+    # Warn rather than abort: resume_cycle re-checks after the reboot.
+    overlay_set disable || warn "could not disable the overlay; the cycle will abort after the reboot"
     systemctl reboot
 }
 
@@ -1464,7 +1613,7 @@ resume_cycle() {
     if [ "$attempts" -gt "$MAX_ATTEMPTS" ]; then
         warn "maintenance has failed $attempts times; giving up and restoring the overlay"
         state_write restoring "$attempts"
-        overlay_set enable
+        overlay_set enable || warn "the overlay could not be re-enabled; this receiver will come up WRITABLE"
         state_clear
         systemctl reboot
         return 0
@@ -1480,7 +1629,7 @@ resume_cycle() {
     do_updates
     log "re-enabling the read-only overlay and rebooting"
     state_write restoring "$attempts"
-    overlay_set enable
+    overlay_set enable || warn "the overlay could not be re-enabled; this receiver will come up WRITABLE"
     state_clear
     systemctl reboot
 }
@@ -1530,7 +1679,7 @@ boot_check() {
                 state_clear
             else
                 warn "the overlay was not re-enabled after maintenance; re-enabling now"
-                overlay_set enable
+                overlay_set enable || warn "the overlay could not be re-enabled; this receiver will come up WRITABLE"
                 state_clear
                 systemctl reboot
             fi
@@ -1575,7 +1724,8 @@ esac
 need_root
 
 case "$MODE" in
-    overlay-enable)  swap_disable; overlay_set enable ;;
+    # For the installer; `overlay on` is the front end for people.
+    overlay-enable)  overlay_set enable ;;
     overlay-disable) overlay_set disable ;;
     boot-check)      boot_check ;;
     config-sync)     config_sync ;;
@@ -1897,15 +2047,27 @@ if awk "BEGIN{exit !($(conf_get RF.OGN.CenterFreq 868.8) > 900)}" 2>/dev/null; t
     BAND_OPT="--gsm-850"
 fi
 
+# gsm_scan defaults to device 0, which on a two-dongle receiver may be the
+# ADS-B stick — and the result is written back as though it were right. Follow
+# the same selection ogn-rf uses: DeviceSerial wins where set.
+DEV_SERIAL=$(conf_get RF.DeviceSerial "")
+if [ -n "$DEV_SERIAL" ]; then
+    DEV_OPT="--serial $DEV_SERIAL"
+    DEV_DESC="serial $DEV_SERIAL"
+else
+    DEV_OPT="--device $(conf_get RF.Device 0)"
+    DEV_DESC="device $(conf_get RF.Device 0)"
+fi
+
 # --ppm 0 deliberately, not a previous measurement: a stale estimate pulls the
 # scan off, and 0 is what a low-drift stick actually is.
 SCAN_GAIN=$(conf_get RF.GSM.Gain 25.0)
 
-[ "$QUIET" -eq 1 ] || log "scanning for GSM carriers (up to ${SCAN_TIMEOUT}s) — this needs the aerial connected"
+[ "$QUIET" -eq 1 ] || log "scanning for GSM carriers on $DEV_DESC (up to ${SCAN_TIMEOUT}s) — this needs the aerial connected"
 
 # shellcheck disable=SC2086
 OUT=$(cd "$INSTALL_DIR" && timeout "$SCAN_TIMEOUT" \
-      ./gsm_scan --ppm 0 --gain "$SCAN_GAIN" $BAND_OPT 2>&1) || true
+      ./gsm_scan --ppm 0 --gain "$SCAN_GAIN" $DEV_OPT $BAND_OPT 2>&1) || true
 
 # Too little or too much gain is gsm_scan's usual first answer. One pass cannot
 # fix that, so name the knob that can.
@@ -1984,6 +2146,141 @@ if [ "$FROM_CONFIG" -eq 1 ]; then
 fi
 OGN_PAYLOAD_ogn_calibrate
 chmod 0755 /usr/local/sbin/ogn-calibrate
+
+cat > /usr/local/sbin/ogn-overlay <<'OGN_PAYLOAD_ogn_overlay'
+#!/bin/bash
+#
+# ogn-overlay — turn the read-only root filesystem on and off by hand.
+#
+#   overlay status           what is on now, and after a reboot
+#   overlay off              come up writable at the next boot
+#   overlay on               go back to protected at the next boot
+#   overlay off --reboot     ... and reboot now
+#   overlay on  --reboot
+#
+# Also installed as `overlay`. For maintenance the weekly window does not
+# cover: with the overlay on, changes are discarded at the next boot.
+#
+#   sudo overlay off --reboot     # comes back writable
+#   ... do the work ...
+#   sudo overlay on --reboot      # back to protected
+#
+# Switching always takes effect at the next boot: the overlay is established by
+# the initramfs, before the root filesystem is mounted.
+#
+# Copyright (c) 2026 ifly7charlie. MIT licence, see LICENSE.
+
+set -euo pipefail
+
+LIBDIR="${OGN_LIBDIR:-/usr/local/lib/ogn-bootstrap}"
+# shellcheck source=src/ogn-common.sh
+. "$LIBDIR/ogn-common.sh"
+
+REBOOT=0
+ACTION=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        on|enable)    ACTION=on ;;
+        off|disable)  ACTION=off ;;
+        status)       ACTION=status ;;
+        --reboot)     REBOOT=1 ;;
+        -h|--help)    sed -n '3,19p' "$0"; exit 0 ;;
+        *)            die "unknown argument: $1  (try: overlay status)" ;;
+    esac
+    shift
+done
+
+# --------------------------------------------------------------------------
+# status — readable by anyone, so a check does not need sudo
+# --------------------------------------------------------------------------
+if [ "$ACTION" = status ] || [ -z "$ACTION" ]; then
+    if overlay_active; then
+        printf 'now:        ACTIVE — the root filesystem is read-only.\n'
+        printf '            Changes you make are discarded at the next reboot.\n'
+    else
+        printf 'now:        inactive — the root filesystem is writable.\n'
+        printf '            Changes you make persist, and are written to the SD card.\n'
+    fi
+    if overlay_next_boot; then
+        printf 'next boot:  ACTIVE\n'
+    else
+        printf 'next boot:  inactive\n'
+    fi
+    if overlay_active && ! overlay_next_boot; then
+        printf '\nA reboot will leave this receiver WRITABLE and unprotected.\n'
+        printf 'Run "sudo overlay on" to undo that.\n'
+    elif ! overlay_active && overlay_next_boot; then
+        printf '\nA reboot will make it read-only.\n'
+    fi
+    [ -z "$ACTION" ] && printf '\nTo change it:  sudo overlay off   |   sudo overlay on\n'
+    exit 0
+fi
+
+need_root
+
+# --------------------------------------------------------------------------
+# off — writable at the next boot
+# --------------------------------------------------------------------------
+if [ "$ACTION" = off ]; then
+    if ! overlay_next_boot; then
+        log "the overlay is already disabled for the next boot"
+    else
+        cmdline_write "$OVERLAY_PARAM" 0 || die "could not update $CMDLINE_FILE"
+        log "overlay disabled — the next boot will come up writable"
+    fi
+
+    overlay_motd_update
+
+    if overlay_active; then
+        warn "still read-only until you reboot"
+    fi
+    if [ "$REBOOT" -eq 1 ]; then
+        log "rebooting"
+        systemctl reboot
+    else
+        log "reboot when ready:  sudo reboot"
+    fi
+    exit 0
+fi
+
+# --------------------------------------------------------------------------
+# on — protected at the next boot
+# --------------------------------------------------------------------------
+overlay_ensure_initramfs || die "could not arrange for an initramfs to be loaded"
+
+if ! overlay_preflight; then
+    die "the overlay cannot be enabled safely yet — see the warnings above.
+     Fix those first: an overlayroot=tmpfs with nothing to act on boots
+     normally and keeps writing to the card, with nothing to tell you so."
+fi
+
+swap_disable
+
+if overlay_next_boot; then
+    log "the overlay is already enabled for the next boot"
+else
+    cmdline_write "$OVERLAY_PARAM" 1 || die "could not update $CMDLINE_FILE"
+    log "overlay enabled — the next boot will come up read-only"
+fi
+
+overlay_motd_update
+
+if ! overlay_active; then
+    warn "still writable until you reboot"
+fi
+if [ "$REBOOT" -eq 1 ]; then
+    log "rebooting"
+    systemctl reboot
+else
+    log "reboot when ready:  sudo reboot"
+fi
+OGN_PAYLOAD_ogn_overlay
+chmod 0755 /usr/local/sbin/ogn-overlay
+
+# `overlay` is the name the documentation uses, and the one anyone logging in
+# to do a piece of maintenance will actually type. ogn-overlay is the script;
+# this is the name that is memorable at 2am on an airfield.
+ln -sfn ogn-overlay /usr/local/sbin/overlay
 
 # Hand over to the installer. Its output goes to the cloud-init log, which is
 # /var/log/cloud-init-output.log, and to the journal.

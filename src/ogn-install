@@ -426,6 +426,13 @@ systemctl daemon-reload
 # 12. Start it, or explain why not
 # ---------------------------------------------------------------------------
 VERSION=$(basename "$REAL_DIR")
+
+# The decoder's page is always HTTP.Port + 1 and not separately configurable.
+PORT=$(conf_get HTTP.Port 8082)
+case "$PORT" in
+    ''|*[!0-9]*) warn "HTTP.Port '$PORT' is not a number; assuming 8082"; PORT=8082 ;;
+esac
+
 if [ "$POSITION_OK" -eq 1 ]; then
     systemctl enable rtlsdr-ogn.service >/dev/null
     systemctl restart rtlsdr-ogn.service
@@ -433,7 +440,8 @@ if [ "$POSITION_OK" -eq 1 ]; then
     motd_set <<EOF
 
   OGN receiver $CALL — $VERSION
-  Status page:  http://$(hostname -s).local:$(conf_get HTTP.Port 8080)/
+  RF page:      http://$(hostname -s).local:$PORT/
+  Decoder page: http://$(hostname -s).local:$((PORT + 1))/
   Service:      systemctl status rtlsdr-ogn
   Logs:         journalctl -u ogn-decode -f
   Settings:     $TARGET_CONF
@@ -463,14 +471,33 @@ fi
 # ---------------------------------------------------------------------------
 # 13. Read-only root, last of all
 # ---------------------------------------------------------------------------
-if [ "$READONLY_FS" -eq 1 ]; then
-    # The boot partition is FAT, and FAT is what corrupts on an unclean power
-    # cycle. raspi-config refuses to change this once the overlay is active,
-    # so it has to happen first.
-    if ! grep -qE '^[^#]*/boot/firmware.*\bro\b' /etc/fstab; then
-        log "mounting the boot partition read-only"
-        raspi-config nonint do_bootro 0 || warn "could not set the boot partition read-only"
+# The boot partition is FAT, and FAT is what corrupts on an unclean power
+# cycle, so it is mounted read-only and opened only to write.
+#
+# Must run before the overlay goes on: /etc/fstab is on the root filesystem,
+# so an edit made with the overlay active is discarded.
+boot_partition_ro() {
+    local tmp rc=0
+    if ! grep -qE '^[^#][^[:space:]]*[[:space:]]+/boot/firmware[[:space:]]' /etc/fstab; then
+        warn "no /boot/firmware line in /etc/fstab; leaving the boot partition alone"
+        return 0
     fi
+    tmp=$(mktemp)
+    LC_ALL=C awk '
+        $1 !~ /^#/ && $2 == "/boot/firmware" && $4 !~ /(^|,)ro(,|$)/ { $4 = $4 ",ro"; changed = 1 }
+        { print }
+        END { exit(changed ? 0 : 1) }
+    ' /etc/fstab > "$tmp" || rc=$?
+    if [ "$rc" -eq 0 ]; then
+        install -m 0644 "$tmp" /etc/fstab
+        log "boot partition set read-only in /etc/fstab"
+    fi
+    rm -f "$tmp"
+    return 0
+}
+
+if [ "$READONLY_FS" -eq 1 ]; then
+    boot_partition_ro
 
     if ogn-maintenance --overlay-status | grep -q '^enabled'; then
         log "read-only overlay already enabled"
@@ -482,6 +509,10 @@ if [ "$READONLY_FS" -eq 1 ]; then
         fi
     fi
 fi
+
+# After step 13, so it reflects the overlay decision. Refreshed at every boot
+# thereafter by ogn-config-sync.
+overlay_motd_update
 
 date -Is | boot_write "$STATE_DIR/installed"
 

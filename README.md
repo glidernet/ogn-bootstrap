@@ -104,7 +104,8 @@ listening before the receiver starts.
 Check it worked:
 
 ```
-http://<hostname>.local:8080/        status page
+http://<hostname>.local:8082/        RF status page
+http://<hostname>.local:8083/        decoder status page
 ssh <user>@<hostname>.local          then: systemctl status rtlsdr-ogn
 ```
 
@@ -136,7 +137,7 @@ at all", so it is worth being precise about how that is achieved.
 
 | | |
 |---|---|
-| Root filesystem | `overlayroot=tmpfs`. Every write goes to RAM and is discarded at reboot. |
+| Root filesystem | `overlayroot=tmpfs`, set in `cmdline.txt` on the boot partition. Every write goes to RAM and is discarded at reboot. Switch it with [`overlay`](#doing-maintenance-by-hand). |
 | Journal | `Storage=volatile`, capped at 32 MB. Lives in `/run`, never `/var/log/journal` — pinned explicitly rather than relying on the overlay, so it holds even with `ReadOnlyFS = false`. |
 | rsyslog | Not installed on Trixie. Disabled if something pulls it in, since it would write `/var/log/syslog` continuously. |
 | `atime` | Raspberry Pi OS already mounts root `noatime`. |
@@ -169,7 +170,7 @@ same SHA256 Imager itself uses, with a short and enumerable list of changes:
 | | |
 |---|---|
 | Packages installed | `rtl-sdr`, `librtlsdr0`, `libpng16-16t64`, `lynx`, `unattended-upgrades`, `overlayroot`, `autossh` — all from the Debian and Raspberry Pi archives |
-| Files added | the `ogn-*` scripts in `/usr/local`, `MyReceiver.conf` and the first-boot installer on the boot partition, and `/etc/ogn-bootstrap-image` recording what it was built from |
+| Files added | the `ogn-*` scripts in `/usr/local` (plus an `overlay` symlink to `ogn-overlay`), `MyReceiver.conf` and the first-boot installer on the boot partition, and `/etc/ogn-bootstrap-image` recording what it was built from |
 | Files changed | none |
 | Root filesystem | grown by 512 MB to fit the above; the Pi expands it to fill the card on first boot as usual |
 
@@ -360,6 +361,47 @@ sudo ogn-update --check             # installed vs available
 ```
 
 Set `MaintenanceWindow = ""` to never update automatically.
+
+### Doing maintenance by hand
+
+The weekly cycle covers security updates and new OGN releases. Anything else —
+installing a package, editing something under `/etc`, keeping a log across a
+reboot — needs the overlay out of the way, or it is silently discarded at the
+next boot. Nothing errors; the change simply is not there any more.
+
+`overlay` is the switch:
+
+```sh
+overlay status                # what is on now, and after a reboot. No sudo needed.
+sudo overlay off --reboot     # comes back writable
+  ... do the work ...
+sudo overlay on --reboot      # back to protected
+```
+
+Switching always takes effect at the **next boot**, never immediately: the
+overlay is established by the initramfs before the root filesystem is mounted,
+so nothing can be changed underneath a running system. `overlay off` without
+`--reboot` just arms it and tells you to reboot when you are ready.
+
+The login banner states the current setting every time, so you do not have to
+remember or go looking:
+
+```
+  Filesystem:  READ-ONLY. Anything you change is discarded at the next reboot.
+               To make a change stick:  sudo overlay off --reboot
+```
+
+and, when it is switched off, rather more insistently. It is refreshed at every
+boot — including the middle boot of a maintenance cycle, where the receiver is
+deliberately writable — because that is the only time the live state can change.
+A receiver left writable by accident is one power cut away from a dead card, and
+forgetting to switch it back is the easy mistake to make.
+
+The switch is the `overlayroot=tmpfs` kernel parameter in `cmdline.txt` on the
+boot partition — not `/etc/overlayroot.conf`, which is on the root filesystem
+and so is itself hidden by the overlay it would be configuring. `overlay on`
+refuses if the pieces it needs are not in place rather than arming a parameter
+that would quietly do nothing.
 
 ### How versions are trusted
 

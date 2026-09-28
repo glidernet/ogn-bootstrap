@@ -16,6 +16,10 @@ PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); printf '  ok   %s\n' "$1"; }
 bad()  { FAIL=$((FAIL+1)); printf '  FAIL %s\n' "$1"; [ $# -gt 1 ] && printf '       %s\n' "$2"; }
 is()   { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "expected [$3], got [$2]"; fi; }
+# Code with the comments stripped. Several of the names below appear in
+# comments on purpose, explaining what is deliberately no longer used, so a
+# plain grep would match the explanation and report the bug it warns about.
+code_of() { sed 's/[[:space:]]#.*$//; /^[[:space:]]*#/d' "$@"; }
 
 export OGN_LIBDIR="$PWD/src"
 # shellcheck source=src/ogn-common.sh
@@ -46,14 +50,30 @@ is "Latitude"                      "$(conf_get Position.Latitude)"             "
 is "Altitude"                      "$(conf_get Position.Altitude)"             "0"
 is "SampleRate"                    "$(conf_get RF.SampleRate)"                 "2.0"
 is "nested CenterFreq"             "$(conf_get RF.OGN.CenterFreq)"             "868.8"
-is "HTTP port"                     "$(conf_get HTTP.Port)"                     "8080"
+is "HTTP port"                     "$(conf_get HTTP.Port)"                     "8082"
 is "UpdateChannel"                 "$(conf_get Install.UpdateChannel)"         "stable"
 is "MaintenanceWindow keeps spaces" "$(conf_get Install.MaintenanceWindow)"    "Sun *-*-* 03:00:00"
 is "deeply nested RemoteAdmin"     "$(conf_get Install.RemoteAdmin.Connect)"   "false"
 is "FreqCorr ships as zero"        "$(conf_get RF.FreqCorr)"                   "+0"
-is "GSM channel ships as a default" "$(conf_get RF.GSM.CenterFreq)"            "938.6"
+is "GSM tracking ships switched off" "$(conf_get RF.GSM.CenterFreq)"           "0"
 is "GSM gain is not the OGN gain"  "$(conf_get RF.GSM.Gain)"                   "25.0"
 is "GeoidSepar deliberately absent"   "$(conf_get Position.GeoidSepar '<none>')" "<none>"
+
+# Dongle selection.
+is "Device selects the first stick" "$(conf_get RF.Device)"                     "0"
+is "DeviceSerial ships commented out" "$(conf_get RF.DeviceSerial '<none>')"    "<none>"
+
+# ADS-B is opt-in by absence.
+is "no ADSB section, so ADS-B is off" "$(conf_get ADSB.AVR '<none>')"           "<none>"
+is "and no MaxAlt either"             "$(conf_get ADSB.MaxAlt '<none>')"        "<none>"
+grep -q '^# ADSB:' boot/MyReceiver.conf \
+    && ok "the ADSB section is present but commented" \
+    || bad "the ADSB section is present but commented"
+
+# 8080 is left free for dump1090/readsb/tar1090.
+grep -qE '^[[:space:]]*Port[[:space:]]*=[[:space:]]*8080' boot/MyReceiver.conf \
+    && bad "8080 is left free for an ADS-B map" \
+    || ok "8080 is left free for an ADS-B map"
 conf_bool Install.ReadOnlyFS            && ok "ReadOnlyFS reads as true"  || bad "ReadOnlyFS reads as true"
 conf_bool Install.RemoteAdmin.OGNTeam   && bad "OGNTeam reads as false"   || ok "OGNTeam reads as false"
 conf_bool Nothing.At.All                && bad "missing key is false"     || ok "missing key is false"
@@ -102,11 +122,135 @@ for fn in boot_rw boot_ro boot_write; do
 done
 grep -q 'Storage=volatile' src/ogn-install && ok "journal is pinned to RAM" || bad "journal is pinned to RAM"
 grep -q 'RuntimeMaxUse' src/ogn-install && ok "journal size is capped" || bad "journal size is capped"
-grep -q 'do_bootro 0' src/ogn-install && ok "boot partition is set read-only" || bad "boot partition is set read-only"
+grep -q 'boot_partition_ro' src/ogn-install && ok "boot partition is set read-only" || bad "boot partition is set read-only"
+# raspi-config has no do_bootro entry point; enable_bootro is internal.
+code_of src/ogn-install | grep -q 'do_bootro' \
+    && bad "no call to the non-existent raspi-config do_bootro" \
+    || ok "no call to the non-existent raspi-config do_bootro"
 grep -q 'rsyslog' src/ogn-install && ok "rsyslog is disabled if present" || bad "rsyslog is disabled if present"
 grep -q 'boot_write "$STATE_FILE"' src/ogn-maintenance && ok "marker writes go through boot_write" || bad "marker writes go through boot_write"
 grep -q '\[ -e "$STATE_FILE" \] || return 0' src/ogn-maintenance \
     && ok "idle boots do not write to the card" || bad "idle boots do not write to the card"
+
+echo "== read-only overlay =="
+# Detection and the switch must name the same marker, or the overlay never
+# reads as enabled and maintenance writes its updates into RAM.
+is "one marker, defined once" "$OVERLAY_PARAM" "overlayroot=tmpfs"
+code_of src/ogn-* | grep -q 'do_overlayfs' \
+    && bad "raspi-config's overlay mechanism is not used" \
+    || ok "raspi-config's overlay mechanism is not used"
+code_of src/ogn-* | grep -q 'boot=overlay' \
+    && bad "no leftover boot=overlay marker" || ok "no leftover boot=overlay marker"
+for fn in overlay_active overlay_next_boot overlay_status cmdline_write \
+          overlay_preflight overlay_ensure_initramfs swap_disable; do
+    type "$fn" >/dev/null 2>&1 && ok "$fn is defined" || bad "$fn is defined"
+done
+
+# The switch lives on the FAT partition: /etc is hidden by the overlay it
+# would be configuring.
+grep -q 'CMDLINE_FILE="$BOOT_DIR/cmdline.txt"' src/ogn-common.sh \
+    && ok "the switch is on the boot partition" || bad "the switch is on the boot partition"
+code_of src/ogn-* | grep -q 'overlayroot\.conf' \
+    && bad "nothing depends on /etc/overlayroot.conf" \
+    || ok "nothing depends on /etc/overlayroot.conf"
+
+# cmdline.txt rewriting, for real: a truncated or two-line cmdline.txt is an
+# unbootable Pi, so this is worth exercising rather than grepping for.
+T=$(mktemp -d)
+BASE='console=serial0,115200 root=PARTUUID=abc rootfstype=ext4 fsck.repair=yes rootwait'
+CMDLINE_FILE="$T/cmdline.txt"
+printf '%s\n' "$BASE" > "$CMDLINE_FILE"
+cmdline_write "$OVERLAY_PARAM" 1 >/dev/null 2>&1
+is "enabling appends the parameter" "$(cat "$CMDLINE_FILE")" "$BASE $OVERLAY_PARAM"
+is "and cmdline.txt stays one line"  "$(wc -l < "$CMDLINE_FILE" | tr -d ' ')" "1"
+cmdline_write "$OVERLAY_PARAM" 1 >/dev/null 2>&1
+is "enabling twice does not duplicate it" \
+    "$(grep -c -o "$OVERLAY_PARAM" "$CMDLINE_FILE" | tr -d ' ')" "1"
+cmdline_write "$OVERLAY_PARAM" 0 >/dev/null 2>&1
+is "disabling removes it, leaving the rest alone" "$(cat "$CMDLINE_FILE")" "$BASE"
+cmdline_write "$OVERLAY_PARAM" 0 >/dev/null 2>&1
+is "disabling twice is harmless" "$(cat "$CMDLINE_FILE")" "$BASE"
+: > "$CMDLINE_FILE"
+cmdline_write "$OVERLAY_PARAM" 1 >/dev/null 2>&1 \
+    && bad "an empty cmdline.txt is refused, not written" \
+    || ok "an empty cmdline.txt is refused, not written"
+rm -rf "$T"
+CMDLINE_FILE="$BOOT_DIR/cmdline.txt"
+
+# The hand-operated command. `overlay` is the name people are told to type.
+grep -q 'ln -sfn ogn-overlay /usr/local/sbin/overlay' boot/vendor-data \
+    && ok "vendor-data installs the 'overlay' command" \
+    || bad "vendor-data installs the 'overlay' command"
+grep -q 'ln -sfn ogn-overlay' tools/build-image.sh \
+    && ok "and so does the image build" || bad "and so does the image build"
+for verb in 'on|enable' 'off|disable' 'status'; do
+    grep -qE "^ *$verb\)" src/ogn-overlay \
+        && ok "overlay takes '$verb'" || bad "overlay takes '$verb'"
+done
+# Checking the state should not need sudo; changing it must.
+S=$(grep -n 'ACTION" = status' src/ogn-overlay | head -1 | cut -d: -f1)
+R=$(grep -n '^need_root' src/ogn-overlay | head -1 | cut -d: -f1)
+if [ -n "$S" ] && [ -n "$R" ] && [ "$S" -lt "$R" ]; then
+    ok "overlay status works without sudo, changes do not"
+else
+    bad "overlay status works without sudo, changes do not"
+fi
+# Arming a parameter with no initramfs to act on boots normally and keeps
+# writing to the card, with nothing to say so. Refuse instead.
+grep -q 'overlay_preflight' src/ogn-overlay \
+    && ok "enabling checks it would actually engage" \
+    || bad "enabling checks it would actually engage"
+grep -q 'auto_initramfs=1' src/ogn-common.sh \
+    && ok "an initramfs is arranged for, by a name that survives kernel upgrades" \
+    || bad "an initramfs is arranged for, by a name that survives kernel upgrades"
+
+# The login banner, refreshed at every boot.
+type overlay_motd_update >/dev/null 2>&1 \
+    && ok "overlay_motd_update is defined" || bad "overlay_motd_update is defined"
+grep -q 'overlay_motd_update' src/ogn-maintenance \
+    && ok "the boot-time config sync refreshes it" \
+    || bad "the boot-time config sync refreshes it"
+grep -q 'overlay_motd_update' src/ogn-install \
+    && ok "the installer writes it once set up" || bad "the installer writes it once set up"
+is "overlay_motd_update runs before config_sync can bail out" \
+    "$(awk '/^config_sync\(\)/,/BOOT_CONF" \]/' src/ogn-maintenance | grep -c 'overlay_motd_update')" "1"
+grep -c 'overlay_motd_update' src/ogn-overlay | grep -q '^2$' \
+    && ok "both overlay on and overlay off refresh it" \
+    || bad "both overlay on and overlay off refresh it"
+
+# All four states say something.
+T=$(mktemp -d)
+OVERLAY_MOTD="$T/motd"
+for now in 0 1; do
+    for next in 0 1; do
+        eval "overlay_active()    { return $((1 - now)); }"
+        eval "overlay_next_boot() { return $((1 - next)); }"
+        overlay_motd_update
+        if [ -s "$OVERLAY_MOTD" ]; then
+            ok "active=$now next=$next produces a banner"
+        else
+            bad "active=$now next=$next produces a banner"
+        fi
+    done
+done
+# The one state worth shouting about.
+overlay_active()    { return 1; }
+overlay_next_boot() { return 1; }
+overlay_motd_update
+grep -q 'WRITABLE' "$OVERLAY_MOTD" \
+    && ok "an unprotected receiver says so loudly" || bad "an unprotected receiver says so loudly"
+# Rewriting identical content would be a pointless SD card write every boot.
+cp "$OVERLAY_MOTD" "$T/before"
+touch -t 200001010000 "$OVERLAY_MOTD"
+overlay_motd_update
+if [ "$OVERLAY_MOTD" -nt "$T/before" ]; then
+    bad "an unchanged banner is not rewritten at every boot"
+else
+    ok "an unchanged banner is not rewritten at every boot"
+fi
+rm -rf "$T"
+unset -f overlay_active overlay_next_boot
+. src/ogn-common.sh
 
 echo "== wifi from the card =="
 conf_load boot/MyReceiver.conf
@@ -290,6 +434,17 @@ grep -q 'printf "%s%s = %s;   # %s' src/ogn-common.sh \
 grep -q 'gsm_scan --ppm' src/ogn-calibrate \
     && ok "gsm_scan is called with flags, as the examples show" \
     || bad "gsm_scan is called with flags, as the examples show"
+
+# gsm_scan defaults to device 0, which may be the ADS-B stick.
+grep -q 'conf_get RF.DeviceSerial' src/ogn-calibrate \
+    && ok "calibration follows DeviceSerial when it is set" \
+    || bad "calibration follows DeviceSerial when it is set"
+grep -q 'conf_get RF.Device 0' src/ogn-calibrate \
+    && ok "and falls back to the Device index" \
+    || bad "and falls back to the Device index"
+grep -q 'gsm_scan --ppm 0 --gain "\$SCAN_GAIN" \$DEV_OPT' src/ogn-calibrate \
+    && ok "and passes that selection to gsm_scan" \
+    || bad "and passes that selection to gsm_scan"
 
 grep -q 'conf_has RF.FreqCorr' src/ogn-install \
     && bad "the installer no longer calibrates unasked" \
