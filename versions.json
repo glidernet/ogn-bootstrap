@@ -28,12 +28,14 @@
       "arm64": {
         "url": "http://download.glidernet.org/arm64/rtlsdr-ogn-bin-arm64-0.3.2.tgz",
         "md5": "ac659a05f45a27b59667758aac26b073",
-        "sha256": null
+        "sha256": "400a53849c440cfdce533297637200385077c7c576ccb98ab8d0eed8d9c54319",
+        "size": 357448
       },
       "armhf": {
         "url": "http://download.glidernet.org/arm/rtlsdr-ogn-bin-ARM-0.3.2.tgz",
         "md5": "33a1f70c74538660274fa653e9ba6503",
-        "sha256": null
+        "sha256": "0fa9865295a3d60334e5a02aeacd4b02b0d94dd95547b02333e69884d0f271fc",
+        "size": 423893
       }
     }
   }
