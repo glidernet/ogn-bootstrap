@@ -22,7 +22,16 @@ STATE_DIR="$BOOT_DIR/ogn-bootstrap"
 CONFIG_APPLIED="$STATE_DIR/config.applied"
 # shellcheck disable=SC2034
 INSTALL_APPLIED="$STATE_DIR/install.applied"
-MANIFEST_URL="${OGN_MANIFEST_URL:-https://raw.githubusercontent.com/glidernet/ogn-bootstrap/master/versions.json}"
+# A test image follows its branch's versions.json, as recorded in the image
+# stamp by build-image.sh. raw.githubusercontent.com only: its TLS is what
+# makes the SHA256s trustworthy.
+IMAGE_STAMP="${OGN_IMAGE_STAMP:-/etc/ogn-bootstrap-image}"
+MANIFEST_URL="${OGN_MANIFEST_URL:-}"
+if [ -z "$MANIFEST_URL" ] && [ -r "$IMAGE_STAMP" ]; then
+    MANIFEST_URL=$(sed -n 's|^OGN_MANIFEST_URL=\(https://raw\.githubusercontent\.com/.*\)$|\1|p' "$IMAGE_STAMP" | head -n 1)
+fi
+MANIFEST_MASTER_URL="https://raw.githubusercontent.com/glidernet/ogn-bootstrap/master/versions.json"
+MANIFEST_URL="${MANIFEST_URL:-$MANIFEST_MASTER_URL}"
 MANIFEST_CACHE="/var/lib/ogn-bootstrap/versions.json"
 MOTD_FILE="/etc/motd.d/10-ogn-bootstrap"
 
@@ -286,6 +295,23 @@ fetch() {
          -o "$dest" "$url"
 }
 
+# network_wait <host> — wait up to OGN_NETWORK_WAIT seconds (default 300) for
+# <host> to resolve. First-boot wifi takes longer than curl's retries.
+network_wait() {
+    local host="$1" limit="${OGN_NETWORK_WAIT:-300}" waited=0
+    while ! getent hosts "$host" >/dev/null 2>&1; do
+        if [ "$waited" -ge "$limit" ]; then
+            warn "no network after ${waited}s: cannot resolve $host"
+            return 1
+        fi
+        [ $((waited % 30)) -eq 0 ] && log "waiting for the network (cannot resolve $host yet)"
+        sleep 5
+        waited=$((waited + 5))
+    done
+    [ "$waited" -gt 0 ] && log "network is up after ${waited}s"
+    return 0
+}
+
 verify_sha256() {
     local file="$1" expected="$2" actual
     [ -n "$expected" ] || die "no expected SHA256 supplied for $file"
@@ -312,6 +338,10 @@ verify_md5() {
 # json_get uses python3, which Raspberry Pi OS Lite ships. Keeping the manifest
 # as JSON means tools/add-version and the GitHub action can edit it safely.
 # --------------------------------------------------------------------------
+manifest_download() {
+    fetch "$1" "$2" && python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$2"
+}
+
 manifest_fetch() {
     local tmp
     if ! mkdir -p "$(dirname "$MANIFEST_CACHE")" 2>/dev/null; then
@@ -321,7 +351,14 @@ manifest_fetch() {
         return 1
     fi
     tmp=$(mktemp)
-    if fetch "$MANIFEST_URL" "$tmp" && python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$tmp"; then
+    if manifest_download "$MANIFEST_URL" "$tmp"; then
+        mv "$tmp" "$MANIFEST_CACHE"
+        return 0
+    fi
+    # The branch may since have been deleted.
+    if [ "$MANIFEST_URL" != "$MANIFEST_MASTER_URL" ] \
+       && manifest_download "$MANIFEST_MASTER_URL" "$tmp"; then
+        warn "could not fetch $MANIFEST_URL; using master's version manifest instead"
         mv "$tmp" "$MANIFEST_CACHE"
         return 0
     fi

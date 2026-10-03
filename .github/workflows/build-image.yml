@@ -91,9 +91,11 @@ jobs:
         run: tools/build-vendor-data && git diff --exit-code boot/vendor-data
 
       - name: Build
-        run: sudo --preserve-env=OGN_VERSION tools/build-image.sh
+        run: sudo --preserve-env=OGN_VERSION,OGN_MANIFEST_REPO,OGN_MANIFEST_REF tools/build-image.sh
         env:
           OGN_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || format('dev-{0}', github.sha) }}
+          OGN_MANIFEST_REPO: ${{ github.repository }}
+          OGN_MANIFEST_REF: ${{ github.ref_type == 'tag' && 'master' || github.ref_name }}
 
       - name: Summarise
         run: |

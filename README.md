@@ -112,6 +112,13 @@ ssh <user>@<hostname>.local          then: systemctl status rtlsdr-ogn
 Within a few minutes the receiver should appear on
 [live.glidernet.org](https://live.glidernet.org).
 
+No network at first boot is not fatal. The installer waits up to five minutes
+for one, and if it still cannot download the decoder it tries again every 15
+minutes and at every boot until it succeeds — so plugging the cable in, or
+fixing the wifi on the card, is enough. `systemctl status
+ogn-install-retry.timer` shows it waiting, and
+`/var/log/cloud-init-output.log` and `journalctl -u ogn-install-retry` say why.
+
 ## What it sets up
 
 | | |
@@ -172,8 +179,8 @@ same SHA256 Imager itself uses, with a short and enumerable list of changes:
 
 | | |
 |---|---|
-| Packages installed | `rtl-sdr`, `librtlsdr0`, `libpng16-16t64`, `lynx`, `unattended-upgrades`, `overlayroot`, `autossh`, `wireguard-tools`, `readsb`, `mlat-client-adsbfi` — all from the Debian and Raspberry Pi archives |
-| Files added | the `ogn-*` scripts in `/usr/local` (plus an `overlay` symlink to `ogn-overlay`), `MyReceiver.conf` and the first-boot installer on the boot partition, and `/etc/ogn-bootstrap-image` recording what it was built from |
+| Packages installed | `rtl-sdr`, `librtlsdr0`, `libpng16-16t64`, `lynx`, `unattended-upgrades`, `overlayroot`, `autossh`, `wireguard-tools`, `mlat-client-adsbfi` — all from the Debian and Raspberry Pi archives — plus `readsb` built from [upstream](https://github.com/wiedehopf/readsb) at a pinned tag, because Debian's build has no RTL-SDR support |
+| Files added | a `readsb.service` drop-in that leaves out `--write-json`, the `ogn-*` scripts in `/usr/local` (plus an `overlay` symlink to `ogn-overlay`), `MyReceiver.conf` and the first-boot installer on the boot partition, and `/etc/ogn-bootstrap-image` recording what it was built from |
 | Files changed | none |
 | Root filesystem | grown by 512 MB to fit the above; the Pi expands it to fill the card on first boot as usual |
 
@@ -343,7 +350,7 @@ Optional, off by default, and nothing to do with ordinary OGN reception.
 
 A second SDR stick listening on 1090 MHz picks up ADS-B: airliners, and any
 transponder-equipped traffic that FLARM never shows. The image ships
-[`readsb`](https://github.com/adsbfi/readsb) to decode it and hands the result
+[`readsb`](https://github.com/wiedehopf/readsb) to decode it and hands the result
 to the OGN decoder, so that traffic reaches the network alongside the gliders.
 You can also share it with tracking sites, which is a separate decision taken
 site by site.
@@ -438,7 +445,7 @@ Beast on 30005 and raw AVR on 30002 for them to read.
 
 ### What it does not do
 
-There is no map. Debian packages no web interface for `readsb`, and
+There is no map. The image ships no web interface for `readsb`, and
 `tar1090` is an install script from GitHub rather than a package, so bundling it
 would mean fetching and running third-party code on every image. Port 8080 is
 left free for one if you want to add it yourself.

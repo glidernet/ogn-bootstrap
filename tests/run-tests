@@ -120,6 +120,46 @@ case "$(manifest_field 0.3.2 arm64 sha256)" in
     *)            ok "sha256 is populated" ;;
 esac
 
+echo "== which manifest an image trusts =="
+manifest_url_with() {
+    local stamp; stamp=$(mktemp)
+    printf '%s\n' "$1" > "$stamp"
+    ( unset OGN_MANIFEST_URL; OGN_IMAGE_STAMP="$stamp"; . src/ogn-common.sh; printf '%s' "$MANIFEST_URL" )
+    rm -f "$stamp"
+}
+MASTER_URL=https://raw.githubusercontent.com/glidernet/ogn-bootstrap/master/versions.json
+BRANCH_URL=https://raw.githubusercontent.com/glidernet/ogn-bootstrap/some/branch/versions.json
+is "no stamp: master"                 "$(manifest_url_with 'OGN_IMAGE_VERSION=dev')" "$MASTER_URL"
+is "a test image: its own branch"     "$(manifest_url_with "OGN_MANIFEST_URL=$BRANCH_URL")" "$BRANCH_URL"
+is "anything but raw GitHub: master"  "$(manifest_url_with 'OGN_MANIFEST_URL=http://example.com/versions.json')" "$MASTER_URL"
+is "the environment still wins" \
+   "$(OGN_MANIFEST_URL=https://x.test/v.json OGN_IMAGE_STAMP=/nonexistent bash -c '. src/ogn-common.sh; printf %s "$MANIFEST_URL"')" \
+   "https://x.test/v.json"
+# Only URLs in REACHABLE answer, each with a manifest naming itself.
+fetched_from() {
+    local dir; dir=$(mktemp -d)
+    (
+        MANIFEST_URL="$1"; REACHABLE="$2"; MANIFEST_CACHE="$dir/cache.json"
+        [ -n "${3:-}" ] && printf '{"from": "cache"}' > "$MANIFEST_CACHE"
+        fetch() { case " $REACHABLE " in *" $1 "*) printf '{"from": "%s"}' "$1" > "$2" ;; *) return 22 ;; esac; }
+        manifest_fetch 2>/dev/null || { printf 'FAILED'; exit; }
+        python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["from"], end="")' "$MANIFEST_CACHE"
+    )
+    rm -rf "$dir"
+}
+is "the branch's manifest while the branch exists" "$(fetched_from "$BRANCH_URL" "$BRANCH_URL $MASTER_URL" cached)" "$BRANCH_URL"
+is "master's once it has gone"                     "$(fetched_from "$BRANCH_URL" "$MASTER_URL" cached)" "$MASTER_URL"
+is "the cached copy with no network at all"        "$(fetched_from "$BRANCH_URL" "" cached)" "cache"
+is "and nothing to fall back on is an error"       "$(fetched_from "$BRANCH_URL" "")" "FAILED"
+is "master is not tried twice"                     "$(fetched_from "$MASTER_URL" "" cached)" "cache"
+grep -q 'OGN_MANIFEST_URL=https://raw.githubusercontent.com/$MANIFEST_REPO/$MANIFEST_REF/versions.json' tools/build-image.sh \
+    && ok "the image build records it" || bad "the image build records it"
+grep -q "OGN_MANIFEST_REF: \${{ github.ref_type == 'tag' && 'master' || github.ref_name }}" .github/workflows/build-image.yml \
+    && ok "a release follows master, a branch build its branch" \
+    || bad "a release follows master, a branch build its branch"
+grep -q 'preserve-env=.*OGN_MANIFEST_REF' .github/workflows/build-image.yml \
+    && ok "and sudo passes it through" || bad "and sudo passes it through"
+
 echo "== SD card write protection =="
 for fn in boot_rw boot_ro boot_write; do
     type "$fn" >/dev/null 2>&1 && ok "$fn is defined" || bad "$fn is defined"
@@ -310,6 +350,32 @@ rm -rf "$T"
 unset -f overlay_active overlay_next_boot
 . src/ogn-common.sh
 
+python3 - <<'PY' && ok "systemd-remount-fs stands down under the overlay" || bad "systemd-remount-fs stands down under the overlay"
+src = open("src/ogn-install").read()
+dropin = src.split("systemd-remount-fs.service.d/ogn-overlay.conf <<EOF", 1)[1].split("\nEOF", 1)[0]
+assert "ConditionKernelCommandLine=!$OVERLAY_PARAM" in dropin, dropin
+# Not inside the ReadOnlyFS branch: the overlay can be switched on later.
+assert "systemd-remount-fs" not in src.split('if [ "$READONLY_FS" -eq 1 ]; then', 1)[1]
+PY
+is "and the parameter it matches is the one the overlay uses" "$OVERLAY_PARAM" "overlayroot=tmpfs"
+
+echo "== the decoders run under procServ =="
+python3 - <<'PY2' && ok "both decoders get a terminal, logging to the journal" || bad "both decoders get a terminal, logging to the journal"
+import re
+src = open("src/ogn-install").read()
+fn = src.split("on_procserv() {", 1)[1].split("\n}", 1)[0]
+for flag in ("--foreground", "--logfile=-", "--oneshot"):
+    assert flag in fn, flag
+# The console is localhost only. --allow gives the child's stdin to the network.
+assert "--allow" not in fn
+for name, port in (("ogn-rf", 50000), ("ogn-decode", 50001)):
+    unit = src.split(f"write_unit {name}.service <<EOF", 1)[1].split("\nEOF", 1)[0]
+    assert f'ExecStart=$(on_procserv {port} {name} "$REAL_DIR/{name}" MyReceiver.conf)' in unit, name
+    assert "Restart=always" in unit, name
+PY2
+grep -qE '^PACKAGES=\(.* procserv\)' src/ogn-install && ok "the installer asks for procserv" || bad "the installer asks for procserv"
+grep -qE '^    procserv$' tools/build-image.sh && ok "and the image ships it" || bad "and the image ships it"
+
 echo "== wifi from the card =="
 conf_load boot/MyReceiver.conf
 is "shipped template leaves SSID empty" "$(conf_get Network.Wifi.SSID '<empty>')" "<empty>"
@@ -400,6 +466,78 @@ STUBEOF
 wifi_apply >/dev/null 2>&1 && ok "no wifi interface is survivable" || bad "no wifi interface is survivable"
 
 PATH="$OLD_PATH"; rm -rf "$STUB"; unset NMCLI_LOG
+
+echo "== waiting for the network =="
+# getent fails GETENT_FAILS times; sleep only records.
+STUB=$(mktemp -d)
+export GETENT_FAILS="$STUB/fails" SLEEP_LOG="$STUB/sleeps"
+cat > "$STUB/getent" <<'STUBEOF'
+#!/bin/bash
+n=$(cat "$GETENT_FAILS")
+[ "$n" -gt 0 ] || exit 0
+echo $((n - 1)) > "$GETENT_FAILS"; exit 2
+STUBEOF
+cat > "$STUB/sleep" <<'STUBEOF'
+#!/bin/bash
+echo "$1" >> "$SLEEP_LOG"
+STUBEOF
+chmod +x "$STUB/getent" "$STUB/sleep"
+OLD_PATH="$PATH"; PATH="$STUB:$PATH"
+
+echo 0 > "$GETENT_FAILS"; : > "$SLEEP_LOG"
+network_wait example.org >/dev/null 2>&1 && ok "a resolving host returns at once" || bad "a resolving host returns at once"
+is "and does not sleep" "$(wc -l < "$SLEEP_LOG" | tr -d ' ')" "0"
+
+echo 3 > "$GETENT_FAILS"; : > "$SLEEP_LOG"
+network_wait example.org >/dev/null 2>&1 && ok "waits for the network to arrive" || bad "waits for the network to arrive"
+is "polling every 5s until it does" "$(wc -l < "$SLEEP_LOG" | tr -d ' ')" "3"
+
+echo 1000 > "$GETENT_FAILS"; : > "$SLEEP_LOG"
+OGN_NETWORK_WAIT=20 network_wait example.org >/dev/null 2>&1 \
+    && bad "gives up after OGN_NETWORK_WAIT" || ok "gives up after OGN_NETWORK_WAIT"
+is "having waited that long and no longer" "$(wc -l < "$SLEEP_LOG" | tr -d ' ')" "4"
+grep -q 'OGN_NETWORK_WAIT:-300' src/ogn-common.sh \
+    && ok "the limit defaults to five minutes" || bad "the limit defaults to five minutes"
+
+PATH="$OLD_PATH"; rm -rf "$STUB"; unset GETENT_FAILS SLEEP_LOG
+
+python3 - <<'PY' && ok "the installer waits for the network before downloading" || bad "the installer waits for the network before downloading"
+src = open("src/ogn-install").read()
+w, n, u = src.index("\nwifi_apply\n"), src.index("\nnetwork_wait "), src.index("ogn-update --channel")
+assert w < n < u, (w, n, u)
+assert "network_wait download.glidernet.org || true" in src, "network_wait must not end the install"
+PY
+
+echo "== a failed first install retries itself =="
+python3 - <<'PY' && ok "the retry timer is armed before anything can fail" || bad "the retry timer is armed before anything can fail"
+src = open("src/ogn-install").read()
+arm = src.index("systemctl enable ogn-install-retry.timer")
+assert arm < src.index('if [ ! -r "$BOOT_CONF" ]'), "armed after the config check"
+assert arm < src.index("\nwifi_apply\n")
+assert src.index("trap install_exit EXIT") < src.index('if [ ! -r "$BOOT_CONF" ]')
+# Only one EXIT trap: a later `trap ... EXIT` would silently replace it.
+assert src.count("EXIT\n") - src.count("trap install_exit EXIT\n") == 0, "a second EXIT trap"
+PY
+python3 - <<'PY' && ok "and only until the first install succeeds" || bad "and only until the first install succeeds"
+import re
+src = open("src/ogn-install").read()
+assert re.search(r'^if \[ ! -e "\$INSTALLED_MARKER" \]; then\n    FIRST_INSTALL=1', src, re.M)
+for name in ("service", "timer"):
+    unit = src.split(f"write_unit ogn-install-retry.{name} <<EOF", 1)[1].split("\nEOF", 1)[0]
+    assert "ConditionPathExists=!$INSTALLED_MARKER" in unit, name
+svc = src.split("write_unit ogn-install-retry.service <<EOF", 1)[1].split("\nEOF", 1)[0]
+assert re.search(r"^Wants=network-online\.target", svc, re.M)
+assert "RemainAfterExit" not in svc, "RemainAfterExit stops the timer re-running it"
+tmr = src.split("write_unit ogn-install-retry.timer <<EOF", 1)[1].split("\nEOF", 1)[0]
+assert "OnBootSec=" in tmr and "OnUnitInactiveSec=" in tmr
+# The marker is written last, and the timer is disarmed after it.
+mark = src.index('date -Is | boot_write "$INSTALLED_MARKER"')
+assert mark < src.index("systemctl disable ogn-install-retry.timer")
+assert mark > src.index("ogn-update --channel")
+PY
+grep -q 'flock -w' src/ogn-install \
+    && ok "the timer and a person cannot run it at once" \
+    || bad "the timer and a person cannot run it at once"
 
 echo "== WireGuard from the card =="
 conf_load boot/MyReceiver.conf

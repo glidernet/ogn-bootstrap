@@ -32,6 +32,74 @@ done
 need_root
 mkdir -p /var/lib/ogn-bootstrap
 
+# The retry timer and a person at the keyboard can both start this.
+exec 9>/run/ogn-install.lock
+flock -w 60 9 || die "another ogn-install is already running"
+
+write_unit() {
+    local name="$1" tmp
+    tmp=$(mktemp)
+    cat > "$tmp"
+    if ! cmp -s "$tmp" "/etc/systemd/system/$name"; then
+        install -m 0644 "$tmp" "/etc/systemd/system/$name"
+        log "updated $name"
+    fi
+    rm -f "$tmp"
+}
+
+# ---------------------------------------------------------------------------
+# 0. Retry a failed first install
+#
+# cloud-init runs this only once, so a first boot without network would leave
+# a dead receiver. The timer reruns it until the "installed" marker exists.
+# Not armed on an installed receiver, so a failed re-run does not loop.
+# ---------------------------------------------------------------------------
+INSTALLED_MARKER="$STATE_DIR/installed"
+FIRST_INSTALL=0
+if [ ! -e "$INSTALLED_MARKER" ]; then
+    FIRST_INSTALL=1
+    install -d -m 0755 /etc/systemd/system
+    write_unit ogn-install-retry.service <<EOF
+[Unit]
+Description=OGN receiver: retry a first install that did not finish
+Documentation=https://github.com/glidernet/ogn-bootstrap
+After=network-online.target cloud-final.service
+Wants=network-online.target
+ConditionPathExists=!$INSTALLED_MARKER
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ogn-install
+TimeoutStartSec=30min
+EOF
+    write_unit ogn-install-retry.timer <<EOF
+[Unit]
+Description=OGN receiver: retry a first install that did not finish
+Documentation=https://github.com/glidernet/ogn-bootstrap
+ConditionPathExists=!$INSTALLED_MARKER
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=15min
+
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl enable ogn-install-retry.timer >/dev/null 2>&1 || true
+fi
+
+install_exit() {
+    local rc=$?
+    conf_cleanup || true
+    # Enabled covers the next boot; started covers this one.
+    if [ "$rc" -ne 0 ] && [ "$FIRST_INSTALL" -eq 1 ] && [ ! -e "$INSTALLED_MARKER" ]; then
+        systemctl start --no-block ogn-install-retry.timer >/dev/null 2>&1 || true
+        printf '%s ogn-bootstrap: install did not finish; retrying every 15 minutes and at every boot (systemctl status ogn-install-retry.timer)\n' "$(date -Is)" >&2
+    fi
+}
+trap install_exit EXIT
+
 # ---------------------------------------------------------------------------
 # 1. Read and sanity-check the configuration
 # ---------------------------------------------------------------------------
@@ -53,7 +121,6 @@ fi
 
 log "reading $BOOT_CONF"
 conf_load "$BOOT_CONF"
-trap conf_cleanup EXIT
 
 OGN_USER=$(detect_ogn_user) || die "could not work out which account to install for; pass OGN_USER_OVERRIDE"
 OGN_HOME=$(user_home "$OGN_USER")
@@ -108,20 +175,18 @@ WINDOW=$(conf_get Install.MaintenanceWindow "")
 # ---------------------------------------------------------------------------
 wifi_apply
 
+# Not fatal: if it never comes, step 4 fails and the retry timer takes over.
+network_wait download.glidernet.org || true
+
 # ---------------------------------------------------------------------------
 # 2. Packages
 #
 # Trixie substitutions worth knowing: libconfig9 -> libconfig11 (and the 0.3.2
 # binaries static-link it anyway), ntp/ntpdate are gone entirely, and the
 # decoder needs libpng16 rather than the libjpeg8 the old guides all mention.
-#
-# procServ and telnet are deliberately absent. The older images ran both
-# binaries inside procServ so you could telnet to ports 50000/50001 and watch
-# the console. Here they are ordinary systemd services, so the same output is
-# in the journal -- which survives, is rotated, and can be read remotely --
-# and there is no console to attach to. `journalctl -u ogn-decode -f`.
+# procserv: see on_procserv.
 # ---------------------------------------------------------------------------
-PACKAGES=(rtl-sdr librtlsdr0 libpng16-16t64 lynx curl ca-certificates unattended-upgrades)
+PACKAGES=(rtl-sdr librtlsdr0 libpng16-16t64 lynx curl ca-certificates unattended-upgrades procserv)
 [ "$READONLY_FS" -eq 1 ] && PACKAGES+=(overlayroot)
 conf_bool Install.RemoteAdmin.OGNTeam && PACKAGES+=(autossh)
 # Network.WireGuard is not in the Install section, so switching it on later
@@ -204,15 +269,13 @@ fi
 # ---------------------------------------------------------------------------
 install -d -m 0755 /etc/systemd/system
 
-write_unit() {
-    local name="$1" tmp
-    tmp=$(mktemp)
-    cat > "$tmp"
-    if ! cmp -s "$tmp" "/etc/systemd/system/$name"; then
-        install -m 0644 "$tmp" "/etc/systemd/system/$name"
-        log "updated $name"
-    fi
-    rm -f "$tmp"
+# on_procserv <port> <name> <command...> — ExecStart running it under procServ.
+# ogn-rf segfaults without a terminal on stdin; procServ provides one, plus the
+# console on localhost:<port>. Logs go to the journal; --oneshot leaves
+# restarts to systemd. Never add --allow: it opens the console to the network.
+on_procserv() {
+    local port="$1" name="$2"; shift 2
+    printf '/usr/bin/procServ --foreground --logfile=- --oneshot --name=%s %s %s' "$name" "$port" "$*"
 }
 
 write_unit ogn-rf.service <<EOF
@@ -227,7 +290,7 @@ Wants=time-sync.target
 Type=simple
 User=$OGN_USER
 WorkingDirectory=$REAL_DIR
-ExecStart=$REAL_DIR/ogn-rf MyReceiver.conf
+ExecStart=$(on_procserv 50000 ogn-rf "$REAL_DIR/ogn-rf" MyReceiver.conf)
 Restart=always
 RestartSec=10
 StandardOutput=journal
@@ -246,7 +309,7 @@ Wants=time-sync.target
 Type=simple
 User=$OGN_USER
 WorkingDirectory=$REAL_DIR
-ExecStart=$REAL_DIR/ogn-decode MyReceiver.conf
+ExecStart=$(on_procserv 50001 ogn-decode "$REAL_DIR/ogn-decode" MyReceiver.conf)
 Restart=always
 RestartSec=10
 StandardOutput=journal
@@ -305,6 +368,15 @@ RuntimeWatchdogSec=15
 RebootWatchdogSec=3min
 EOF
 
+# systemd-remount-fs fails on an overlay root ("No changes allowed in
+# reconfigure") and leaves the system "degraded". It has nothing to do there.
+install -d -m 0755 /etc/systemd/system/systemd-remount-fs.service.d
+cat > /etc/systemd/system/systemd-remount-fs.service.d/ogn-overlay.conf <<EOF
+# Skipped under the read-only overlay. Installed by ogn-bootstrap.
+[Unit]
+ConditionKernelCommandLine=!$OVERLAY_PARAM
+EOF
+
 # ---------------------------------------------------------------------------
 # 9. Logs
 #
@@ -319,10 +391,8 @@ EOF
 #   RuntimeMaxUse     capped, because the flip side of a journal in RAM is a
 #                     journal competing with the decoder for RAM.
 #
-# This is also why the services log to the journal rather than running under
-# procServ as the older images did: procServ writes plain files under
-# /var/log, which persist whenever the overlay is off, and it never rotates
-# them.
+# Hence procServ logs to the journal, not the unrotated /var/log files the
+# older images used.
 # ---------------------------------------------------------------------------
 install -d -m 0755 /etc/systemd/journald.conf.d
 cat > /etc/systemd/journald.conf.d/10-ogn.conf <<'EOF'
@@ -675,7 +745,12 @@ fi
 overlay_motd_update
 overlay_state_publish
 
-date -Is | boot_write "$STATE_DIR/installed"
+date -Is | boot_write "$INSTALLED_MARKER"
+
+if [ "$FIRST_INSTALL" -eq 1 ]; then
+    systemctl disable ogn-install-retry.timer >/dev/null 2>&1 || true
+    systemctl stop --no-block ogn-install-retry.timer >/dev/null 2>&1 || true
+fi
 
 # What the card said when we last acted on it: ogn-config-sync watches the
 # first, ogn-boot-check the second. Written last, so a failed install does not

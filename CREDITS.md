@@ -53,11 +53,13 @@ time. If you are packaging this further, that distinction matters.
 
 ## ADS-B
 
-ADS-B reception uses [`readsb`](https://github.com/adsbfi/readsb) and
-[`mlat-client`](https://github.com/adsbfi/mlat-client), both **GPL-3.0** and
-both taken from the Debian archive as ordinary packages. Nothing is vendored,
-patched or rebuilt here: `/etc/default/readsb` is generated from the card, and
-that is the whole of the integration.
+ADS-B reception uses [`readsb`](https://github.com/wiedehopf/readsb) and
+[`mlat-client`](https://github.com/adsbfi/mlat-client), both **GPL-3.0**.
+`mlat-client` is the ordinary Debian package. `readsb` is not: Debian builds it
+without RTL-SDR support, so the image builds it unmodified from upstream's
+pinned release tag, using upstream's own Debian packaging with the `rtlsdr`
+build profile. Nothing is vendored or patched: `/etc/default/readsb` is
+generated from the card, and that is the whole of the integration.
 
 The tracking sites a receiver can be told to feed — [ADS-B
 Exchange](https://www.adsbexchange.com/), [adsb.fi](https://adsb.fi/),
@@ -75,8 +77,10 @@ mostly GPL, with the rest spelled out per package in `/usr/share/doc/*/copyright
 inside the image itself.
 
 We add no modified binaries, and everything we do add is the MIT-licensed
-content of this repository. For the GPL components, the corresponding source is
-the same source Debian and Raspberry Pi publish:
+content of this repository plus the `readsb` build above. Its corresponding
+source is in the image itself, at `/usr/share/doc/readsb/readsb-<tag>.tar.gz`.
+For every other GPL component, the corresponding source is the same source
+Debian and Raspberry Pi publish:
 
 - `https://deb.debian.org/debian` and `https://sources.debian.org`
 - `https://archive.raspberrypi.com/debian`
