@@ -666,8 +666,16 @@ EOF
 # upper layer, so the system pins memory to hold a "disk" that is itself
 # memory, and the overlay slowly fills. Disable the units that recreate it
 # rather than just swapoff, or it returns at the next boot.
+#
+# On Trixie the units come from rpi-swap-generator, regenerated under /run at
+# every boot, so `systemctl disable` cannot touch them; only its own config
+# can. Must be written while the root filesystem is still writable.
+SWAP_DROPIN="${OGN_SWAP_DROPIN:-/etc/rpi/swap.conf.d/90-ogn-bootstrap.conf}"
 swap_disable() {
     local u
+    install -d -m 0755 "$(dirname "$SWAP_DROPIN")"
+    printf '# Written by ogn-bootstrap: no swap under the read-only overlay.\n[Main]\nMechanism=none\n' \
+        > "$SWAP_DROPIN"
     swapoff -a 2>/dev/null || true
     for u in rpi-setup-loop@var-swap.service rpi-resize-swap-file.service dphys-swapfile.service; do
         systemctl disable --now "$u" >/dev/null 2>&1 || true
