@@ -940,6 +940,295 @@ wireguard_apply() {
 }
 
 # --------------------------------------------------------------------------
+# ADS-B from the card
+#
+# The same argument as WireGuard above: /etc/default/readsb is a rendering of
+# ADSB.* rather than configuration in its own right. Under the read-only
+# overlay /etc is RAM and forgets itself at every reboot, so it has to be.
+#
+# Nothing here writes to the card, and nothing anywhere writes continuously:
+# readsb is started with no --write-json, because this image ships no map and
+# a JSON directory rewritten every second is precisely the wear the overlay
+# exists to prevent. The multilateration clients keep their settings in /run
+# for the same reason.
+# --------------------------------------------------------------------------
+ADSB_DEFAULT="${OGN_ADSB_DEFAULT:-/etc/default/readsb}"
+ADSB_MLAT_DIR="${OGN_ADSB_MLAT_DIR:-/run/ogn-bootstrap/mlat}"
+ADSB_MOTD="${OGN_ADSB_MOTD:-/etc/motd.d/50-ogn-adsb}"
+
+# readsb's own port conventions, and the ones every ADS-B instruction written
+# for a Pi assumes: raw AVR out, Beast out, and Beast in for MLAT results.
+ADSB_AVR_PORT=30002
+ADSB_BEAST_PORT=30005
+ADSB_MLAT_IN_PORT=30104
+
+# The sites this receiver knows how to feed, and the only ones a tick box can
+# reach. Kept here rather than on the card so that a hostname cannot be
+# mistyped into a receiver nobody can get back to, and so that what a given
+# setting sends, and to whom, can be read in one place.
+#
+# All four take Beast on 30004 and multilateration on 31090.
+ADSB_FEEDS="ADSBExchange ADSBFi ADSBLol AirplanesLive"
+ADSB_FEED_PORT=30004
+ADSB_MLAT_PORT=31090
+
+adsb_feed_host() {
+    case "$1" in
+        ADSBExchange)  printf 'feed.adsbexchange.com' ;;
+        ADSBFi)        printf 'feed.adsb.fi' ;;
+        ADSBLol)       printf 'feed.adsb.lol' ;;
+        AirplanesLive) printf 'feed.airplanes.live' ;;
+        *)             return 1 ;;
+    esac
+}
+
+# systemd instance names, so it reads ogn-mlat@adsbfi rather than @ADSBFi.
+adsb_feed_instance() { printf '%s' "$1" | tr 'A-Z' 'a-z'; }
+
+# The feeds switched on, one per line. Needs conf_load first.
+adsb_enabled_feeds() {
+    local f
+    for f in $ADSB_FEEDS; do
+        conf_bool "ADSB.Feed.$f" false && printf '%s\n' "$f"
+    done
+    return 0
+}
+
+# A number, possibly negative, possibly with a decimal point. readsb's -10
+# means "let the tuner decide", so a bare - is not enough to reject on.
+adsb_number_ok() { printf '%s' "$1" | grep -Eq '^-?[0-9]+(\.[0-9]+)?$'; }
+
+# adsb_render — print /etc/default/readsb from the loaded card settings.
+#
+# Pure: reads the config, writes stdout, touches nothing. Returns 1, saying
+# what is wrong, rather than rendering something that cannot work.
+adsb_render() {
+    local serial ogn_serial gain custom entry host f conn="" feeds="" ok=1
+
+    serial=$(conf_get ADSB.DeviceSerial "")
+    ogn_serial=$(conf_get RF.DeviceSerial "")
+    gain=$(conf_get ADSB.Gain -10)
+    custom=$(conf_get ADSB.Feed.Custom "")
+
+    [ -n "$serial" ] || {
+        warn "ADSB.DeviceSerial is empty; it wants the serial of the 1090 MHz stick"; ok=0; }
+
+    # Two dongles and only one of them named is the trap this whole section is
+    # built around: RF.Device is an index, indexes are handed out in USB
+    # enumeration order, and so the OGN decoder can open the ADS-B stick and
+    # hear nothing for reasons nothing reports.
+    if [ -z "$ogn_serial" ]; then
+        warn "ADS-B needs RF.DeviceSerial set as well, so the OGN decoder cannot open the ADS-B stick by accident"
+        ok=0
+    elif [ "$serial" = "$ogn_serial" ]; then
+        warn "ADSB.DeviceSerial and RF.DeviceSerial are both '$serial'; one stick cannot do 868 and 1090 at once"
+        ok=0
+    fi
+
+    adsb_number_ok "$gain" || { warn "ADSB.Gain ('$gain') is not a number"; ok=0; }
+
+    # Multilateration works by comparing arrival times between receivers, so a
+    # receiver that is not where it says it is makes everyone else's answers
+    # worse. Refuse rather than quietly feed a template default.
+    if conf_bool ADSB.Feed.MLAT false; then
+        local lat lon
+        lat=$(conf_get Position.Latitude 0)
+        lon=$(conf_get Position.Longitude 0)
+        if awk "BEGIN{exit !($lat == 0 && $lon == 0)}" 2>/dev/null; then
+            warn "ADSB.Feed.MLAT needs a real Position; it is still 0,0"
+            ok=0
+        elif awk "BEGIN{exit !($lat < -90 || $lat > 90 || $lon < -180 || $lon > 180)}" 2>/dev/null; then
+            warn "ADSB.Feed.MLAT needs a real Position; $lat,$lon is out of range"
+            ok=0
+        fi
+        [ -n "$(adsb_enabled_feeds)" ] || {
+            warn "ADSB.Feed.MLAT is on but no site is switched on to send it to"; ok=0; }
+    fi
+
+    for f in $(adsb_enabled_feeds); do
+        host=$(adsb_feed_host "$f") || continue
+        conn="$conn --net-connector $host,$ADSB_FEED_PORT,beast_reduce_plus_out"
+        feeds="$feeds $f"
+    done
+
+    # Custom is a comma-separated scalar rather than a libconfig array,
+    # because the flattener keeps an array as one opaque bracketed string and
+    # conf_get has no way to take it apart.
+    local IFS_SAVE="$IFS"
+    IFS=','
+    for entry in $custom; do
+        IFS="$IFS_SAVE"
+        entry=$(printf '%s' "$entry" | tr -d '[:space:]')
+        [ -n "$entry" ] || continue
+        case "$entry" in
+            *:[0-9]*) conn="$conn --net-connector ${entry%:*},${entry##*:},beast_reduce_plus_out" ;;
+            *)        warn "ADSB.Feed.Custom entry '$entry' is not host:port"; ok=0 ;;
+        esac
+        IFS=','
+    done
+    IFS="$IFS_SAVE"
+
+    [ "$ok" -eq 1 ] || return 1
+
+    printf '# Generated from %s by ogn-bootstrap. Edit the card, not this file:\n' "$BOOT_CONF"
+    printf '# this is rewritten from ADSB at every boot.\n'
+    printf '#\n'
+    if [ -n "$feeds" ]; then
+        printf '# Sharing with:%s\n' "$feeds"
+    else
+        printf '# Not shared with anyone: the OGN decoder reads it on %s and that is all.\n' "$ADSB_AVR_PORT"
+    fi
+    printf '\n'
+    printf 'RECEIVER_OPTIONS="--device %s --device-type rtlsdr --gain %s --ppm 0"\n' "$serial" "$gain"
+    printf 'DECODER_OPTIONS="--max-range 360"\n'
+    printf 'NET_OPTIONS="--net --net-heartbeat 60 --net-ro-port %s --net-bo-port %s --net-bi-port %s%s"\n' \
+        "$ADSB_AVR_PORT" "$ADSB_BEAST_PORT" "$ADSB_MLAT_IN_PORT" "$conn"
+    # Deliberately empty. A map would want --write-json; this image ships none,
+    # and the directory would be rewritten every second for nobody to read.
+    printf 'JSON_OPTIONS=""\n'
+    return 0
+}
+
+# adsb_mlat_render <feed> — print the environment for one ogn-mlat@ instance.
+#
+# Pure, as above. mlat-client reads Beast from readsb and sends its answers
+# back in on ADSB_MLAT_IN_PORT, so multilaterated aircraft reach OGN too.
+adsb_mlat_render() {
+    local feed="$1" host call
+    host=$(adsb_feed_host "$feed") || { warn "no multilateration server known for '$feed'"; return 1; }
+    call=$(conf_get APRS.Call "")
+    [ -n "$call" ] || { warn "APRS.Call is empty; multilateration servers want a station name"; return 1; }
+
+    printf 'MLAT_SERVER=%s:%s\n' "$host" "$ADSB_MLAT_PORT"
+    printf 'MLAT_LAT=%s\n'   "$(conf_get Position.Latitude 0)"
+    printf 'MLAT_LON=%s\n'   "$(conf_get Position.Longitude 0)"
+    printf 'MLAT_ALT=%s\n'   "$(conf_get Position.Altitude 0)"
+    printf 'MLAT_CALL=%s\n'  "$call"
+    printf 'MLAT_INPUT=localhost:%s\n'   "$ADSB_BEAST_PORT"
+    printf 'MLAT_RESULTS=beast,connect,localhost:%s\n' "$ADSB_MLAT_IN_PORT"
+    return 0
+}
+
+# adsb_down — stop decoding, stop feeding, and forget how.
+adsb_down() {
+    local f inst
+    if systemctl is-enabled --quiet readsb 2>/dev/null || systemctl is-active --quiet readsb 2>/dev/null; then
+        log "switching ADS-B off"
+        systemctl disable --now readsb >/dev/null 2>&1 || true
+    fi
+    for f in $ADSB_FEEDS; do
+        inst=$(adsb_feed_instance "$f")
+        systemctl is-enabled --quiet "ogn-mlat@$inst.service" 2>/dev/null \
+            && systemctl disable --now "ogn-mlat@$inst.service" >/dev/null 2>&1 || true
+        rm -f "$ADSB_MLAT_DIR/$inst.env"
+    done
+    rm -f "$ADSB_DEFAULT" "$ADSB_MOTD"
+    return 0
+}
+
+# adsb_mlat_apply — one mlat-client per site that is switched on, and none
+# for any that is not. Returns 1 if a wanted one could not be configured.
+adsb_mlat_apply() {
+    local f inst tmp on=0 rc=0
+    conf_bool ADSB.Feed.MLAT false && on=1
+    [ "$on" -eq 1 ] && install -d -m 0755 "$ADSB_MLAT_DIR" 2>/dev/null
+
+    for f in $ADSB_FEEDS; do
+        inst=$(adsb_feed_instance "$f")
+        if [ "$on" -eq 1 ] && conf_bool "ADSB.Feed.$f" false; then
+            tmp=$(mktemp) || return 1
+            if ! adsb_mlat_render "$f" > "$tmp"; then
+                rm -f "$tmp"; rc=1; continue
+            fi
+            if ! cmp -s "$tmp" "$ADSB_MLAT_DIR/$inst.env"; then
+                install -m 0644 "$tmp" "$ADSB_MLAT_DIR/$inst.env"
+                systemctl restart "ogn-mlat@$inst.service" >/dev/null 2>&1 || true
+            fi
+            rm -f "$tmp"
+            systemctl is-enabled --quiet "ogn-mlat@$inst.service" 2>/dev/null \
+                || systemctl enable --now "ogn-mlat@$inst.service" >/dev/null 2>&1 || true
+        else
+            systemctl is-enabled --quiet "ogn-mlat@$inst.service" 2>/dev/null \
+                && systemctl disable --now "ogn-mlat@$inst.service" >/dev/null 2>&1 || true
+            rm -f "$ADSB_MLAT_DIR/$inst.env"
+        fi
+    done
+    return $rc
+}
+
+# What this receiver is sharing with, in a form fit for a one-line summary.
+adsb_feed_summary() {
+    local f out=""
+    for f in $(adsb_enabled_feeds); do
+        out="$out, $(adsb_feed_host "$f")"
+    done
+    if [ -z "$out" ]; then printf 'OGN only'; else printf 'OGN%s' "$out"; fi
+}
+
+ADSB_MOTD_TEMPLATE='
+  ADS-B:       readsb on stick %s, feeding %s
+               Is it hearing anything?  sudo ogn-adsb status
+
+'
+adsb_motd_update() {
+    local tmp
+    mkdir -p "$(dirname "$ADSB_MOTD")" 2>/dev/null || return 0
+    tmp=$(mktemp) || return 0
+    # shellcheck disable=SC2059
+    printf "$ADSB_MOTD_TEMPLATE" \
+        "$(conf_get ADSB.DeviceSerial '?')" "$(adsb_feed_summary)" > "$tmp"
+    cmp -s "$tmp" "$ADSB_MOTD" || install -m 0644 "$tmp" "$ADSB_MOTD" 2>/dev/null || true
+    rm -f "$tmp"
+    return 0
+}
+
+# adsb_apply — make ADSB the live state. Needs conf_load first. Returns 1
+# only when ADS-B was asked for and could not be provided, so that the unit
+# holding this reports a failure someone can see.
+adsb_apply() {
+    local tmp changed=0
+
+    if ! conf_bool ADSB.Enable false; then
+        adsb_down
+        return 0
+    fi
+
+    if ! command -v readsb >/dev/null 2>&1; then
+        warn "ADSB.Enable is true but readsb is not installed"
+        return 1
+    fi
+
+    tmp=$(mktemp)
+    if ! adsb_render > "$tmp"; then
+        rm -f "$tmp"
+        warn "ADS-B is enabled but not usably configured; leaving the receiver alone"
+        return 1
+    fi
+
+    if cmp -s "$tmp" "$ADSB_DEFAULT" && systemctl is-active --quiet readsb 2>/dev/null; then
+        rm -f "$tmp"
+    else
+        install -d -m 0755 "$(dirname "$ADSB_DEFAULT")"
+        install -m 0644 "$tmp" "$ADSB_DEFAULT"
+        rm -f "$tmp"
+        changed=1
+    fi
+
+    if [ "$changed" -eq 1 ]; then
+        log "starting readsb on the ADS-B stick"
+        systemctl enable readsb >/dev/null 2>&1 || true
+        if ! systemctl restart readsb >/dev/null 2>&1; then
+            warn "readsb would not start; see journalctl -u readsb"
+            return 1
+        fi
+    fi
+
+    adsb_mlat_apply || { adsb_motd_update; return 1; }
+    adsb_motd_update
+    return 0
+}
+
+# --------------------------------------------------------------------------
 # MOTD
 # --------------------------------------------------------------------------
 motd_set() {

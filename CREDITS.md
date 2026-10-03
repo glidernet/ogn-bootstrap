@@ -51,6 +51,21 @@ and checksums; each receiver downloads from
 [download.glidernet.org](http://download.glidernet.org) itself, at install
 time. If you are packaging this further, that distinction matters.
 
+## ADS-B
+
+ADS-B reception uses [`readsb`](https://github.com/adsbfi/readsb) and
+[`mlat-client`](https://github.com/adsbfi/mlat-client), both **GPL-3.0** and
+both taken from the Debian archive as ordinary packages. Nothing is vendored,
+patched or rebuilt here: `/etc/default/readsb` is generated from the card, and
+that is the whole of the integration.
+
+The tracking sites a receiver can be told to feed — [ADS-B
+Exchange](https://www.adsbexchange.com/), [adsb.fi](https://adsb.fi/),
+[adsb.lol](https://adsb.lol/) and [airplanes.live](https://airplanes.live/) —
+are independent of this project and of OGN. They are listed here because the
+software knows their addresses, not because they endorse anything. Each is off
+until an operator switches it on.
+
 ## The published image
 
 The `.img.xz` released here is Raspberry Pi OS Lite (64-bit) with packages from

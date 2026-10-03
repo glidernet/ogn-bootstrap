@@ -124,6 +124,7 @@ Within a few minutes the receiver should appear on
 | Weekly maintenance | security updates and OGN upgrades, in a window you choose |
 | Config resync | `MyReceiver.conf` is re-read from the card at every boot, so an edit takes effect without a login |
 | WireGuard | Optional, off by default: a tunnel out to a VPN server of your own, so you can reach the receiver from anywhere |
+| ADS-B | Optional, off by default: a second dongle on 1090 MHz, feeding OGN and any tracking sites you pick |
 | Geoid data | `WW15MGH.DAC`, so altitudes are right without hand-tuning |
 
 Nothing is exposed to the internet, and no remote access is enabled, unless
@@ -143,6 +144,7 @@ at all", so it is worth being precise about how that is achieved.
 | rsyslog | Not installed on Trixie. Disabled if something pulls it in, since it would write `/var/log/syslog` continuously. |
 | `atime` | Raspberry Pi OS already mounts root `noatime`. |
 | Swap | Disabled, along with the units that recreate it. A swapfile on a tmpfs overlay pins RAM to hold a "disk" that is itself RAM. |
+| ADS-B | `readsb` runs with no `--write-json`, and the multilateration settings are rendered into `/run`. Nothing it does touches the card. |
 | Boot partition | Mounted **read-only** — and `umask=0077`, so the credentials on it are root's alone; see [Credentials on the card](#credentials-on-the-card) — and made writable only for the moment it takes to write the maintenance marker — a handful of writes per week, each flushed and dropped straight back to read-only. |
 
 That last one matters most. The root filesystem can hide behind the overlay,
@@ -170,7 +172,7 @@ same SHA256 Imager itself uses, with a short and enumerable list of changes:
 
 | | |
 |---|---|
-| Packages installed | `rtl-sdr`, `librtlsdr0`, `libpng16-16t64`, `lynx`, `unattended-upgrades`, `overlayroot`, `autossh` — all from the Debian and Raspberry Pi archives |
+| Packages installed | `rtl-sdr`, `librtlsdr0`, `libpng16-16t64`, `lynx`, `unattended-upgrades`, `overlayroot`, `autossh`, `wireguard-tools`, `readsb`, `mlat-client-adsbfi` — all from the Debian and Raspberry Pi archives |
 | Files added | the `ogn-*` scripts in `/usr/local` (plus an `overlay` symlink to `ogn-overlay`), `MyReceiver.conf` and the first-boot installer on the boot partition, and `/etc/ogn-bootstrap-image` recording what it was built from |
 | Files changed | none |
 | Root filesystem | grown by 512 MB to fit the above; the Pi expands it to fill the card on first boot as usual |
@@ -335,6 +337,118 @@ guessing `inactive`, which is the comfortable wrong answer. `ogn-maintenance
 --status` does the same with the maintenance state.
 
 
+## ADS-B
+
+Optional, off by default, and nothing to do with ordinary OGN reception.
+
+A second SDR stick listening on 1090 MHz picks up ADS-B: airliners, and any
+transponder-equipped traffic that FLARM never shows. The image ships
+[`readsb`](https://github.com/adsbfi/readsb) to decode it and hands the result
+to the OGN decoder, so that traffic reaches the network alongside the gliders.
+You can also share it with tracking sites, which is a separate decision taken
+site by site.
+
+Both packages come from the Debian archive like everything else here. Nothing
+is downloaded from a tracking site, and no account or key is needed for any of
+this.
+
+### Setting it up
+
+You need a second dongle, and a 1090 MHz aerial — the stock whip that came with
+the stick will hear aircraft overhead and not a great deal else.
+
+Give the two dongles different serial numbers first, so they cannot trade
+places when something is re-plugged:
+
+```sh
+rtl_test                  # lists what is plugged in, with index and serial
+rtl_eeprom -d 0 -s 868    # the OGN stick
+rtl_eeprom -d 1 -s 1090   # the ADS-B stick
+```
+
+Then, on the card, set `RF.DeviceSerial` to the OGN stick and uncomment the
+`ADSB` section:
+
+```c
+RF:
+{
+  DeviceSerial = "868";
+} ;
+
+ADSB:
+{
+  Enable       = true;
+  DeviceSerial = "1090";
+  Gain         = -10;
+
+  AVR    = "localhost:30002";
+  MaxAlt = 18000;
+} ;
+```
+
+Reboot, and `sudo ogn-adsb status` will tell you whether it is decoding
+anything.
+
+Setting **both** serials is required, not merely advisable, and `ogn-adsb`
+refuses to start without them. `RF.Device` is an index, indexes are handed out
+in USB enumeration order, and so a receiver that names only one stick can hand
+the OGN decoder the 1090 one after a re-plug — which looks exactly like an
+aerial fault and is the single most common way to lose a day to this.
+
+### Sharing it
+
+Everything above is local: the ADS-B stays on the Pi and goes to OGN, which is
+where this receiver's data already goes. To send it anywhere else, switch that
+site on:
+
+```c
+  Feed:
+  {
+    ADSBExchange  = false;
+    ADSBFi        = false;
+    ADSBLol       = false;
+    AirplanesLive = false;
+
+    MLAT          = false;
+
+    Custom        = "";
+  } ;
+```
+
+Each one makes this receiver connect out to that site and stream every aircraft
+it hears, continuously, for as long as it is switched on. None of them needs an
+account or a sharing key, none of them can reach back in, and the hostnames are
+in the software rather than on the card so there is nothing to mistype. Your
+decision, site by site.
+
+`MLAT` is multilateration: the sites compare the arrival times of the same
+signal at several receivers to place aircraft that broadcast no position of
+their own. It sends your timings to whichever sites are switched on, and it
+needs `Position` to be right to a few metres — a receiver that is not where it
+says it is makes everybody else's answers worse, so `ogn-adsb` refuses to feed
+multilateration from a position that is still `0,0`.
+
+`Custom` takes `"host:port, host:port"` for anywhere else that accepts Beast.
+
+FlightAware, Flightradar24 and Plane Finder are **not** in that list. Each needs
+its own feeder software downloaded from the vendor — proprietary binaries, in
+two of the three cases — rather than a package from Debian, so none of it ships
+here. You can install them by hand alongside this; `readsb` is already serving
+Beast on 30005 and raw AVR on 30002 for them to read.
+
+### What it does not do
+
+There is no map. Debian packages no web interface for `readsb`, and
+`tar1090` is an install script from GitHub rather than a package, so bundling it
+would mean fetching and running third-party code on every image. Port 8080 is
+left free for one if you want to add it yourself.
+
+`readsb` is run with no `--write-json` for the same reason the rest of this
+image is careful: a JSON directory rewritten every second is exactly the wear
+the read-only root exists to prevent. Adding a map means turning that back on,
+and accepting the writes that come with it.
+
+
 ## Changing settings later
 
 `MyReceiver.conf` is read from the boot partition at **every** boot, not just
@@ -463,7 +577,11 @@ sudo ogn-maintenance --config-sync  # re-read MyReceiver.conf from the card
 sudo ogn-update --check             # installed vs available
 ```
 
-Set `MaintenanceWindow = ""` to never update automatically.
+The window defaults to `Mon *-*-* 03:00:00`, plus up to half an hour of
+randomised delay. Monday rather than Sunday on purpose: an update that goes
+wrong is then found with a working week ahead to sort it out, instead of on
+the morning of a weekend's flying. Set `MaintenanceWindow = ""` to never
+update automatically.
 
 ### Doing maintenance by hand
 

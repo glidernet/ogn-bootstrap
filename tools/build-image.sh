@@ -53,6 +53,11 @@ WORK_DIR="${WORK_DIR:-$REPO_ROOT/.build}"
 # Network.WireGuard is read from the card at every boot and never re-runs the
 # installer, so a tunnel switched on later has to work with no network and no
 # apt. The kernel side is a module in the stock Raspberry Pi OS kernel.
+#
+# readsb and mlat-client-adsbfi are here for exactly the same reason: ADSB is
+# outside the Install section, so a second dongle added to a receiver in a
+# field has to come up from an edit on the card alone. Both are stock Debian
+# packages -- nothing here adds an apt source.
 PACKAGES=(
     rtl-sdr
     librtlsdr0
@@ -64,6 +69,8 @@ PACKAGES=(
     overlayroot
     autossh
     wireguard-tools
+    readsb
+    mlat-client-adsbfi
 )
 
 log()  { printf '\n=== %s\n' "$*"; }
@@ -249,7 +256,7 @@ install_scripts() {
     local f
     for f in src/ogn-install src/ogn-update src/ogn-maintenance \
              src/ogn-remote-admin src/ogn-calibrate src/ogn-overlay \
-             src/ogn-wireguard; do
+             src/ogn-wireguard src/ogn-adsb; do
         install -m 0755 "$f" "$MNT/usr/local/sbin/"
     done
 
@@ -288,7 +295,15 @@ tidy() {
     rm -f  "$MNT/var/cache/apt/archives/"*.deb
     find "$MNT/var/log" -type f -exec truncate -s 0 {} + 2>/dev/null || true
     rm -f "$MNT/root/.bash_history" "$MNT/etc/machine-id"
-    : > "$MNT/etc/machine-id"          # regenerated on first boot
+
+    # "uninitialized", exactly as pi-gen leaves it, and NOT an empty file.
+    # systemd treats an empty machine-id as "not the first boot", so every
+    # ConditionFirstBoot=yes unit is skipped -- including Raspberry Pi's
+    # regenerate_ssh_host_keys.service. pi-gen ships no host keys, so sshd
+    # then has none and refuses every connection.
+    echo "uninitialized" > "$MNT/etc/machine-id"
+    [ -z "$(ls "$MNT/etc/ssh/"ssh_host_*_key 2>/dev/null)" ] \
+        || die "/etc/ssh has host keys in it — every card would share them"
 
     # cloud-init must still think it has never run. If this is not empty the
     # image was booted somewhere it should not have been.

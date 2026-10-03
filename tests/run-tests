@@ -52,7 +52,11 @@ is "SampleRate"                    "$(conf_get RF.SampleRate)"                 "
 is "nested CenterFreq"             "$(conf_get RF.OGN.CenterFreq)"             "868.8"
 is "HTTP port"                     "$(conf_get HTTP.Port)"                     "8082"
 is "UpdateChannel"                 "$(conf_get Install.UpdateChannel)"         "stable"
-is "MaintenanceWindow keeps spaces" "$(conf_get Install.MaintenanceWindow)"    "Sun *-*-* 03:00:00"
+is "MaintenanceWindow keeps spaces" "$(conf_get Install.MaintenanceWindow)"    "Mon *-*-* 03:00:00"
+# Monday, not Sunday: a broken update is then found with a week to fix it,
+# rather than on the morning of a weekend's flying.
+grep -qE '^ *MaintenanceWindow *= *"Mon ' boot/MyReceiver.conf \
+    && ok "the window is early Monday" || bad "the window is early Monday"
 is "deeply nested RemoteAdmin"     "$(conf_get Install.RemoteAdmin.Connect)"   "false"
 is "FreqCorr ships as zero"        "$(conf_get RF.FreqCorr)"                   "+0"
 is "GSM tracking ships switched off" "$(conf_get RF.GSM.CenterFreq)"           "0"
@@ -590,6 +594,257 @@ grep -q 'ogn-wireguard.timer' src/ogn-wireguard \
     && ok "the repair timer follows the card, not the installer" \
     || bad "the repair timer follows the card, not the installer"
 grep -q 'wg_up' src/ogn-maintenance \
+    && ok "a live edit is picked up by the config resync" \
+    || bad "a live edit is picked up by the config resync"
+
+echo "== ADS-B from the card =="
+# Shipped state: the whole section is commented, so none of it reads back and
+# nothing can be rendered. This is what "ADS-B is off by absence" has to mean.
+conf_load boot/MyReceiver.conf
+is "no ADSB.Enable, so ADS-B is off" "$(conf_get ADSB.Enable '<none>')"          "<none>"
+is "and no DeviceSerial either"      "$(conf_get ADSB.DeviceSerial '<none>')"    "<none>"
+is "and no site is switched on"      "$(conf_get ADSB.Feed.ADSBFi '<none>')"     "<none>"
+adsb_render >/dev/null 2>&1 && bad "the shipped card renders no readsb config" \
+                            || ok  "the shipped card renders no readsb config"
+is "and nothing is being shared"     "$(adsb_feed_summary)"                      "OGN only"
+
+# The instructions on the card say "uncomment this whole section and reboot".
+# This is the assertion that the instructions are true: strip the comment
+# markers off the shipped block, and what is left has to parse, validate and
+# render -- sharing with nobody, because every site ships switched off.
+ADU=$(mktemp -d)
+python3 - "$ADU/c.conf" <<'UNCOMMENT'
+import sys
+lines = open("boot/MyReceiver.conf", encoding="utf-8").read().split("\n")
+start = next(i for i, l in enumerate(lines) if l.strip() == "# ADSB:")
+end = next(i for i, l in enumerate(lines) if i > start and l.strip() == "# } ;")
+block = [l[2:] if l.startswith("# ") else l[1:] if l.startswith("#") else l
+         for l in lines[start:end + 1]]
+open(sys.argv[1], "w", encoding="utf-8").write(
+    'APRS:\n{\n  Call = "TEST1";\n} ;\n\n'
+    'Position:\n{\n  Latitude = +51.1;\n  Longitude = -1.8;\n  Altitude = 128;\n} ;\n\n'
+    'RF:\n{\n  DeviceSerial = "868";\n} ;\n\n' + "\n".join(block) + "\n")
+UNCOMMENT
+conf_load "$ADU/c.conf"
+conf_bool ADSB.Enable false && ok "uncommenting the shipped block switches it on"                             || bad "uncommenting the shipped block switches it on"
+is "and names the 1090 stick"        "$(conf_get ADSB.DeviceSerial)"             "1090"
+is "and hands the decoder the feed"  "$(conf_get ADSB.AVR)"                      "localhost:30002"
+ADUR=$(adsb_render 2>/dev/null) && ok "and renders a usable readsb config"                                 || bad "and renders a usable readsb config"
+# Every site ships false, so switching ADS-B on must not, by itself, start
+# sending what this receiver hears to anybody new.
+case "$ADUR" in
+    *net-connector*) bad "and shares it with nobody until asked" "$ADUR" ;;
+    *)               ok  "and shares it with nobody until asked" ;;
+esac
+rm -rf "$ADU"
+conf_load boot/MyReceiver.conf
+
+# A filled-in card.
+conf_load tests/fixtures/adsb.conf
+AD=$(adsb_render 2>/dev/null) || bad "the fixture renders"
+for expect in \
+    '--device 1090' \
+    '--device-type rtlsdr' \
+    '--gain -10' \
+    "--net-ro-port 30002" \
+    "--net-bo-port 30005" \
+    "--net-bi-port 30104" \
+    '--net-connector feed.adsb.fi,30004,beast_reduce_plus_out' \
+    '--net-connector feed.airplanes.live,30004,beast_reduce_plus_out' \
+    'JSON_OPTIONS=""'
+do
+    case "$AD" in
+        *"$expect"*) ok "renders $expect" ;;
+        *)           bad "renders $expect" "$AD" ;;
+    esac
+done
+# A site that was not ticked must not appear. This is the assertion that says
+# "off" means "no connection", not "a connection nobody looked at".
+case "$AD" in
+    *adsbexchange*) bad "a site left off is not fed" "$AD" ;;
+    *)              ok  "a site left off is not fed" ;;
+esac
+# No --write-json, ever: there is no map on this image, and the directory
+# would be rewritten every second onto a card the overlay exists to protect.
+case "$AD" in
+    *write-json*) bad "nothing is written to disk continuously" "$AD" ;;
+    *)            ok  "nothing is written to disk continuously" ;;
+esac
+is "the summary names who gets it" "$(adsb_feed_summary)" "OGN, feed.adsb.fi, feed.airplanes.live"
+
+# One multilateration environment per site that is on, and none for the rest.
+ML=$(adsb_mlat_render ADSBFi 2>/dev/null) || bad "an mlat environment renders"
+case "$ML" in
+    *"MLAT_SERVER=feed.adsb.fi:31090"*) ok "mlat points at the right server" ;;
+    *) bad "mlat points at the right server" "$ML" ;;
+esac
+case "$ML" in
+    *"MLAT_RESULTS=beast,connect,localhost:30104"*) ok "mlat results come back to readsb" ;;
+    *) bad "mlat results come back to readsb" "$ML" ;;
+esac
+is "mlat instance names are lowercase" "$(adsb_feed_instance ADSBFi)" "adsbfi"
+
+# Required fields, one at a time.
+ADT=$(mktemp -d)
+sed 's/^  DeviceSerial = "1090";/  DeviceSerial = "";/' tests/fixtures/adsb.conf > "$ADT/c.conf"
+conf_load "$ADT/c.conf"
+adsb_render >/dev/null 2>&1 \
+    && bad "an empty ADSB.DeviceSerial is refused" \
+    || ok  "an empty ADSB.DeviceSerial is refused"
+# Gain is different, and deliberately so: conf_get cannot tell an empty value
+# from an absent one, so a blank Gain falls back to the -10 that means "let the
+# tuner decide". That is the right answer for a gain, and the wrong one for a
+# serial, which is why only the serial is required above.
+sed 's/^  Gain         = -10;/  Gain = "";/' tests/fixtures/adsb.conf > "$ADT/c.conf"
+conf_load "$ADT/c.conf"
+# Captured rather than piped into grep -q: grep exits at the first match and
+# the SIGPIPE that follows becomes a pipeline failure under pipefail.
+ADG=$(adsb_render 2>/dev/null)
+case "$ADG" in
+    *"--gain -10"*) ok  "an empty ADSB.Gain falls back to automatic" ;;
+    *)              bad "an empty ADSB.Gain falls back to automatic" "$ADG" ;;
+esac
+# The trap the whole two-dongle section exists to avoid: RF.Device is an index
+# and indexes move, so ADS-B without RF.DeviceSerial can hand the OGN decoder
+# the 1090 stick and leave nothing to explain the silence.
+sed 's/^  DeviceSerial = "868";//' tests/fixtures/adsb.conf > "$ADT/c.conf"
+conf_load "$ADT/c.conf"
+adsb_render >/dev/null 2>&1 \
+    && bad "ADS-B without RF.DeviceSerial is refused" \
+    || ok  "ADS-B without RF.DeviceSerial is refused"
+
+check_rejects() {
+    sed "$2" tests/fixtures/adsb.conf > "$ADT/c.conf"
+    conf_load "$ADT/c.conf"
+    adsb_render >/dev/null 2>&1 && bad "$1" || ok "$1"
+}
+check_rejects "both sticks given the same serial is refused" 's/DeviceSerial = "1090"/DeviceSerial = "868"/'
+check_rejects "a non-numeric gain is refused"                's/Gain         = -10/Gain         = "loud"/'
+check_rejects "a Custom entry with no port is refused"       's|Custom        = ""|Custom = "feed.example.org"|'
+# Multilateration compares arrival times between receivers, so a receiver that
+# is not where it says it is makes everyone else's answers worse.
+check_rejects "mlat with the position still 0,0 is refused"  's/Latitude  = +51.1874/Latitude = 0.0/; s/Longitude =  -1.8340/Longitude = 0.0/'
+check_rejects "mlat with no site to send it to is refused"   's/ADSBFi        = true/ADSBFi = false/; s/AirplanesLive = true/AirplanesLive = false/'
+# A custom target that IS well formed has to survive all of that.
+sed 's|Custom        = ""|Custom = "feed.example.org:30004"|' tests/fixtures/adsb.conf > "$ADT/c.conf"
+conf_load "$ADT/c.conf"
+ADC=$(adsb_render 2>/dev/null)
+case "$ADC" in
+    *"feed.example.org,30004,beast_reduce_plus_out"*) ok  "a well-formed Custom target is fed" ;;
+    *)                                                bad "a well-formed Custom target is fed" "$ADC" ;;
+esac
+rm -rf "$ADT"
+
+# The whole apply path, against stubs. systemctl is what must not be called
+# twice, and readsb only has to exist for the command -v check.
+STUB=$(mktemp -d)
+export ADSB_LOG="$STUB/calls"
+: > "$ADSB_LOG"; : > "$ADSB_LOG.on"
+printf '#!/bin/bash\nexit 0\n' > "$STUB/readsb"
+cat > "$STUB/systemctl" <<'STUBEOF'
+#!/bin/bash
+printf 'systemctl %s\n' "$*" >> "$ADSB_LOG"
+verb="$1"; shift
+unit=""
+for a in "$@"; do case "$a" in --*) ;; *) unit="$a" ;; esac; done
+case "$verb" in
+    is-active|is-enabled) grep -qx "$unit" "$ADSB_LOG.on" 2>/dev/null ;;
+    enable|start|restart) printf '%s\n' "$unit" >> "$ADSB_LOG.on"; exit 0 ;;
+    disable|stop)         grep -vx "$unit" "$ADSB_LOG.on" > "$ADSB_LOG.on.t" 2>/dev/null
+                          mv "$ADSB_LOG.on.t" "$ADSB_LOG.on" 2>/dev/null; exit 0 ;;
+    *) exit 0 ;;
+esac
+STUBEOF
+chmod +x "$STUB/readsb" "$STUB/systemctl"
+OLD_PATH="$PATH"; PATH="$STUB:$PATH"
+OLD_DEFAULT="$ADSB_DEFAULT"; OLD_MLAT="$ADSB_MLAT_DIR"; OLD_AMOTD="$ADSB_MOTD"
+ADSB_DEFAULT="$STUB/default-readsb"; ADSB_MLAT_DIR="$STUB/mlat"; ADSB_MOTD="$STUB/motd"
+
+conf_load tests/fixtures/adsb.conf
+adsb_apply >/dev/null 2>&1 && ok "applies cleanly" || bad "applies cleanly"
+[ -f "$ADSB_DEFAULT" ] && ok "writes the readsb defaults" || bad "writes the readsb defaults"
+grep -q 'systemctl restart readsb' "$ADSB_LOG" && ok "starts readsb" || bad "starts readsb"
+[ -f "$ADSB_MLAT_DIR/adsbfi.env" ] \
+    && ok "an mlat environment for each site that is on" \
+    || bad "an mlat environment for each site that is on"
+[ -f "$ADSB_MLAT_DIR/adsblol.env" ] \
+    && bad "and none for a site that is off" \
+    || ok  "and none for a site that is off"
+# The mlat environment is in /run, not /var/lib: it is a rendering of the card,
+# and must not survive a reboot into disagreeing with it.
+grep -q '/run/ogn-bootstrap/mlat' src/ogn-common.sh \
+    && ok "mlat settings live in /run" || bad "mlat settings live in /run"
+
+# Idempotence. A boot-time re-apply that bounces a working feed would drop
+# every aircraft it is tracking for no reason.
+: > "$ADSB_LOG"
+adsb_apply >/dev/null 2>&1 && ok "a second apply is clean" || bad "a second apply is clean"
+grep -q 'restart readsb' "$ADSB_LOG" \
+    && bad "an unchanged, working feed is left alone" \
+    || ok  "an unchanged, working feed is left alone"
+
+# A changed setting must not be left alone.
+sed 's/ADSBLol       = false/ADSBLol = true/' tests/fixtures/adsb.conf > "$STUB/c.conf"
+conf_load "$STUB/c.conf"
+: > "$ADSB_LOG"
+adsb_apply >/dev/null 2>&1
+grep -q 'restart readsb' "$ADSB_LOG" \
+    && ok "adding a site restarts the decoder" || bad "adding a site restarts the decoder"
+[ -f "$ADSB_MLAT_DIR/adsblol.env" ] \
+    && ok "and brings its mlat client with it" || bad "and brings its mlat client with it"
+
+# Switched off on the card: stopped, and the rendering removed with it.
+sed 's/Enable       = true/Enable = false/' tests/fixtures/adsb.conf > "$STUB/c.conf"
+conf_load "$STUB/c.conf"
+adsb_apply >/dev/null 2>&1 && ok "switching it off on the card applies cleanly" \
+                           || bad "switching it off on the card applies cleanly"
+[ -f "$ADSB_DEFAULT" ] && bad "and the readsb defaults are removed" \
+                       || ok  "and the readsb defaults are removed"
+[ -f "$ADSB_MLAT_DIR/adsbfi.env" ] && bad "and every mlat client with them" \
+                                   || ok  "and every mlat client with them"
+
+PATH="$OLD_PATH"
+ADSB_DEFAULT="$OLD_DEFAULT"; ADSB_MLAT_DIR="$OLD_MLAT"; ADSB_MOTD="$OLD_AMOTD"
+rm -rf "$STUB"; unset ADSB_LOG
+
+echo "== ADS-B plumbing =="
+grep -q 'ogn-adsb' boot/vendor-data && ok "vendor-data carries ogn-adsb" || bad "vendor-data carries ogn-adsb"
+grep -q 'src/ogn-adsb' tools/build-image.sh && ok "and so does the image build" || bad "and so does the image build"
+grep -q 'src/ogn-adsb' tools/build-vendor-data \
+    && ok "and the payload generator knows about it" \
+    || bad "and the payload generator knows about it"
+# Shipped in the image for the same reason as wireguard-tools: ADSB is outside
+# the Install section, so a dongle added later never comes back through apt.
+for pkg in readsb mlat-client-adsbfi; do
+    grep -q "$pkg" tools/build-image.sh \
+        && ok "the image ships $pkg, so the card alone can switch it on" \
+        || bad "the image ships $pkg, so the card alone can switch it on"
+done
+# Everything comes from Debian. A third-party apt source in this file would
+# make the promise at the top of build-image.yml false.
+code_of tools/build-image.sh src/ogn-install src/ogn-adsb src/ogn-common.sh \
+    | grep -qE 'sources\.list|apt-key|add-apt-repository|deb https?:' \
+    && bad "ADS-B adds no third-party apt source" \
+    || ok  "ADS-B adds no third-party apt source"
+grep -q 'systemctl enable ogn-adsb.service' src/ogn-install \
+    && ok "the service is enabled whatever the card says today" \
+    || bad "the service is enabled whatever the card says today"
+python3 - <<'PY' && ok "the ADS-B unit is independent of the OGN group" || bad "the ADS-B unit is independent of the OGN group"
+import re
+src = open("src/ogn-install").read()
+unit = src.split("write_unit ogn-adsb.service <<'EOF'", 1)[1].split("\nEOF", 1)[0]
+# ogn-calibrate stops rtlsdr-ogn to take the OGN stick for a GSM scan. ADS-B is
+# on the other stick and has no business going down with it.
+assert "PartOf" not in unit, "PartOf would stop ADS-B during a calibration run"
+assert re.search(r"^Wants=network-online\.target", unit, re.M), "missing Wants=network-online.target"
+assert "RemainAfterExit" not in unit, "RemainAfterExit stops the timer re-running it"
+mlat = src.split("write_unit ogn-mlat@.service <<'EOF'", 1)[1].split("\nEOF", 1)[0]
+assert "StandardOutput=journal" in mlat, "mlat must log to the journal, not /var/log"
+PY
+grep -q 'ogn-adsb.timer' src/ogn-adsb \
+    && ok "the repair timer follows the card, not the installer" \
+    || bad "the repair timer follows the card, not the installer"
+grep -q 'ogn-adsb' src/ogn-maintenance \
     && ok "a live edit is picked up by the config resync" \
     || bad "a live edit is picked up by the config resync"
 

@@ -14,7 +14,7 @@ cd "$(dirname "$0")/.."
 
 OUT=boot/vendor-data
 LIB_FILES=(src/ogn-common.sh)
-BIN_FILES=(src/ogn-install src/ogn-update src/ogn-maintenance src/ogn-remote-admin src/ogn-calibrate src/ogn-overlay src/ogn-wireguard)
+BIN_FILES=(src/ogn-install src/ogn-update src/ogn-maintenance src/ogn-remote-admin src/ogn-calibrate src/ogn-overlay src/ogn-wireguard src/ogn-adsb)
 
 emit_file() {
     local src="$1" dest="$2" mode="$3" marker
@@ -47,6 +47,10 @@ cat <<'HEADER'
 #
 # It does NOT enable any remote access unless you asked for it in
 # MyReceiver.conf. Everything under Install.RemoteAdmin is off by default.
+#
+# It does NOT send what this receiver hears to anyone except OGN. ADS-B
+# reception is off until you switch it on, and the tracking sites under
+# ADSB.Feed are each off until you pick them.
 #
 # Nothing here needs editing. Your settings all live in MyReceiver.conf,
 # next to this file.

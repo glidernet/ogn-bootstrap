@@ -128,6 +128,10 @@ conf_bool Install.RemoteAdmin.OGNTeam && PACKAGES+=(autossh)
 # never comes back through here. The image ships wireguard-tools for exactly
 # that reason; this line is for a Pi being set up by hand.
 conf_bool Network.WireGuard.Enable && PACKAGES+=(wireguard-tools)
+# Same reasoning for ADS-B: the ADSB section is outside Install, so switching
+# it on later never comes back through here. The image ships both already.
+conf_bool ADSB.Enable && PACKAGES+=(readsb)
+conf_bool ADSB.Feed.MLAT && PACKAGES+=(mlat-client-adsbfi)
 apt_install "${PACKAGES[@]}"
 
 # ---------------------------------------------------------------------------
@@ -389,6 +393,72 @@ EOF
 systemctl enable ogn-wireguard.service >/dev/null
 
 # ---------------------------------------------------------------------------
+# 10b. ADS-B
+#
+# Written and enabled whatever the card says, for the same reason as the
+# WireGuard units above: ADSB lives outside the Install section, so it is
+# re-read at every boot and never re-runs this installer. ogn-adsb does
+# nothing while ADSB.Enable is false, and switches its own timer on and off
+# to match.
+#
+# Deliberately NOT PartOf=rtlsdr-ogn.service. ogn-calibrate stops that group
+# to take the OGN stick for a GSM scan, and ADS-B is on the other stick and
+# has no business going down with it.
+# ---------------------------------------------------------------------------
+write_unit ogn-adsb.service <<'EOF'
+[Unit]
+Description=OGN receiver ADS-B
+Documentation=https://github.com/glidernet/ogn-bootstrap
+After=network-online.target nss-lookup.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ogn-adsb --apply
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Not RemainAfterExit, as above: the timer re-runs this same service.
+write_unit ogn-adsb.timer <<'EOF'
+[Unit]
+Description=Keep ADS-B reception and its feeds up
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=10min
+
+[Install]
+WantedBy=timers.target
+EOF
+
+# One instance per tracking site that multilateration is switched on for.
+# The environment comes from /run, which is where it belongs: it is a
+# rendering of the card, and the root filesystem is RAM under the overlay.
+write_unit ogn-mlat@.service <<'EOF'
+[Unit]
+Description=OGN receiver ADS-B multilateration: %i
+Documentation=https://github.com/glidernet/ogn-bootstrap
+After=readsb.service network-online.target
+Wants=network-online.target
+BindsTo=readsb.service
+
+[Service]
+Type=simple
+EnvironmentFile=/run/ogn-bootstrap/mlat/%i.env
+ExecStart=/usr/bin/mlat-client --input-type beast --input-connect ${MLAT_INPUT} \
+    --server ${MLAT_SERVER} --user ${MLAT_CALL} \
+    --lat ${MLAT_LAT} --lon ${MLAT_LON} --alt ${MLAT_ALT} \
+    --results ${MLAT_RESULTS}
+Restart=always
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+EOF
+systemctl enable ogn-adsb.service >/dev/null
+
+# ---------------------------------------------------------------------------
 # 11. Unattended security updates, and the maintenance timer
 # ---------------------------------------------------------------------------
 cat > /etc/apt/apt.conf.d/51ogn-unattended-upgrades <<'EOF'
@@ -479,6 +549,10 @@ systemctl daemon-reload
 # card. Never fatal: a receiver that cannot reach a VPN server is still a
 # receiver, and the journal says why.
 ogn-wireguard --config "$BOOT_CONF" --apply || warn "the WireGuard tunnel is not up; see journalctl -u ogn-wireguard"
+
+# Same again for ADS-B. Never fatal: a receiver that cannot decode ADS-B is
+# still doing the job it was put on the airfield to do.
+ogn-adsb --config "$BOOT_CONF" --apply || warn "ADS-B is not running; see journalctl -u ogn-adsb"
 
 # ---------------------------------------------------------------------------
 # 12. Start it, or explain why not

@@ -133,6 +133,14 @@ config_sync() {
             || warn "could not re-apply Network.WireGuard; see journalctl -u ogn-wireguard"
     fi
 
+    # ADS-B has the same shape: ogn-adsb.service waits for the network, so at
+    # boot this leaves it alone. On a card edit applied by hand to a running
+    # receiver, readsb is already up and this is what notices.
+    if systemctl is-active --quiet readsb 2>/dev/null; then
+        ogn-adsb --config "$BOOT_CONF" --apply \
+            || warn "could not re-apply ADSB; see journalctl -u ogn-adsb"
+    fi
+
     # Before the digest, and before the receiver starts: nothing else has the
     # SDR yet. Disarms itself, so this is a no-op on all but the asked-for boot.
     ogn-calibrate --from-config || true
