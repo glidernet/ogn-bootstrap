@@ -134,14 +134,19 @@ _libconfig_flatten() {
                     if (d == "\"") { ins = 1; val = val d; j++; continue }
                     if (d == "[" || d == "(") { bd++; val = val d; j++; continue }
                     if (d == "]" || d == ")") { bd--; val = val d; j++; continue }
-                    if (d == ";" && bd <= 0) break
+                    if ((d == ";" || d == ",") && bd <= 0) { j++; break }
+                    # libconfig makes the terminator optional, so a value
+                    # also ends at the end of its line or at the closing
+                    # brace, which is left for the group to consume.
+                    if (d == "}" && bd <= 0) break
+                    if (d == "\n" && bd <= 0 && val ~ /[^ \t\r]/) break
                     val = val d; j++
                 }
                 p = ""
                 for (k = 1; k <= np; k++) p = p stack[k] "."
                 gsub(/^[ \t\r\n]+/, "", val); gsub(/[ \t\r\n]+$/, "", val)
                 print p pending "=" val
-                pending = ""; i = j + 1; continue }
+                pending = ""; i = j; continue }
             i++
         }
     }' "$1"
@@ -1081,12 +1086,49 @@ adsb_enabled_feeds() {
 # means "let the tuner decide", so a bare - is not enough to reject on.
 adsb_number_ok() { printf '%s' "$1" | grep -Eq '^-?[0-9]+(\.[0-9]+)?$'; }
 
+# Where this receiver's identity comes from, first one readable wins: the Pi's
+# own serial number, then machine-id for anything that is not a Pi.
+ADSB_ID_SOURCES="${OGN_ADSB_ID_SOURCES:-/sys/firmware/devicetree/base/serial-number /proc/cpuinfo /etc/machine-id}"
+
+adsb_uuid_ok() { printf '%s' "$1" | grep -Eq '^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$'; }
+
+# adsb_uuid — the UUID readsb gives the feed sites, so they can tell this
+# receiver's data from everyone else's. Without one readsb still feeds, but
+# anonymously, and complains about it on every connection.
+#
+# ADSB.Feed.UUID on the card wins, for a receiver already registered with a
+# site. Otherwise it is derived from the hardware serial rather than generated
+# and stored: the same at every boot and across a reflash, so the sites keep
+# the station's history, with nothing written to the card. Hashed, so the
+# serial itself never leaves the Pi. Prints nothing if there is no source.
+adsb_uuid() {
+    local id src h v
+    id=$(conf_get ADSB.Feed.UUID "")
+    if [ -n "$id" ]; then printf '%s' "$id"; return 0; fi
+    for src in $ADSB_ID_SOURCES; do
+        [ -r "$src" ] || continue
+        case "$src" in
+            */cpuinfo) id=$(sed -n 's/^Serial[[:space:]]*:[[:space:]]*//p' "$src" | head -1) ;;
+            *)         id=$(tr -d '\0\n' < "$src") ;;
+        esac
+        # An all-zero serial is what a board without one reports.
+        case "$id" in ''|*[!0]*) ;; *) id="" ;; esac
+        [ -n "$id" ] && break
+    done
+    [ -n "$id" ] || return 0
+    h=$(printf 'ogn-bootstrap-adsb:%s' "$id" | sha256_stdin)
+    # Shaped as a version 4 UUID, which is what the sites' own scripts make.
+    v=$(printf '%s' "89ab" | cut -c$(( 0x${h:16:1} % 4 + 1 )))
+    printf '%s-%s-4%s-%s%s-%s' "${h:0:8}" "${h:8:4}" "${h:13:3}" "$v" "${h:17:3}" "${h:20:12}"
+}
+
 # adsb_render — print /etc/default/readsb from the loaded card settings.
 #
-# Pure: reads the config, writes stdout, touches nothing. Returns 1, saying
-# what is wrong, rather than rendering something that cannot work.
+# Pure: reads the config (and the hardware serial, for adsb_uuid), writes
+# stdout, touches nothing. Returns 1, saying what is wrong, rather than
+# rendering something that cannot work.
 adsb_render() {
-    local serial ogn_serial gain custom entry host f conn="" feeds="" ok=1
+    local serial ogn_serial gain custom entry host f conn="" feeds="" ok=1 uuid
 
     serial=$(conf_get ADSB.DeviceSerial "")
     ogn_serial=$(conf_get RF.DeviceSerial "")
@@ -1150,6 +1192,19 @@ adsb_render() {
         IFS=','
     done
     IFS="$IFS_SAVE"
+
+    # Only sent to the sites, so only worth having when there are some.
+    if [ -n "$conn" ]; then
+        uuid=$(adsb_uuid)
+        if [ -z "$uuid" ]; then
+            warn "no hardware serial or machine-id to identify this receiver to the feed sites; feeding anonymously"
+        elif adsb_uuid_ok "$uuid"; then
+            conn="$conn --uuid $uuid"
+        else
+            warn "ADSB.Feed.UUID ('$uuid') is not a UUID; it looks like 01234567-89ab-cdef-0123-456789abcdef"
+            ok=0
+        fi
+    fi
 
     [ "$ok" -eq 1 ] || return 1
 
@@ -1225,11 +1280,14 @@ adsb_mlat_apply() {
             fi
             if ! cmp -s "$tmp" "$ADSB_MLAT_DIR/$inst.env"; then
                 install -m 0644 "$tmp" "$ADSB_MLAT_DIR/$inst.env"
-                systemctl restart "ogn-mlat@$inst.service" >/dev/null 2>&1 || true
+                # --no-block throughout: these units wait for
+                # network-online.target, and a caller ordered before it would
+                # otherwise wait for them forever.
+                systemctl --no-block restart "ogn-mlat@$inst.service" >/dev/null 2>&1 || true
             fi
             rm -f "$tmp"
             systemctl is-enabled --quiet "ogn-mlat@$inst.service" 2>/dev/null \
-                || systemctl enable --now "ogn-mlat@$inst.service" >/dev/null 2>&1 || true
+                || systemctl --no-block enable --now "ogn-mlat@$inst.service" >/dev/null 2>&1 || true
         else
             systemctl is-enabled --quiet "ogn-mlat@$inst.service" 2>/dev/null \
                 && systemctl disable --now "ogn-mlat@$inst.service" >/dev/null 2>&1 || true
@@ -1281,6 +1339,14 @@ adsb_apply() {
         return 1
     fi
 
+    # Never enabled: ogn-adsb.service starts it at every boot, once the card
+    # has been read. Enabled, it starts on its own before that, on whatever
+    # /etc/default/readsb survived -- and an enable made while the root was
+    # writable survives the overlay. Earlier versions did exactly that.
+    if systemctl is-enabled --quiet readsb 2>/dev/null; then
+        systemctl disable readsb >/dev/null 2>&1 || true
+    fi
+
     tmp=$(mktemp)
     if ! adsb_render > "$tmp"; then
         rm -f "$tmp"
@@ -1299,7 +1365,6 @@ adsb_apply() {
 
     if [ "$changed" -eq 1 ]; then
         log "starting readsb on the ADS-B stick"
-        systemctl enable readsb >/dev/null 2>&1 || true
         if ! systemctl restart readsb >/dev/null 2>&1; then
             warn "readsb would not start; see journalctl -u readsb"
             return 1
@@ -1309,6 +1374,41 @@ adsb_apply() {
     adsb_mlat_apply || { adsb_motd_update; return 1; }
     adsb_motd_update
     return 0
+}
+
+# --------------------------------------------------------------------------
+# The first reboot
+#
+# On first boot the installer leaves the overlay unarmed and hands the reboot
+# to ogn-first-reboot.timer, which waits until nothing else still needs a
+# writable root: cloud-init finishing Imager's settings, and Raspberry Pi
+# Connect spending the auth key Imager gave it. A sign-in made under the
+# overlay is forgotten at the next reboot, and the key is single-use, so it
+# has to happen here or not at all.
+# --------------------------------------------------------------------------
+FIRST_REBOOT_DIR="${OGN_FIRST_REBOOT_DIR:-/var/lib/ogn-bootstrap}"
+FIRST_REBOOT_PENDING="$FIRST_REBOOT_DIR/first-reboot.pending"
+FIRST_REBOOT_MOTD="${OGN_FIRST_REBOOT_MOTD:-/etc/motd.d/15-ogn-first-reboot}"
+# A personal auth key expires six hours after it is made. Past that there is
+# nothing left to wait for.
+FIRST_REBOOT_LIMIT="${OGN_FIRST_REBOOT_LIMIT:-21600}"
+HOME_ROOT="${OGN_HOME_ROOT:-/home}"
+
+cloud_init_running() {
+    command -v cloud-init >/dev/null 2>&1 \
+        && cloud-init status 2>/dev/null | grep -q 'status: running'
+}
+
+# connect_signin_pending — an auth key is waiting to be spent by an account
+# that is not signed in yet. Connect removes the key once it has tried, and
+# state.json is what a successful sign-in leaves behind.
+connect_signin_pending() {
+    local key
+    for key in "$HOME_ROOT"/*/.config/com.raspberrypi.connect/auth.key; do
+        [ -e "$key" ] || continue
+        [ -s "$(dirname "$key")/state.json" ] || return 0
+    done
+    return 1
 }
 
 # --------------------------------------------------------------------------
@@ -2052,15 +2152,24 @@ grep -qE '^[^#][^[:space:]]*[[:space:]]+/boot/firmware[[:space:]].*umask=0077' /
     || warn "/etc/fstab sets its own umask on /boot/firmware, so the wifi password and any
      WireGuard key on the card stay readable by every account on this Pi"
 
+ARM_OVERLAY=0
 if [ "$READONLY_FS" -eq 1 ]; then
     if ogn-maintenance --overlay-status | grep -q '^enabled'; then
         log "read-only overlay already enabled"
+    elif [ "$REBOOT_WHEN_DONE" -eq 1 ]; then
+        # Armed by the first reboot itself, once nothing still needs the root
+        # writable -- so a power cut while it waits comes back writable, and
+        # still waiting, rather than read-only with the waiting forgotten.
+        # Checked now all the same, so a missing piece fails the install,
+        # and is retried, rather than surfacing as a writable receiver later.
+        overlay_ensure_initramfs && overlay_preflight \
+            || die "the read-only overlay could not be prepared"
+        log "the read-only overlay is enabled at the reboot"
+        ARM_OVERLAY=1
     else
         log "enabling the read-only overlay (takes effect at the next reboot)"
         ogn-maintenance --overlay-enable
-        if [ "$REBOOT_WHEN_DONE" -eq 0 ]; then
-            warn "the read-only overlay is armed but will not be active until you reboot"
-        fi
+        warn "the read-only overlay is armed but will not be active until you reboot"
     fi
 fi
 
@@ -2085,8 +2194,57 @@ conf_digest Install | boot_write "$INSTALL_APPLIED"
 log "setup complete"
 
 if [ "$REBOOT_WHEN_DONE" -eq 1 ]; then
-    log "rebooting"
-    systemctl reboot
+    # On first boot this runs as cloud-init's scripts_vendor, and Imager's own
+    # settings -- Raspberry Pi Connect, passwordless sudo, SSH -- are runcmd,
+    # which runs in scripts_user, after it. Rebooting from here cut them off,
+    # so they ran instead on the next boot, under the overlay: in RAM, and
+    # again at every boot after, re-presenting a single-use Connect key that
+    # had already been spent.
+    #
+    # So the reboot is handed to a timer, which waits for cloud-init to finish
+    # and for Connect to sign in -- for as long as the network takes, up to
+    # the key's six-hour life -- and only then arms the overlay and reboots.
+    # A unit on disk rather than a transient one, so that it survives a power
+    # cut while it waits.
+    install -d -m 0755 "$FIRST_REBOOT_DIR"
+    if [ "$ARM_OVERLAY" -eq 1 ]; then
+        printf 'overlay\n' > "$FIRST_REBOOT_PENDING"
+    else
+        printf 'reboot\n' > "$FIRST_REBOOT_PENDING"
+    fi
+    write_unit ogn-first-reboot.service <<EOF
+[Unit]
+Description=OGN receiver: the reboot that finishes setup
+Documentation=https://github.com/glidernet/ogn-bootstrap
+After=cloud-final.service
+ConditionPathExists=$FIRST_REBOOT_PENDING
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ogn-maintenance --first-reboot
+EOF
+    write_unit ogn-first-reboot.timer <<EOF
+[Unit]
+Description=OGN receiver: reboot to finish setup, once nothing needs a writable root
+Documentation=https://github.com/glidernet/ogn-bootstrap
+ConditionPathExists=$FIRST_REBOOT_PENDING
+
+[Timer]
+OnBootSec=1min
+OnUnitInactiveSec=1min
+
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl enable ogn-first-reboot.timer >/dev/null 2>&1 || true
+    if cloud_init_running; then
+        log "rebooting once cloud-init has finished and Raspberry Pi Connect, if set up, has signed in"
+    else
+        # Run by hand: usually nothing to wait for, so this reboots now.
+        ogn-maintenance --first-reboot
+    fi
+    systemctl start --no-block ogn-first-reboot.timer >/dev/null 2>&1 || true
 fi
 OGN_PAYLOAD_ogn_install
 chmod 0755 /usr/local/sbin/ogn-install
@@ -2375,20 +2533,26 @@ config_sync() {
     # wifi_apply is itself a no-op when the live config already matches.
     wifi_apply
 
-    # WireGuard belongs to ogn-wireguard.service, which waits for the network
-    # -- exactly what this must not do. What is left for here is the edit
-    # applied to a receiver that is already up: `ogn-maintenance --config-sync`
-    # by hand, with a tunnel running that the card has just changed. At boot
-    # the interface does not exist yet, so this stays out of the way.
-    if wg_up; then
+    # WireGuard and ADS-B belong to their own services, which wait for the
+    # network -- exactly what this must not do, since it runs before
+    # network-online.target and anything here that waits on a unit ordered
+    # after it waits forever. What is left for here is an edit applied by hand
+    # to a receiver that is already up: `ogn-maintenance --config-sync`.
+    #
+    # Asked of systemd rather than inferred from what is running: readsb left
+    # enabled by an earlier version is already up at boot, and taking that to
+    # mean "run by hand" is how a boot hung here.
+    local booting=0
+    case "$(systemctl is-system-running 2>/dev/null)" in
+        initializing|starting) booting=1 ;;
+    esac
+
+    if [ "$booting" -eq 0 ] && wg_up; then
         ogn-wireguard --config "$BOOT_CONF" --apply \
             || warn "could not re-apply Network.WireGuard; see journalctl -u ogn-wireguard"
     fi
 
-    # ADS-B has the same shape: ogn-adsb.service waits for the network, so at
-    # boot this leaves it alone. On a card edit applied by hand to a running
-    # receiver, readsb is already up and this is what notices.
-    if systemctl is-active --quiet readsb 2>/dev/null; then
+    if [ "$booting" -eq 0 ] && systemctl is-active --quiet readsb 2>/dev/null; then
         ogn-adsb --config "$BOOT_CONF" --apply \
             || warn "could not re-apply ADSB; see journalctl -u ogn-adsb"
     fi
@@ -2445,7 +2609,10 @@ config_sync() {
     if [ -z "$(conf_get APRS.Call "")" ]; then
         sed -i "s|^\( *Call *= *\)\"\"|\1\"$call\"|" "$target"
     fi
-    if ! conf_has RF.FreqCorr && [ -n "$old_freq" ]; then
+    # Checked against the file itself, not the parsed settings: a second
+    # FreqCorr is a duplicate setting, which libconfig refuses outright and
+    # takes the receiver off the air.
+    if [ -n "$old_freq" ] && ! grep -q '^ *FreqCorr *=' "$target"; then
         sed -i "s|^\( *SampleRate *=\)|  FreqCorr = $old_freq;   # measured by ogn-calibrate\n\1|" "$target"
     fi
     conf_redact_secrets "$target"
@@ -2542,6 +2709,51 @@ install_check() {
     fi
 }
 
+# --- the first reboot ----------------------------------------------------
+# Run by ogn-first-reboot.timer, and once directly by the installer. Returns
+# without doing anything until the root no longer needs to be writable; then
+# arms the overlay if the installer asked for it, and reboots. See
+# FIRST_REBOOT_PENDING in ogn-common.sh.
+first_reboot() {
+    local since now until
+    [ -e "$FIRST_REBOOT_PENDING" ] || return 0
+
+    if cloud_init_running; then
+        log "first reboot: waiting for cloud-init to finish"
+        return 0
+    fi
+
+    if connect_signin_pending; then
+        now=$(date +%s)
+        [ -s "$FIRST_REBOOT_PENDING.since" ] || printf '%s\n' "$now" > "$FIRST_REBOOT_PENDING.since"
+        since=$(cat "$FIRST_REBOOT_PENDING.since")
+        if [ $((now - since)) -lt "$FIRST_REBOOT_LIMIT" ]; then
+            until=$(date -d "@$((since + FIRST_REBOOT_LIMIT))" '+%H:%M' 2>/dev/null || printf 'later')
+            log "first reboot: waiting for Raspberry Pi Connect to sign in (gives up at $until)"
+            mkdir -p "$(dirname "$FIRST_REBOOT_MOTD")"
+            cat > "$FIRST_REBOOT_MOTD" <<EOF
+
+  Setup is finished, but the read-only root is not on yet: waiting for
+  Raspberry Pi Connect to sign in, which needs the network. It reboots into
+  read-only mode by itself once Connect is signed in, or at $until regardless.
+
+EOF
+            return 0
+        fi
+        warn "Raspberry Pi Connect did not sign in within $((FIRST_REBOOT_LIMIT / 3600)) hours; its auth key has expired"
+        warn "sign in by hand with the overlay off: see 'Connect and the read-only root' in the README"
+    fi
+
+    if [ "$(cat "$FIRST_REBOOT_PENDING")" = overlay ]; then
+        log "enabling the read-only overlay"
+        overlay_set enable || warn "the overlay could not be enabled; this receiver will come up WRITABLE"
+    fi
+    rm -f "$FIRST_REBOOT_PENDING" "$FIRST_REBOOT_PENDING.since" "$FIRST_REBOOT_MOTD"
+    systemctl disable ogn-first-reboot.timer >/dev/null 2>&1 || true
+    log "rebooting"
+    systemctl reboot
+}
+
 boot_check() {
     case "$(state_read)" in
         updating)
@@ -2579,6 +2791,7 @@ while [ $# -gt 0 ]; do
         --overlay-status) MODE=overlay-status ;;
         --overlay-enable) MODE=overlay-enable ;;
         --overlay-disable) MODE=overlay-disable ;;
+        --first-reboot)   MODE=first-reboot ;;
         -h|--help)        sed -n '3,21p' "$0"; exit 0 ;;
         *)                die "unknown option: $1" ;;
     esac
@@ -2610,6 +2823,7 @@ case "$MODE" in
     # For the installer; `overlay on` is the front end for people.
     overlay-enable)  overlay_set enable ;;
     overlay-disable) overlay_set disable ;;
+    first-reboot)    first_reboot ;;
     boot-check)      boot_check ;;
     config-sync)     config_sync ;;
     scheduled|now)   begin_cycle ;;
@@ -2728,6 +2942,10 @@ if conf_bool Install.RemoteAdmin.Connect; then
   Run this as $USER_NAME and follow the link it prints:
 
       rpi-connect signin
+
+  With the read-only root on, a sign-in is forgotten at the next reboot.
+  Make it stick with:  sudo overlay off --reboot, sign in, then
+                       sudo overlay on --reboot
 
 EOF
     else

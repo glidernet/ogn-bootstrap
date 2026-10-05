@@ -108,6 +108,10 @@ if conf_bool Install.RemoteAdmin.Connect; then
 
       rpi-connect signin
 
+  With the read-only root on, a sign-in is forgotten at the next reboot.
+  Make it stick with:  sudo overlay off --reboot, sign in, then
+                       sudo overlay on --reboot
+
 EOF
     else
         rm -f /etc/motd.d/30-ogn-connect

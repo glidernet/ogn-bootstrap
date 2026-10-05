@@ -96,6 +96,13 @@ is "three levels deep"             "$(conf_get Nest.Level2.Level3.Deep)" "42"
 is "sibling after a nested close"  "$(conf_get Nest.Sibling)"        "false"
 is "value after an array"          "$(conf_get Arrays.After)"        "7"
 is "empty string uses the default" "$(conf_get Strings.Empty 'dflt')" "dflt"
+is "no ; before a newline"        "$(conf_get NoSemi.First)"        "1"
+is "no ; before the closing brace" "$(conf_get NoSemi.Last)"         "54"
+is "group after a missing ;"       "$(conf_get AfterNoSemi.Next)"    "x"
+is "comma as terminator"           "$(conf_get AfterNoSemi.Commas)"  "3"
+is "no ; before an inline brace"   "$(conf_get AfterNoSemi.Inline)"  "9"
+conf_has NoSemi.AfterNoSemi.Next   && bad "missing ; does not nest what follows" \
+                                   || ok "missing ; does not nest what follows"
 
 echo "== receiver name validation =="
 check_name() { printf '%s' "$1" | grep -Eq '^[A-Za-z0-9]{1,9}$'; }
@@ -539,6 +546,65 @@ grep -q 'flock -w' src/ogn-install \
     && ok "the timer and a person cannot run it at once" \
     || bad "the timer and a person cannot run it at once"
 
+echo "== the first reboot waits for a writable root to be finished with =="
+# Imager's settings -- Connect, sudo, SSH -- are runcmd, which cloud-init runs
+# after the vendor script. A reboot from inside the vendor script pushed them
+# onto the next boot, under the overlay, where they lived in RAM; and a
+# Connect sign-in that has not happened by the reboot can only ever happen in
+# RAM after it.
+python3 - <<'PY' && ok "the installer hands the reboot to a timer" || bad "the installer hands the reboot to a timer"
+src = open("src/ogn-install").read()
+tail = src.split('if [ "$REBOOT_WHEN_DONE" -eq 1 ]; then\n    # On first boot', 1)[1]
+assert "systemctl reboot" not in tail, "reboots from inside cloud-init"
+assert 'FIRST_REBOOT_PENDING' in tail
+assert "systemctl enable ogn-first-reboot.timer" in tail
+assert "systemctl start --no-block ogn-first-reboot.timer" in tail
+PY
+python3 - <<'PY' && ok "and leaves the overlay for it to arm" || bad "and leaves the overlay for it to arm"
+src = open("src/ogn-install").read()
+block = src.split("ARM_OVERLAY=0\n", 1)[1].split("\nfi\n", 1)[0]
+reboot_branch = block.split('elif [ "$REBOOT_WHEN_DONE" -eq 1 ]; then', 1)[1].split("    else\n", 1)[0]
+assert "--overlay-enable" not in reboot_branch, "armed before the wait"
+assert "overlay_preflight" in reboot_branch, "a broken overlay would only show at the reboot"
+assert "ARM_OVERLAY=1" in reboot_branch
+PY
+python3 - <<'PY' && ok "the timer survives a power cut and stops once done" || bad "the timer survives a power cut and stops once done"
+import re
+src = open("src/ogn-install").read()
+for name in ("service", "timer"):
+    unit = src.split(f"write_unit ogn-first-reboot.{name} <<EOF", 1)[1].split("\nEOF", 1)[0]
+    assert "ConditionPathExists=$FIRST_REBOOT_PENDING" in unit, name
+svc = src.split("write_unit ogn-first-reboot.service <<EOF", 1)[1].split("\nEOF", 1)[0]
+assert "RemainAfterExit" not in svc, "RemainAfterExit stops the timer re-running it"
+assert "--first-reboot" in svc
+tmr = src.split("write_unit ogn-first-reboot.timer <<EOF", 1)[1].split("\nEOF", 1)[0]
+assert "OnBootSec=" in tmr and "OnUnitInactiveSec=" in tmr
+assert re.search(r"^WantedBy=timers\.target", tmr, re.M)
+PY
+python3 - <<'PY' && ok "it waits for cloud-init, then Connect, then arms and reboots" || bad "it waits for cloud-init, then Connect, then arms and reboots"
+src = open("src/ogn-maintenance").read()
+fn = src.split("first_reboot() {", 1)[1].split("\n}\n", 1)[0]
+order = [fn.index(k) for k in ("cloud_init_running", "connect_signin_pending",
+                               "FIRST_REBOOT_LIMIT", "overlay_set enable", "systemctl reboot")]
+assert order == sorted(order), order
+# The marker goes before the reboot, or the timer runs again on the far side.
+assert fn.index('rm -f "$FIRST_REBOOT_PENDING"') < fn.index("systemctl reboot")
+PY
+
+# Whether Connect still has a key to spend. Connect removes auth.key once it
+# has tried, and a sign-in leaves state.json.
+CH=$(mktemp -d); HOME_ROOT="$CH"
+connect_signin_pending && bad "no Connect at all: nothing to wait for" || ok "no Connect at all: nothing to wait for"
+mkdir -p "$CH/pi/.config/com.raspberrypi.connect"
+connect_signin_pending && bad "Connect with no key: nothing to wait for" || ok "Connect with no key: nothing to wait for"
+printf 'key\n' > "$CH/pi/.config/com.raspberrypi.connect/auth.key"
+connect_signin_pending && ok "a key not yet spent: wait" || bad "a key not yet spent: wait"
+printf '{"accessToken":"x"}' > "$CH/pi/.config/com.raspberrypi.connect/state.json"
+connect_signin_pending && bad "signed in: done waiting" || ok "signed in: done waiting"
+rm -f "$CH/pi/.config/com.raspberrypi.connect/state.json" "$CH/pi/.config/com.raspberrypi.connect/auth.key"
+connect_signin_pending && bad "key spent, sign-in failed: nothing left to wait for" || ok "key spent, sign-in failed: nothing left to wait for"
+rm -rf "$CH"; HOME_ROOT=/home
+
 echo "== WireGuard from the card =="
 conf_load boot/MyReceiver.conf
 conf_bool Network.WireGuard.Enable && bad "the shipped template ships it off" || ok "the shipped template ships it off"
@@ -734,6 +800,9 @@ grep -q 'ogn-wireguard.timer' src/ogn-wireguard \
 grep -q 'wg_up' src/ogn-maintenance \
     && ok "a live edit is picked up by the config resync" \
     || bad "a live edit is picked up by the config resync"
+grep -q 'is-system-running' src/ogn-maintenance \
+    && ok "the resync leaves WireGuard and ADS-B alone at boot" \
+    || bad "the resync leaves WireGuard and ADS-B alone at boot"
 
 echo "== ADS-B from the card =="
 # Shipped state: the whole section is commented, so none of it reads back and
@@ -777,7 +846,10 @@ esac
 rm -rf "$ADU"
 conf_load boot/MyReceiver.conf
 
-# A filled-in card.
+# A filled-in card. The identity source is pinned, so the UUID is known.
+ADID=$(mktemp -d)
+printf '100000001234abcd\0' > "$ADID/serial-number"
+ADSB_ID_SOURCES="$ADID/serial-number"
 conf_load tests/fixtures/adsb.conf
 AD=$(adsb_render 2>/dev/null) || bad "the fixture renders"
 for expect in \
@@ -809,6 +881,31 @@ case "$AD" in
     *)            ok  "nothing is written to disk continuously" ;;
 esac
 is "the summary names who gets it" "$(adsb_feed_summary)" "OGN, feed.adsb.fi, feed.airplanes.live"
+
+# The feed sites are told who is sending, or readsb logs "Not a valid UUID"
+# on every connection and the feed arrives anonymously.
+ADU1=$(adsb_uuid)
+adsb_uuid_ok "$ADU1" && ok "a UUID is derived from the hardware serial" || bad "a UUID is derived from the hardware serial" "$ADU1"
+case "$AD" in
+    *"--uuid $ADU1"*) ok  "and readsb is given it" ;;
+    *)                bad "and readsb is given it" "$AD" ;;
+esac
+is "the same serial gives the same UUID" "$(adsb_uuid)" "$ADU1"
+case "$ADU1" in *1234abcd*) bad "the serial itself is not sent" "$ADU1" ;; *) ok "the serial itself is not sent" ;; esac
+printf 'Serial\t\t: 100000001234abcd\n' > "$ADID/cpuinfo"
+is "cpuinfo gives the same answer as the device tree" \
+   "$(ADSB_ID_SOURCES="$ADID/missing $ADID/cpuinfo"; adsb_uuid)" "$ADU1"
+printf 'Serial\t\t: 0000000000000000\n' > "$ADID/zero"
+printf 'abcdef0123456789abcdef0123456789\n' > "$ADID/machine-id"
+ADU2=$(ADSB_ID_SOURCES="$ADID/zero $ADID/machine-id"; adsb_uuid)
+adsb_uuid_ok "$ADU2" && [ "$ADU2" != "$ADU1" ] \
+    && ok "an all-zero serial falls through to machine-id" || bad "an all-zero serial falls through to machine-id" "$ADU2"
+ADN=$(ADSB_ID_SOURCES="$ADID/missing"; adsb_render 2>/dev/null)
+case "$ADN" in
+    *--uuid*)          bad "with no identity at all it feeds anonymously" "$ADN" ;;
+    *net-connector*)   ok  "with no identity at all it feeds anonymously" ;;
+    *)                 bad "with no identity at all it feeds anonymously" "$ADN" ;;
+esac
 
 # One multilateration environment per site that is on, and none for the rest.
 ML=$(adsb_mlat_render ADSBFi 2>/dev/null) || bad "an mlat environment renders"
@@ -863,6 +960,14 @@ check_rejects "a Custom entry with no port is refused"       's|Custom        = 
 # is not where it says it is makes everyone else's answers worse.
 check_rejects "mlat with the position still 0,0 is refused"  's/Latitude  = +51.1874/Latitude = 0.0/; s/Longitude =  -1.8340/Longitude = 0.0/'
 check_rejects "mlat with no site to send it to is refused"   's/ADSBFi        = true/ADSBFi = false/; s/AirplanesLive = true/AirplanesLive = false/'
+check_rejects "an ADSB.Feed.UUID that is not a UUID is refused" 's|Custom        = ""|Custom = ""; UUID = "not-a-uuid"|'
+sed 's|Custom        = ""|Custom = ""; UUID = "01234567-89ab-cdef-0123-456789abcdef"|' tests/fixtures/adsb.conf > "$ADT/c.conf"
+conf_load "$ADT/c.conf"
+ADO=$(adsb_render 2>/dev/null)
+case "$ADO" in
+    *"--uuid 01234567-89ab-cdef-0123-456789abcdef"*) ok  "ADSB.Feed.UUID on the card wins" ;;
+    *)                                               bad "ADSB.Feed.UUID on the card wins" "$ADO" ;;
+esac
 # A custom target that IS well formed has to survive all of that.
 sed 's|Custom        = ""|Custom = "feed.example.org:30004"|' tests/fixtures/adsb.conf > "$ADT/c.conf"
 conf_load "$ADT/c.conf"
@@ -871,7 +976,7 @@ case "$ADC" in
     *"feed.example.org,30004,beast_reduce_plus_out"*) ok  "a well-formed Custom target is fed" ;;
     *)                                                bad "a well-formed Custom target is fed" "$ADC" ;;
 esac
-rm -rf "$ADT"
+rm -rf "$ADT" "$ADID"
 
 # The whole apply path, against stubs. systemctl is what must not be called
 # twice, and readsb only has to exist for the command -v check.
@@ -888,7 +993,10 @@ for a in "$@"; do case "$a" in --*) ;; *) unit="$a" ;; esac; done
 case "$verb" in
     is-active|is-enabled) grep -qx "$unit" "$ADSB_LOG.on" 2>/dev/null ;;
     enable|start|restart) printf '%s\n' "$unit" >> "$ADSB_LOG.on"; exit 0 ;;
-    disable|stop)         grep -vx "$unit" "$ADSB_LOG.on" > "$ADSB_LOG.on.t" 2>/dev/null
+    disable)              case " $* " in *" --now "*) ;; *) exit 0 ;; esac
+                          grep -vx "$unit" "$ADSB_LOG.on" > "$ADSB_LOG.on.t" 2>/dev/null
+                          mv "$ADSB_LOG.on.t" "$ADSB_LOG.on" 2>/dev/null; exit 0 ;;
+    stop)                 grep -vx "$unit" "$ADSB_LOG.on" > "$ADSB_LOG.on.t" 2>/dev/null
                           mv "$ADSB_LOG.on.t" "$ADSB_LOG.on" 2>/dev/null; exit 0 ;;
     *) exit 0 ;;
 esac
@@ -902,6 +1010,17 @@ conf_load tests/fixtures/adsb.conf
 adsb_apply >/dev/null 2>&1 && ok "applies cleanly" || bad "applies cleanly"
 [ -f "$ADSB_DEFAULT" ] && ok "writes the readsb defaults" || bad "writes the readsb defaults"
 grep -q 'systemctl restart readsb' "$ADSB_LOG" && ok "starts readsb" || bad "starts readsb"
+# Enabled, readsb starts at boot before the card is read, and an enable made
+# while the root is writable outlives the overlay. ogn-adsb.service starts it.
+grep -q 'systemctl enable readsb' "$ADSB_LOG" \
+    && bad "readsb is started, never enabled" || ok "readsb is started, never enabled"
+# The mlat units wait for network-online.target; the config resync runs before
+# it. A blocking restart from there is a boot that never finishes.
+if grep 'ogn-mlat@' "$ADSB_LOG" | grep -E ' (restart|enable) ' | grep -vq -- '--no-block'; then
+    bad "mlat clients are started without waiting on them" "$(cat "$ADSB_LOG")"
+else
+    ok "mlat clients are started without waiting on them"
+fi
 [ -f "$ADSB_MLAT_DIR/adsbfi.env" ] \
     && ok "an mlat environment for each site that is on" \
     || bad "an mlat environment for each site that is on"

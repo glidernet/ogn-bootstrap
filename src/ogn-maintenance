@@ -123,20 +123,26 @@ config_sync() {
     # wifi_apply is itself a no-op when the live config already matches.
     wifi_apply
 
-    # WireGuard belongs to ogn-wireguard.service, which waits for the network
-    # -- exactly what this must not do. What is left for here is the edit
-    # applied to a receiver that is already up: `ogn-maintenance --config-sync`
-    # by hand, with a tunnel running that the card has just changed. At boot
-    # the interface does not exist yet, so this stays out of the way.
-    if wg_up; then
+    # WireGuard and ADS-B belong to their own services, which wait for the
+    # network -- exactly what this must not do, since it runs before
+    # network-online.target and anything here that waits on a unit ordered
+    # after it waits forever. What is left for here is an edit applied by hand
+    # to a receiver that is already up: `ogn-maintenance --config-sync`.
+    #
+    # Asked of systemd rather than inferred from what is running: readsb left
+    # enabled by an earlier version is already up at boot, and taking that to
+    # mean "run by hand" is how a boot hung here.
+    local booting=0
+    case "$(systemctl is-system-running 2>/dev/null)" in
+        initializing|starting) booting=1 ;;
+    esac
+
+    if [ "$booting" -eq 0 ] && wg_up; then
         ogn-wireguard --config "$BOOT_CONF" --apply \
             || warn "could not re-apply Network.WireGuard; see journalctl -u ogn-wireguard"
     fi
 
-    # ADS-B has the same shape: ogn-adsb.service waits for the network, so at
-    # boot this leaves it alone. On a card edit applied by hand to a running
-    # receiver, readsb is already up and this is what notices.
-    if systemctl is-active --quiet readsb 2>/dev/null; then
+    if [ "$booting" -eq 0 ] && systemctl is-active --quiet readsb 2>/dev/null; then
         ogn-adsb --config "$BOOT_CONF" --apply \
             || warn "could not re-apply ADSB; see journalctl -u ogn-adsb"
     fi
@@ -193,7 +199,10 @@ config_sync() {
     if [ -z "$(conf_get APRS.Call "")" ]; then
         sed -i "s|^\( *Call *= *\)\"\"|\1\"$call\"|" "$target"
     fi
-    if ! conf_has RF.FreqCorr && [ -n "$old_freq" ]; then
+    # Checked against the file itself, not the parsed settings: a second
+    # FreqCorr is a duplicate setting, which libconfig refuses outright and
+    # takes the receiver off the air.
+    if [ -n "$old_freq" ] && ! grep -q '^ *FreqCorr *=' "$target"; then
         sed -i "s|^\( *SampleRate *=\)|  FreqCorr = $old_freq;   # measured by ogn-calibrate\n\1|" "$target"
     fi
     conf_redact_secrets "$target"
@@ -290,6 +299,51 @@ install_check() {
     fi
 }
 
+# --- the first reboot ----------------------------------------------------
+# Run by ogn-first-reboot.timer, and once directly by the installer. Returns
+# without doing anything until the root no longer needs to be writable; then
+# arms the overlay if the installer asked for it, and reboots. See
+# FIRST_REBOOT_PENDING in ogn-common.sh.
+first_reboot() {
+    local since now until
+    [ -e "$FIRST_REBOOT_PENDING" ] || return 0
+
+    if cloud_init_running; then
+        log "first reboot: waiting for cloud-init to finish"
+        return 0
+    fi
+
+    if connect_signin_pending; then
+        now=$(date +%s)
+        [ -s "$FIRST_REBOOT_PENDING.since" ] || printf '%s\n' "$now" > "$FIRST_REBOOT_PENDING.since"
+        since=$(cat "$FIRST_REBOOT_PENDING.since")
+        if [ $((now - since)) -lt "$FIRST_REBOOT_LIMIT" ]; then
+            until=$(date -d "@$((since + FIRST_REBOOT_LIMIT))" '+%H:%M' 2>/dev/null || printf 'later')
+            log "first reboot: waiting for Raspberry Pi Connect to sign in (gives up at $until)"
+            mkdir -p "$(dirname "$FIRST_REBOOT_MOTD")"
+            cat > "$FIRST_REBOOT_MOTD" <<EOF
+
+  Setup is finished, but the read-only root is not on yet: waiting for
+  Raspberry Pi Connect to sign in, which needs the network. It reboots into
+  read-only mode by itself once Connect is signed in, or at $until regardless.
+
+EOF
+            return 0
+        fi
+        warn "Raspberry Pi Connect did not sign in within $((FIRST_REBOOT_LIMIT / 3600)) hours; its auth key has expired"
+        warn "sign in by hand with the overlay off: see 'Connect and the read-only root' in the README"
+    fi
+
+    if [ "$(cat "$FIRST_REBOOT_PENDING")" = overlay ]; then
+        log "enabling the read-only overlay"
+        overlay_set enable || warn "the overlay could not be enabled; this receiver will come up WRITABLE"
+    fi
+    rm -f "$FIRST_REBOOT_PENDING" "$FIRST_REBOOT_PENDING.since" "$FIRST_REBOOT_MOTD"
+    systemctl disable ogn-first-reboot.timer >/dev/null 2>&1 || true
+    log "rebooting"
+    systemctl reboot
+}
+
 boot_check() {
     case "$(state_read)" in
         updating)
@@ -327,6 +381,7 @@ while [ $# -gt 0 ]; do
         --overlay-status) MODE=overlay-status ;;
         --overlay-enable) MODE=overlay-enable ;;
         --overlay-disable) MODE=overlay-disable ;;
+        --first-reboot)   MODE=first-reboot ;;
         -h|--help)        sed -n '3,21p' "$0"; exit 0 ;;
         *)                die "unknown option: $1" ;;
     esac
@@ -358,6 +413,7 @@ case "$MODE" in
     # For the installer; `overlay on` is the front end for people.
     overlay-enable)  overlay_set enable ;;
     overlay-disable) overlay_set disable ;;
+    first-reboot)    first_reboot ;;
     boot-check)      boot_check ;;
     config-sync)     config_sync ;;
     scheduled|now)   begin_cycle ;;

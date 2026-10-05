@@ -728,15 +728,24 @@ grep -qE '^[^#][^[:space:]]*[[:space:]]+/boot/firmware[[:space:]].*umask=0077' /
     || warn "/etc/fstab sets its own umask on /boot/firmware, so the wifi password and any
      WireGuard key on the card stay readable by every account on this Pi"
 
+ARM_OVERLAY=0
 if [ "$READONLY_FS" -eq 1 ]; then
     if ogn-maintenance --overlay-status | grep -q '^enabled'; then
         log "read-only overlay already enabled"
+    elif [ "$REBOOT_WHEN_DONE" -eq 1 ]; then
+        # Armed by the first reboot itself, once nothing still needs the root
+        # writable -- so a power cut while it waits comes back writable, and
+        # still waiting, rather than read-only with the waiting forgotten.
+        # Checked now all the same, so a missing piece fails the install,
+        # and is retried, rather than surfacing as a writable receiver later.
+        overlay_ensure_initramfs && overlay_preflight \
+            || die "the read-only overlay could not be prepared"
+        log "the read-only overlay is enabled at the reboot"
+        ARM_OVERLAY=1
     else
         log "enabling the read-only overlay (takes effect at the next reboot)"
         ogn-maintenance --overlay-enable
-        if [ "$REBOOT_WHEN_DONE" -eq 0 ]; then
-            warn "the read-only overlay is armed but will not be active until you reboot"
-        fi
+        warn "the read-only overlay is armed but will not be active until you reboot"
     fi
 fi
 
@@ -761,6 +770,55 @@ conf_digest Install | boot_write "$INSTALL_APPLIED"
 log "setup complete"
 
 if [ "$REBOOT_WHEN_DONE" -eq 1 ]; then
-    log "rebooting"
-    systemctl reboot
+    # On first boot this runs as cloud-init's scripts_vendor, and Imager's own
+    # settings -- Raspberry Pi Connect, passwordless sudo, SSH -- are runcmd,
+    # which runs in scripts_user, after it. Rebooting from here cut them off,
+    # so they ran instead on the next boot, under the overlay: in RAM, and
+    # again at every boot after, re-presenting a single-use Connect key that
+    # had already been spent.
+    #
+    # So the reboot is handed to a timer, which waits for cloud-init to finish
+    # and for Connect to sign in -- for as long as the network takes, up to
+    # the key's six-hour life -- and only then arms the overlay and reboots.
+    # A unit on disk rather than a transient one, so that it survives a power
+    # cut while it waits.
+    install -d -m 0755 "$FIRST_REBOOT_DIR"
+    if [ "$ARM_OVERLAY" -eq 1 ]; then
+        printf 'overlay\n' > "$FIRST_REBOOT_PENDING"
+    else
+        printf 'reboot\n' > "$FIRST_REBOOT_PENDING"
+    fi
+    write_unit ogn-first-reboot.service <<EOF
+[Unit]
+Description=OGN receiver: the reboot that finishes setup
+Documentation=https://github.com/glidernet/ogn-bootstrap
+After=cloud-final.service
+ConditionPathExists=$FIRST_REBOOT_PENDING
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ogn-maintenance --first-reboot
+EOF
+    write_unit ogn-first-reboot.timer <<EOF
+[Unit]
+Description=OGN receiver: reboot to finish setup, once nothing needs a writable root
+Documentation=https://github.com/glidernet/ogn-bootstrap
+ConditionPathExists=$FIRST_REBOOT_PENDING
+
+[Timer]
+OnBootSec=1min
+OnUnitInactiveSec=1min
+
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl enable ogn-first-reboot.timer >/dev/null 2>&1 || true
+    if cloud_init_running; then
+        log "rebooting once cloud-init has finished and Raspberry Pi Connect, if set up, has signed in"
+    else
+        # Run by hand: usually nothing to wait for, so this reboots now.
+        ogn-maintenance --first-reboot
+    fi
+    systemctl start --no-block ogn-first-reboot.timer >/dev/null 2>&1 || true
 fi

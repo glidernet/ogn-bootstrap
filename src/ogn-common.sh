@@ -96,14 +96,19 @@ _libconfig_flatten() {
                     if (d == "\"") { ins = 1; val = val d; j++; continue }
                     if (d == "[" || d == "(") { bd++; val = val d; j++; continue }
                     if (d == "]" || d == ")") { bd--; val = val d; j++; continue }
-                    if (d == ";" && bd <= 0) break
+                    if ((d == ";" || d == ",") && bd <= 0) { j++; break }
+                    # libconfig makes the terminator optional, so a value
+                    # also ends at the end of its line or at the closing
+                    # brace, which is left for the group to consume.
+                    if (d == "}" && bd <= 0) break
+                    if (d == "\n" && bd <= 0 && val ~ /[^ \t\r]/) break
                     val = val d; j++
                 }
                 p = ""
                 for (k = 1; k <= np; k++) p = p stack[k] "."
                 gsub(/^[ \t\r\n]+/, "", val); gsub(/[ \t\r\n]+$/, "", val)
                 print p pending "=" val
-                pending = ""; i = j + 1; continue }
+                pending = ""; i = j; continue }
             i++
         }
     }' "$1"
@@ -1043,12 +1048,49 @@ adsb_enabled_feeds() {
 # means "let the tuner decide", so a bare - is not enough to reject on.
 adsb_number_ok() { printf '%s' "$1" | grep -Eq '^-?[0-9]+(\.[0-9]+)?$'; }
 
+# Where this receiver's identity comes from, first one readable wins: the Pi's
+# own serial number, then machine-id for anything that is not a Pi.
+ADSB_ID_SOURCES="${OGN_ADSB_ID_SOURCES:-/sys/firmware/devicetree/base/serial-number /proc/cpuinfo /etc/machine-id}"
+
+adsb_uuid_ok() { printf '%s' "$1" | grep -Eq '^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$'; }
+
+# adsb_uuid — the UUID readsb gives the feed sites, so they can tell this
+# receiver's data from everyone else's. Without one readsb still feeds, but
+# anonymously, and complains about it on every connection.
+#
+# ADSB.Feed.UUID on the card wins, for a receiver already registered with a
+# site. Otherwise it is derived from the hardware serial rather than generated
+# and stored: the same at every boot and across a reflash, so the sites keep
+# the station's history, with nothing written to the card. Hashed, so the
+# serial itself never leaves the Pi. Prints nothing if there is no source.
+adsb_uuid() {
+    local id src h v
+    id=$(conf_get ADSB.Feed.UUID "")
+    if [ -n "$id" ]; then printf '%s' "$id"; return 0; fi
+    for src in $ADSB_ID_SOURCES; do
+        [ -r "$src" ] || continue
+        case "$src" in
+            */cpuinfo) id=$(sed -n 's/^Serial[[:space:]]*:[[:space:]]*//p' "$src" | head -1) ;;
+            *)         id=$(tr -d '\0\n' < "$src") ;;
+        esac
+        # An all-zero serial is what a board without one reports.
+        case "$id" in ''|*[!0]*) ;; *) id="" ;; esac
+        [ -n "$id" ] && break
+    done
+    [ -n "$id" ] || return 0
+    h=$(printf 'ogn-bootstrap-adsb:%s' "$id" | sha256_stdin)
+    # Shaped as a version 4 UUID, which is what the sites' own scripts make.
+    v=$(printf '%s' "89ab" | cut -c$(( 0x${h:16:1} % 4 + 1 )))
+    printf '%s-%s-4%s-%s%s-%s' "${h:0:8}" "${h:8:4}" "${h:13:3}" "$v" "${h:17:3}" "${h:20:12}"
+}
+
 # adsb_render — print /etc/default/readsb from the loaded card settings.
 #
-# Pure: reads the config, writes stdout, touches nothing. Returns 1, saying
-# what is wrong, rather than rendering something that cannot work.
+# Pure: reads the config (and the hardware serial, for adsb_uuid), writes
+# stdout, touches nothing. Returns 1, saying what is wrong, rather than
+# rendering something that cannot work.
 adsb_render() {
-    local serial ogn_serial gain custom entry host f conn="" feeds="" ok=1
+    local serial ogn_serial gain custom entry host f conn="" feeds="" ok=1 uuid
 
     serial=$(conf_get ADSB.DeviceSerial "")
     ogn_serial=$(conf_get RF.DeviceSerial "")
@@ -1112,6 +1154,19 @@ adsb_render() {
         IFS=','
     done
     IFS="$IFS_SAVE"
+
+    # Only sent to the sites, so only worth having when there are some.
+    if [ -n "$conn" ]; then
+        uuid=$(adsb_uuid)
+        if [ -z "$uuid" ]; then
+            warn "no hardware serial or machine-id to identify this receiver to the feed sites; feeding anonymously"
+        elif adsb_uuid_ok "$uuid"; then
+            conn="$conn --uuid $uuid"
+        else
+            warn "ADSB.Feed.UUID ('$uuid') is not a UUID; it looks like 01234567-89ab-cdef-0123-456789abcdef"
+            ok=0
+        fi
+    fi
 
     [ "$ok" -eq 1 ] || return 1
 
@@ -1187,11 +1242,14 @@ adsb_mlat_apply() {
             fi
             if ! cmp -s "$tmp" "$ADSB_MLAT_DIR/$inst.env"; then
                 install -m 0644 "$tmp" "$ADSB_MLAT_DIR/$inst.env"
-                systemctl restart "ogn-mlat@$inst.service" >/dev/null 2>&1 || true
+                # --no-block throughout: these units wait for
+                # network-online.target, and a caller ordered before it would
+                # otherwise wait for them forever.
+                systemctl --no-block restart "ogn-mlat@$inst.service" >/dev/null 2>&1 || true
             fi
             rm -f "$tmp"
             systemctl is-enabled --quiet "ogn-mlat@$inst.service" 2>/dev/null \
-                || systemctl enable --now "ogn-mlat@$inst.service" >/dev/null 2>&1 || true
+                || systemctl --no-block enable --now "ogn-mlat@$inst.service" >/dev/null 2>&1 || true
         else
             systemctl is-enabled --quiet "ogn-mlat@$inst.service" 2>/dev/null \
                 && systemctl disable --now "ogn-mlat@$inst.service" >/dev/null 2>&1 || true
@@ -1243,6 +1301,14 @@ adsb_apply() {
         return 1
     fi
 
+    # Never enabled: ogn-adsb.service starts it at every boot, once the card
+    # has been read. Enabled, it starts on its own before that, on whatever
+    # /etc/default/readsb survived -- and an enable made while the root was
+    # writable survives the overlay. Earlier versions did exactly that.
+    if systemctl is-enabled --quiet readsb 2>/dev/null; then
+        systemctl disable readsb >/dev/null 2>&1 || true
+    fi
+
     tmp=$(mktemp)
     if ! adsb_render > "$tmp"; then
         rm -f "$tmp"
@@ -1261,7 +1327,6 @@ adsb_apply() {
 
     if [ "$changed" -eq 1 ]; then
         log "starting readsb on the ADS-B stick"
-        systemctl enable readsb >/dev/null 2>&1 || true
         if ! systemctl restart readsb >/dev/null 2>&1; then
             warn "readsb would not start; see journalctl -u readsb"
             return 1
@@ -1271,6 +1336,41 @@ adsb_apply() {
     adsb_mlat_apply || { adsb_motd_update; return 1; }
     adsb_motd_update
     return 0
+}
+
+# --------------------------------------------------------------------------
+# The first reboot
+#
+# On first boot the installer leaves the overlay unarmed and hands the reboot
+# to ogn-first-reboot.timer, which waits until nothing else still needs a
+# writable root: cloud-init finishing Imager's settings, and Raspberry Pi
+# Connect spending the auth key Imager gave it. A sign-in made under the
+# overlay is forgotten at the next reboot, and the key is single-use, so it
+# has to happen here or not at all.
+# --------------------------------------------------------------------------
+FIRST_REBOOT_DIR="${OGN_FIRST_REBOOT_DIR:-/var/lib/ogn-bootstrap}"
+FIRST_REBOOT_PENDING="$FIRST_REBOOT_DIR/first-reboot.pending"
+FIRST_REBOOT_MOTD="${OGN_FIRST_REBOOT_MOTD:-/etc/motd.d/15-ogn-first-reboot}"
+# A personal auth key expires six hours after it is made. Past that there is
+# nothing left to wait for.
+FIRST_REBOOT_LIMIT="${OGN_FIRST_REBOOT_LIMIT:-21600}"
+HOME_ROOT="${OGN_HOME_ROOT:-/home}"
+
+cloud_init_running() {
+    command -v cloud-init >/dev/null 2>&1 \
+        && cloud-init status 2>/dev/null | grep -q 'status: running'
+}
+
+# connect_signin_pending — an auth key is waiting to be spent by an account
+# that is not signed in yet. Connect removes the key once it has tried, and
+# state.json is what a successful sign-in leaves behind.
+connect_signin_pending() {
+    local key
+    for key in "$HOME_ROOT"/*/.config/com.raspberrypi.connect/auth.key; do
+        [ -e "$key" ] || continue
+        [ -s "$(dirname "$key")/state.json" ] || return 0
+    done
+    return 1
 }
 
 # --------------------------------------------------------------------------

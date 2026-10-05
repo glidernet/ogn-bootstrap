@@ -99,7 +99,9 @@ so first boot is mostly waiting for the network: it fetches the decoder (about
 350 kB) and the geoid table, then reboots itself once to bring up the read-only
 filesystem. A minute or two, not five — unless you asked for
 [calibration](#calibrating-the-sdr), which adds up to three minutes of
-listening before the receiver starts.
+listening before the receiver starts, or set up Raspberry Pi Connect, in which
+case that reboot waits until Connect has signed in (see
+[Connect and the read-only root](#connect-and-the-read-only-root)).
 
 Check it worked:
 
@@ -240,9 +242,33 @@ All three are **off by default**, in the `Install.RemoteAdmin` section:
 
 | Setting | What it does |
 |---|---|
-| `Connect` | [Raspberry Pi Connect](https://www.raspberrypi.com/documentation/services/connect.html): a shell in your browser, through NAT, using your Raspberry Pi ID. Set `ConnectAuthKey` to an organisation key to link it with no sign-in step; otherwise log in once and run `rpi-connect signin`. |
+| `Connect` | [Raspberry Pi Connect](https://www.raspberrypi.com/documentation/services/connect.html): a shell in your browser, through NAT, using your Raspberry Pi ID. Set `ConnectAuthKey` to an organisation key to link it with no sign-in step; otherwise log in once and run `rpi-connect signin` — with the overlay off, see [Connect and the read-only root](#connect-and-the-read-only-root). |
 | `OGNTeam` | A reverse SSH tunnel letting the OGN core team log in to help diagnose problems. They must accept this machine's key first — ask on the OGN forum. **This grants a third party access to a machine on your club's network.** Worth it for a receiver nobody local can maintain; your decision either way. |
 | `ExtraSSHKeys` | Additional authorised keys. Setting any also turns off SSH password login. |
+
+### Connect and the read-only root
+
+Connect keeps its sign-in in `~/.config/com.raspberrypi.connect/state.json`,
+on the root filesystem. Sign in with the overlay on and it works — until the
+next reboot, when the overlay discards it and the receiver comes back signed
+out. Nothing reports this; the device simply goes offline in the Connect
+dashboard. So sign in while the root is writable:
+
+```sh
+sudo overlay off --reboot
+rpi-connect signin            # open the link it prints
+sudo overlay on --reboot
+rpi-connect status            # after the reboot: Signed in: yes
+```
+
+Setting Connect up in Imager does this for you. Imager hands over a personal
+auth key through cloud-init, and the first boot holds off the reboot into
+read-only mode until Connect has spent it — however long the network takes —
+so the sign-in is made, and kept, while the root is still writable. The
+receiver runs normally meanwhile, and the login banner says what it is waiting
+for. The key expires six hours after Imager made it, so after that the wait
+ends regardless; a receiver that never got online in that time comes up
+signed out, and needs signing in by hand as above.
 
 There is a fourth, in `Network.WireGuard` rather than `Install.RemoteAdmin`,
 because it is networking rather than something the installer builds in — see
@@ -436,6 +462,14 @@ says it is makes everybody else's answers worse, so `ogn-adsb` refuses to feed
 multilateration from a position that is still `0,0`.
 
 `Custom` takes `"host:port, host:port"` for anywhere else that accepts Beast.
+
+Each site is also sent a UUID, which is how it tells this receiver's data from
+everyone else's — and how its "is my feeder working" pages find you. It is
+worked out from the Pi's serial number rather than generated and stored, so it
+is the same at every boot and after a reflash, the site keeps the station's
+history, and nothing is written to the card. Only a hash of the serial leaves
+the Pi. If a site already knows this receiver by a UUID of its own, set `UUID`
+in the `Feed` section to that instead.
 
 FlightAware, Flightradar24 and Plane Finder are **not** in that list. Each needs
 its own feeder software downloaded from the vendor — proprietary binaries, in
