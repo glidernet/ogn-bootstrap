@@ -315,8 +315,11 @@ Network:
 } ;
 ```
 
-`AllowedIPs` is what gets routed *into* the tunnel. For reaching the receiver,
-that is your VPN subnet and nothing else. `0.0.0.0/0` instead sends everything
+`AllowedIPs` names the addresses at the *server's* end, not the receiver's: what
+gets routed *into* the tunnel, and what is accepted out of it. For reaching the
+receiver, that is your VPN subnet and nothing else; to reach more networks
+behind the server, list them comma-separated in the one string, e.g.
+`"10.6.0.0/24, 192.168.50.0/24"`. `0.0.0.0/0` instead sends everything
 — including the receiver's uplink to the OGN network — through your server,
 which makes your server a single point of failure for reception, and needs
 `nftables` or `iptables` on the Pi besides. `PersistentKeepalive` is what keeps
@@ -571,8 +574,31 @@ you set them: put the card in any laptop and edit the file on `bootfs`.
 `ogn-config-sync.service` reads it early in the boot — before anything waits
 for the network, and before the decoder starts — so the change is simply live,
 with no restart and nothing written back to the card. An unchanged file does no
-work at all. On a Pi you can still log in to, `sudo ogn-maintenance
---config-sync` applies an edit without rebooting.
+work at all.
+
+### Editing it on the Pi itself
+
+On a Pi you can log in to, the file is `/boot/firmware/MyReceiver.conf`. The
+read-only overlay does not cover it, so an edit there survives a reboot. But
+the boot partition is mounted read-only in its own right, and readable only by
+root, so open it for the edit and close it again afterwards:
+
+```sh
+sudo mount -o remount,rw /boot/firmware
+sudo nano /boot/firmware/MyReceiver.conf
+sudo sync
+sudo mount -o remount,ro /boot/firmware
+sudo ogn-maintenance --config-sync     # apply now, rather than at the next boot
+```
+
+Quit the editor before the last `mount`. A swap file still open on the
+partition makes the remount fail with "busy", and the partition then stays
+writable until the next reboot. That is harmless, but it is exactly the
+exposure to a power cut that mounting it read-only is there to avoid.
+
+`--config-sync` applies everything except the `Install` section. WireGuard and
+ADS-B changes are applied straight away only if those services are already
+running; otherwise they take effect at the next boot.
 
 The **`Install`** section is different, because it describes how the machine
 was built — which packages are on it, whether the overlay is armed, when the
