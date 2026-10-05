@@ -443,6 +443,78 @@ two of the three cases — rather than a package from Debian, so none of it ship
 here. You can install them by hand alongside this; `readsb` is already serving
 Beast on 30005 and raw AVR on 30002 for them to read.
 
+### FlightAware, Flightradar24 and Plane Finder
+
+Each of these is installed the same way: get the `ADSB` section working first,
+switch the overlay off, install the vendor's feeder pointed at `readsb`, sign
+up, and switch the overlay back on.
+
+```sh
+sudo ogn-adsb status          # aircraft are being decoded — do not go further until they are
+sudo overlay off --reboot     # comes back writable
+  ... install and sign up, below ...
+sudo overlay on --reboot      # back to protected
+```
+
+The overlay has to be off for the **whole** of it, signing up included. Each
+feeder keeps its identity — the sharing key, the feeder ID — in a file under
+`/etc` or `/var`, and one created while the overlay is on is gone at the next
+boot. The feeder then signs up again as a new station every time the Pi
+restarts, and nothing errors to tell you. Write the key down as well: a
+reflashed card starts from nothing, and giving the old key back is how the
+site keeps your station's history.
+
+The one rule common to all three: **never let the installer set up its own
+decoder.** They all offer to install `dump1090`, which would fight `readsb` for
+the 1090 stick. Each one should be told it has a Beast receiver on
+`127.0.0.1:30005`, and nothing more.
+
+**FlightAware** — install `piaware` following FlightAware's instructions for
+Raspberry Pi OS (their repository package, not the PiAware SD card image), then:
+
+```sh
+sudo piaware-config receiver-type other
+sudo piaware-config receiver-host 127.0.0.1
+sudo piaware-config receiver-port 30005
+sudo piaware-config mlat-results false
+sudo systemctl restart piaware
+```
+
+Claim the feeder on flightaware.com/adsb/piaware/claim from the same network.
+The feeder ID is in `/var/cache/piaware/feeder_id`, which is why `piaware` has
+to run at least once before the overlay goes back on. `mlat-results false`
+stops FlightAware's multilateration answers being fed back into `readsb` on
+30104 — the port this image's own MLAT uses — and from there on to OGN;
+FlightAware's terms do not allow them to be passed on.
+
+**Flightradar24** — run the Raspberry Pi install command from Flightradar24's
+*Share your data* page. In the signup:
+
+- **Receiver type:** ModeS Beast (TCP), at `127.0.0.1:30005`
+- **Position:** the same as `Position` in `MyReceiver.conf` — but Flightradar24
+  asks for the altitude in **feet**, where this file uses metres
+
+`fr24feed-status` reports whether it is connected, and there is a status page
+on port 8754. The sharing key ends up in `/etc/fr24feed.ini`.
+
+**Plane Finder** — install the `pfclient` package for 64-bit ARM from
+Plane Finder's download page, then open `http://<hostname>.local:30053/` and
+work through the setup there: data format **Beast**, TCP, `127.0.0.1` port
+`30005`. The setup page writes the share code to `/etc/pfclient-config.json`.
+
+All three log under `/var/log`. With the overlay on that is RAM, so they cost
+the card nothing and lose their history at every reboot.
+
+**None of them is updated by the weekly maintenance cycle.** That runs
+`unattended-upgrade`, which takes security updates from the Debian and Raspberry
+Pi archives and nothing else. Updating a feeder is the same overlay-off,
+overlay-on round as installing it, with `sudo apt update && sudo apt install
+--only-upgrade piaware fr24feed pfclient` (or whichever you have) in the middle.
+
+And they depend on the `ADSB` section staying switched on. None of them has a
+stick of its own; set `Enable = false` and `readsb` stops, and each feeder sits
+there reporting no data.
+
 ### What it does not do
 
 There is no map. The image ships no web interface for `readsb`, and
