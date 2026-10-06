@@ -1738,6 +1738,12 @@ Restart=always
 RestartSec=10
 StandardOutput=journal
 StandardError=journal
+# ogn-decode echoes every packet it uplinks, each followed by a blank line.
+# With ADS-B on that is several lines a second, enough to push everything
+# else out of the RAM journal within hours. The procServ console
+# (telnet localhost 50001) still shows them.
+LogFilterPatterns=~^APRS <-
+LogFilterPatterns=~^[[:space:]]*\$
 EOF
 
 # The grouping unit exists so that 'systemctl restart rtlsdr-ogn' does the
@@ -2054,9 +2060,9 @@ ogn-adsb --config "$BOOT_CONF" --apply || warn "ADS-B is not running; see journa
 VERSION=$(basename "$REAL_DIR")
 
 # The decoder's page is always HTTP.Port + 1 and not separately configurable.
-PORT=$(conf_get HTTP.Port 8082)
+PORT=$(conf_get HTTP.Port 8080)
 case "$PORT" in
-    ''|*[!0-9]*) warn "HTTP.Port '$PORT' is not a number; assuming 8082"; PORT=8082 ;;
+    ''|*[!0-9]*) warn "HTTP.Port '$PORT' is not a number; assuming 8080"; PORT=8080 ;;
 esac
 
 if [ "$POSITION_OK" -eq 1 ]; then

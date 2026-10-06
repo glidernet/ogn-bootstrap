@@ -50,7 +50,7 @@ is "Latitude"                      "$(conf_get Position.Latitude)"             "
 is "Altitude"                      "$(conf_get Position.Altitude)"             "0"
 is "SampleRate"                    "$(conf_get RF.SampleRate)"                 "2.0"
 is "nested CenterFreq"             "$(conf_get RF.OGN.CenterFreq)"             "868.8"
-is "HTTP port"                     "$(conf_get HTTP.Port)"                     "8082"
+is "HTTP port"                     "$(conf_get HTTP.Port)"                     "8080"
 is "UpdateChannel"                 "$(conf_get Install.UpdateChannel)"         "stable"
 is "MaintenanceWindow keeps spaces" "$(conf_get Install.MaintenanceWindow)"    "Mon *-*-* 03:00:00"
 # Monday, not Sunday: a broken update is then found with a week to fix it,
@@ -74,10 +74,6 @@ grep -q '^# ADSB:' boot/MyReceiver.conf \
     && ok "the ADSB section is present but commented" \
     || bad "the ADSB section is present but commented"
 
-# 8080 is left free for dump1090/readsb/tar1090.
-grep -qE '^[[:space:]]*Port[[:space:]]*=[[:space:]]*8080' boot/MyReceiver.conf \
-    && bad "8080 is left free for an ADS-B map" \
-    || ok "8080 is left free for an ADS-B map"
 conf_bool Install.ReadOnlyFS            && ok "ReadOnlyFS reads as true"  || bad "ReadOnlyFS reads as true"
 conf_bool Install.RemoteAdmin.OGNTeam   && bad "OGNTeam reads as false"   || ok "OGNTeam reads as false"
 conf_bool Nothing.At.All                && bad "missing key is false"     || ok "missing key is false"
@@ -379,6 +375,24 @@ for name, port in (("ogn-rf", 50000), ("ogn-decode", 50001)):
     unit = src.split(f"write_unit {name}.service <<EOF", 1)[1].split("\nEOF", 1)[0]
     assert f'ExecStart=$(on_procserv {port} {name} "$REAL_DIR/{name}" MyReceiver.conf)' in unit, name
     assert "Restart=always" in unit, name
+PY2
+
+python3 - <<'PY2' && ok "ogn-decode keeps per-packet echoes out of the journal" || bad "ogn-decode keeps per-packet echoes out of the journal"
+import re
+src = open("src/ogn-install").read()
+unit = src.split("write_unit ogn-decode.service <<EOF", 1)[1].split("\nEOF", 1)[0]
+# The heredoc is unquoted, so \$ is what reaches the unit file as $.
+pats = [l.split("=~", 1)[1].replace("\\$", "$")
+        for l in unit.splitlines() if l.startswith("LogFilterPatterns=~")]
+assert len(pats) == 2, pats
+# systemd uses PCRE2; Python's re has no POSIX classes, so translate that one.
+pats = [re.compile(p.replace("[[:space:]]", r"\s")) for p in pats]
+drop = ["APRS <- ICA4CAD89>OGADSB:/194455h5950.28N/01713.65E^088/330/A=007520", "", "\r", "  "]
+keep = ["RF: sampling at 2.0 MHz", "APRS: connected to aprs.glidernet.org"]
+for l in drop:
+    assert any(p.search(l) for p in pats), repr(l)
+for l in keep:
+    assert not any(p.search(l) for p in pats), repr(l)
 PY2
 grep -qE '^PACKAGES=\(.* procserv\)' src/ogn-install && ok "the installer asks for procserv" || bad "the installer asks for procserv"
 grep -qE '^    procserv$' tools/build-image.sh && ok "and the image ships it" || bad "and the image ships it"
@@ -767,7 +781,7 @@ is "and the decoder's copy holds none" \
 is "while the card keeps all four" \
     "$(grep -c 'SECRET-' "$T/card.conf" | tr -d ' ')" "4"
 conf_load "$T/decoder.conf"
-is "the redacted copy still parses"  "$(conf_get HTTP.Port)"        "8082"
+is "the redacted copy still parses"  "$(conf_get HTTP.Port)"        "8080"
 is "and keeps what is not secret"    "$(conf_get RF.OGN.CenterFreq)" "868.8"
 rm -rf "$T"
 grep -q 'conf_redact_secrets "$TARGET_CONF"' src/ogn-install \
