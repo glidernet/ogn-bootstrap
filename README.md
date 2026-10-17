@@ -543,7 +543,7 @@ ADSB:
 {
   Enable       = true;
   DeviceSerial = "1090";
-  Gain         = -10;
+  Gain         = "auto";
 
   AVR    = "localhost:30002";
   MaxAlt = 18000;

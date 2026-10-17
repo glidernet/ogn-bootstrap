@@ -869,7 +869,7 @@ AD=$(adsb_render 2>/dev/null) || bad "the fixture renders"
 for expect in \
     '--device 1090' \
     '--device-type rtlsdr' \
-    '--gain -10' \
+    '--gain auto ' \
     "--net-ro-port 30002" \
     "--net-bo-port 30005" \
     "--net-bi-port 30104" \
@@ -942,18 +942,24 @@ adsb_render >/dev/null 2>&1 \
     && bad "an empty ADSB.DeviceSerial is refused" \
     || ok  "an empty ADSB.DeviceSerial is refused"
 # Gain is different, and deliberately so: conf_get cannot tell an empty value
-# from an absent one, so a blank Gain falls back to the -10 that means "let the
-# tuner decide". That is the right answer for a gain, and the wrong one for a
-# serial, which is why only the serial is required above.
-sed 's/^  Gain         = -10;/  Gain = "";/' tests/fixtures/adsb.conf > "$ADT/c.conf"
-conf_load "$ADT/c.conf"
+# from an absent one, so a blank Gain falls back to readsb's autogain. That is
+# the right answer for a gain, and the wrong one for a serial, which is why
+# only the serial is required above.
 # Captured rather than piped into grep -q: grep exits at the first match and
 # the SIGPIPE that follows becomes a pipeline failure under pipefail.
-ADG=$(adsb_render 2>/dev/null)
-case "$ADG" in
-    *"--gain -10"*) ok  "an empty ADSB.Gain falls back to automatic" ;;
-    *)              bad "an empty ADSB.Gain falls back to automatic" "$ADG" ;;
-esac
+check_gain() {
+    sed "s/^  Gain         = \"auto\";/  Gain = $2;/" tests/fixtures/adsb.conf > "$ADT/c.conf"
+    conf_load "$ADT/c.conf"
+    ADG=$(adsb_render 2>/dev/null)
+    case "$ADG" in
+        *"--gain $3 "*) ok  "$1" ;;
+        *)              bad "$1" "$ADG" ;;
+    esac
+}
+check_gain "an empty ADSB.Gain falls back to readsb's autogain" '""'       auto
+check_gain "\"AUTO\" is read as auto"                           '"AUTO"'   auto
+check_gain "-10 still hands the gain to the tuner"              '-10'      -10
+check_gain "a number still fixes the gain"                      '49.6'     49.6
 # The trap the whole two-dongle section exists to avoid: RF.Device is an index
 # and indexes move, so ADS-B without RF.DeviceSerial can hand the OGN decoder
 # the 1090 stick and leave nothing to explain the silence.
@@ -969,7 +975,7 @@ check_rejects() {
     adsb_render >/dev/null 2>&1 && bad "$1" || ok "$1"
 }
 check_rejects "both sticks given the same serial is refused" 's/DeviceSerial = "1090"/DeviceSerial = "868"/'
-check_rejects "a non-numeric gain is refused"                's/Gain         = -10/Gain         = "loud"/'
+check_rejects "a gain that is neither auto nor a number is refused" 's/Gain         = "auto"/Gain         = "loud"/'
 check_rejects "a Custom entry with no port is refused"       's|Custom        = ""|Custom = "feed.example.org"|'
 # Multilateration compares arrival times between receivers, so a receiver that
 # is not where it says it is makes everyone else's answers worse.

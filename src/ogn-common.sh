@@ -1099,7 +1099,7 @@ adsb_render() {
 
     serial=$(conf_get ADSB.DeviceSerial "")
     ogn_serial=$(conf_get RF.DeviceSerial "")
-    gain=$(conf_get ADSB.Gain -10)
+    gain=$(conf_get ADSB.Gain auto)
     custom=$(conf_get ADSB.Feed.Custom "")
 
     [ -n "$serial" ] || {
@@ -1117,7 +1117,12 @@ adsb_render() {
         ok=0
     fi
 
-    adsb_number_ok "$gain" || { warn "ADSB.Gain ('$gain') is not a number"; ok=0; }
+    # "auto" is readsb's own autogain, which steps the gain down as soon as
+    # anything comes close to clipping. -10 is the tuner's AGC instead, and
+    # any other number a fixed gain in dB.
+    [ "$(printf '%s' "$gain" | tr '[:upper:]' '[:lower:]')" = auto ] && gain=auto
+    [ "$gain" = auto ] || adsb_number_ok "$gain" \
+        || { warn "ADSB.Gain ('$gain') is not \"auto\" or a number"; ok=0; }
 
     # Multilateration works by comparing arrival times between receivers, so a
     # receiver that is not where it says it is makes everyone else's answers
