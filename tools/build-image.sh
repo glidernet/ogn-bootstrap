@@ -337,12 +337,13 @@ build_readsb() {
     # adsb_apply enables it once ADSB.Enable asks for it.
     chroot "$MNT" systemctl disable readsb.service >/dev/null 2>&1 || true
 
-    # Upstream's unit hardcodes --write-json /run/readsb. This image ships no
-    # map, so nothing would read it.
+    # Upstream's unit hardcodes --write-json /run/readsb. Stripped here so that
+    # it comes only from JSON_OPTIONS, which adsb_render sets for the
+    # statistics page; a receiver with ADS-B off writes nothing at all.
     install -d -m 0755 "$MNT/etc/systemd/system/readsb.service.d"
     cat > "$MNT/etc/systemd/system/readsb.service.d/ogn-bootstrap.conf" <<'EOF'
-# Written by tools/build-image.sh: readsb without --write-json, as this image
-# ships no map to read it.
+# Written by tools/build-image.sh: --write-json comes from JSON_OPTIONS in
+# /etc/default/readsb, which ogn-adsb renders from the card.
 [Service]
 ExecStart=
 ExecStart=/usr/bin/readsb --quiet $RECEIVER_OPTIONS $DECODER_OPTIONS $NET_OPTIONS $JSON_OPTIONS
@@ -368,7 +369,7 @@ EOF
 install_scripts() {
     log "installing the ogn-bootstrap scripts"
     install -d -m 0755 "$MNT/usr/local/lib/ogn-bootstrap" "$MNT/usr/local/sbin"
-    install -m 0644 src/ogn-common.sh "$MNT/usr/local/lib/ogn-bootstrap/"
+    install -m 0644 src/ogn-common.sh src/adsb-stats.py "$MNT/usr/local/lib/ogn-bootstrap/"
     local f
     for f in src/ogn-install src/ogn-update src/ogn-maintenance \
              src/ogn-remote-admin src/ogn-calibrate src/ogn-overlay \

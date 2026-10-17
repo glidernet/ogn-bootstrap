@@ -143,6 +143,7 @@ same network. Replace `<hostname>` with the name you chose in Imager:
 ```
 http://<hostname>.local:8080/        radio status page
 http://<hostname>.local:8081/        decoder status page
+http://<hostname>.local:8084/        ADS-B statistics (only with ADS-B on)
 ssh <user>@<hostname>.local          then run: systemctl status rtlsdr-ogn
 ```
 
@@ -491,7 +492,7 @@ On the Pi itself, we've done what we can to keep them private:
 |---|---|
 | On the Pi | Only the administrator (root) account can read the card's boot partition. This takes effect from the next restart. |
 | The decoder's copy | The decoder gets its own copy of `MyReceiver.conf`, with all the passwords and keys removed. It doesn't need any of them. |
-| Over the network | The status pages on ports 8080 and 8081 only show specific pages. They show the config file's name, but not what's in it. |
+| Over the network | The status pages on ports 8080 and 8081 only show specific pages. They show the config file's name, but not what's in it. The ADS-B statistics page on 8084 serves only its own page and three of `readsb`'s JSON files: `stats.json`, `receiver.json` and `aircraft.json`. |
 | In the logs | The WireGuard tunnel logs its address and server, but never a key. |
 
 Because only root can read the boot partition, `overlay status` and
@@ -677,14 +678,29 @@ stick. If you set `Enable = false`, they'll stop receiving any data.
 Their logs are kept in memory while read-only mode is on, so they don't wear
 out the card, but they're cleared every time the Pi restarts.
 
+### Statistics page
+
+With ADS-B on, `http://<hostname>.local:8084/` shows what `readsb` is doing:
+how many aircraft it can hear, messages per second, signal and noise levels,
+and the furthest range, over the last minute, 5 minutes, 15 minutes and since
+it started. It refreshes every 10 seconds.
+
+`readsb` writes these figures to `/run/readsb` every second. `/run` is in
+memory, so nothing is written to the card. The page is served by a small
+script that uses Python's standard library, which Raspberry Pi OS already
+includes. It runs as an unprivileged user, and only while `readsb` is running.
+The raw files are at `/data/stats.json`, `/data/receiver.json` and
+`/data/aircraft.json` on the same port. Anyone who can reach that port can
+read them, including where every aircraft the receiver hears is.
+
 ### What ADS-B doesn't include
 
 There's no aircraft map. The popular one, `tar1090`, is installed by running a
 script from GitHub rather than from a package, and we didn't want to build that
 into every card. If you add it yourself, move it off port 8080 or change
-`HTTP.Port` in the config, since the OGN status pages use 8080 and 8081. Bear in
-mind that a map needs `readsb` to write data to the card every second, which is
-exactly the kind of wear the read-only filesystem is there to prevent.
+`HTTP.Port` in the config, since the OGN status pages use 8080 and 8081. It can
+read the JSON that `readsb` already writes to `/run/readsb` for the statistics
+page.
 
 ## How it works
 
@@ -708,7 +724,7 @@ Here's how each part of that works:
 | rsyslog | Not installed on Trixie. If something else installs it, it's switched off, because it writes to the card constantly. |
 | File access times | Raspberry Pi OS already turns these off (`noatime`). |
 | Swap | Switched off. With everything already in memory, a swap file would just use up more memory. |
-| ADS-B | `readsb` is set up so that it never writes to the card. |
+| ADS-B | `readsb` is set up so that it never writes to the card. Its JSON for the statistics page goes to `/run/readsb`, which is in memory. |
 | Boot partition | Mounted **read-only**, and readable only by root (see [Credentials on the card](#credentials-on-the-card)). It's unlocked just long enough to save the maintenance progress, which is only a handful of writes a week. |
 
 The boot partition needs special care. Unlike the main filesystem, it can't be

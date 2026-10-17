@@ -875,7 +875,7 @@ for expect in \
     "--net-bi-port 30104" \
     '--net-connector feed.adsb.fi,30004,beast_reduce_plus_out' \
     '--net-connector feed.airplanes.live,30004,beast_reduce_plus_out' \
-    'JSON_OPTIONS=""'
+    'JSON_OPTIONS="--write-json /run/readsb"'
 do
     case "$AD" in
         *"$expect"*) ok "renders $expect" ;;
@@ -888,11 +888,12 @@ case "$AD" in
     *adsbexchange*) bad "a site left off is not fed" "$AD" ;;
     *)              ok  "a site left off is not fed" ;;
 esac
-# No --write-json, ever: there is no map on this image, and the directory
-# would be rewritten every second onto a card the overlay exists to protect.
-case "$AD" in
-    *write-json*) bad "nothing is written to disk continuously" "$AD" ;;
-    *)            ok  "nothing is written to disk continuously" ;;
+# readsb rewrites its JSON every second. Into /run, which is RAM, that is free;
+# anywhere else it is the card the overlay exists to protect.
+WJ=$(printf '%s\n' "$AD" | grep -o -- '--write-json[= ][^ "]*' | sed 's/^--write-json[= ]//')
+case "$WJ" in
+    /run/*) ok  "nothing is written to disk continuously" ;;
+    *)      bad "nothing is written to disk continuously" "--write-json goes to [$WJ], not /run" ;;
 esac
 is "the summary names who gets it" "$(adsb_feed_summary)" "OGN, feed.adsb.fi, feed.airplanes.live"
 
@@ -1001,11 +1002,17 @@ printf '#!/bin/bash\nexit 0\n' > "$STUB/readsb"
 cat > "$STUB/systemctl" <<'STUBEOF'
 #!/bin/bash
 printf 'systemctl %s\n' "$*" >> "$ADSB_LOG"
+# Leading options such as --no-block come before the verb.
+while [ $# -gt 0 ]; do case "$1" in --*) shift ;; *) break ;; esac; done
 verb="$1"; shift
 unit=""
 for a in "$@"; do case "$a" in --*) ;; *) unit="$a" ;; esac; done
 case "$verb" in
-    is-active|is-enabled) grep -qx "$unit" "$ADSB_LOG.on" 2>/dev/null ;;
+    # As the real thing does: a unit with no [Install] section is "static",
+    # and is-enabled calls that success whether or not it is running.
+    is-enabled) case "$unit" in ogn-mlat@*) exit 0 ;; esac
+                grep -qx "$unit" "$ADSB_LOG.on" 2>/dev/null ;;
+    is-active)  grep -qx "$unit" "$ADSB_LOG.on" 2>/dev/null ;;
     enable|start|restart) printf '%s\n' "$unit" >> "$ADSB_LOG.on"; exit 0 ;;
     disable)              case " $* " in *" --now "*) ;; *) exit 0 ;; esac
                           grep -vx "$unit" "$ADSB_LOG.on" > "$ADSB_LOG.on.t" 2>/dev/null
@@ -1028,6 +1035,12 @@ grep -q 'systemctl restart readsb' "$ADSB_LOG" && ok "starts readsb" || bad "sta
 # while the root is writable outlives the overlay. ogn-adsb.service starts it.
 grep -q 'systemctl enable readsb' "$ADSB_LOG" \
     && bad "readsb is started, never enabled" || ok "readsb is started, never enabled"
+grep -q 'systemctl --no-block start ogn-adsb-web.service' "$ADSB_LOG" \
+    && ok "starts the statistics page, without waiting on it" \
+    || bad "starts the statistics page, without waiting on it" "$(cat "$ADSB_LOG")"
+grep -qE 'systemctl (enable|disable).*ogn-adsb-web' "$ADSB_LOG" \
+    && bad "the statistics page is started, never enabled" \
+    || ok  "the statistics page is started, never enabled"
 # The mlat units wait for network-online.target; the config resync runs before
 # it. A blocking restart from there is a boot that never finishes.
 if grep 'ogn-mlat@' "$ADSB_LOG" | grep -E ' (restart|enable) ' | grep -vq -- '--no-block'; then
@@ -1053,6 +1066,14 @@ adsb_apply >/dev/null 2>&1 && ok "a second apply is clean" || bad "a second appl
 grep -q 'restart readsb' "$ADSB_LOG" \
     && bad "an unchanged, working feed is left alone" \
     || ok  "an unchanged, working feed is left alone"
+# enable and disable each daemon-reload systemd. From the 10-minute timer that
+# re-ran every generator (zram among them) once per site switched off.
+grep -qE 'systemctl (enable|disable).*ogn-mlat@' "$ADSB_LOG" \
+    && bad "a re-apply never enables or disables an mlat client" "$(cat "$ADSB_LOG")" \
+    || ok  "a re-apply never enables or disables an mlat client"
+grep -q 'ogn-mlat@adsbfi.service' "$ADSB_LOG.on" \
+    && ok "the mlat client for a site that is on is running" \
+    || bad "the mlat client for a site that is on is running"
 
 # A changed setting must not be left alone.
 sed 's/ADSBLol       = false/ADSBLol = true/' tests/fixtures/adsb.conf > "$STUB/c.conf"
@@ -1111,13 +1132,61 @@ assert re.search(r"^Wants=network-online\.target", unit, re.M), "missing Wants=n
 assert "RemainAfterExit" not in unit, "RemainAfterExit stops the timer re-running it"
 mlat = src.split("write_unit ogn-mlat@.service <<'EOF'", 1)[1].split("\nEOF", 1)[0]
 assert "StandardOutput=journal" in mlat, "mlat must log to the journal, not /var/log"
+# The package installs /usr/bin/mlat-client-adsbfi; there is no mlat-client.
+assert re.search(r"^ExecStart=/usr/bin/mlat-client-adsbfi ", mlat, re.M), \
+    "ExecStart must name the binary mlat-client-adsbfi actually ships"
 PY
+python3 - <<'PY' && ok "the statistics page goes with readsb, unprivileged" || bad "the statistics page goes with readsb, unprivileged"
+src = open("src/ogn-install").read()
+unit = src.split("write_unit ogn-adsb-web.service <<EOF", 1)[1].split("\nEOF", 1)[0]
+assert "BindsTo=readsb.service" in unit, "must stop when readsb does"
+assert "DynamicUser=yes" in unit, "must not run as root"
+assert "python3 -I" in unit, "-I keeps the script's directory and the environment out of sys.path"
+assert "[Install]" not in unit, "adsb_apply starts it; enabled, it would outlive ADS-B being switched off"
+PY
+grep -q 'adsb-stats.py' boot/vendor-data && ok "vendor-data carries adsb-stats.py" || bad "vendor-data carries adsb-stats.py"
+grep -q 'src/adsb-stats.py' tools/build-image.sh && ok "and so does the image build" || bad "and so does the image build"
 grep -q 'ogn-adsb.timer' src/ogn-adsb \
     && ok "the repair timer follows the card, not the installer" \
     || bad "the repair timer follows the card, not the installer"
 grep -q 'ogn-adsb' src/ogn-maintenance \
     && ok "a live edit is picked up by the config resync" \
     || bad "a live edit is picked up by the config resync"
+
+echo "== ADS-B statistics page =="
+# The real server, on a free port, over a directory standing in for
+# /run/readsb. It must serve the page and the three files, and nothing else.
+if python3 -m py_compile src/adsb-stats.py 2>/dev/null; then ok "adsb-stats.py compiles"; else bad "adsb-stats.py compiles"; fi
+rm -rf src/__pycache__
+if command -v curl >/dev/null; then
+    WEB=$(mktemp -d)
+    printf '{"now":1}\n' > "$WEB/stats.json"
+    printf 'secret\n'    > "$WEB/other.json"
+    python3 -I src/adsb-stats.py --port 0 --dir "$WEB" 2> "$WEB.log" &
+    WEBPID=$!
+    WEBPORT=""
+    for _ in $(seq 50); do
+        WEBPORT=$(sed -n 's/.* on port \([0-9]*\)$/\1/p' "$WEB.log")
+        [ -n "$WEBPORT" ] && break
+        sleep 0.1
+    done
+    if [ -z "$WEBPORT" ]; then
+        bad "the statistics server starts" "$(cat "$WEB.log")"
+    else
+        ok "the statistics server starts"
+        code() { curl -s -o /dev/null -w '%{http_code}' --path-as-is "http://127.0.0.1:$WEBPORT$1"; }
+        is "it serves the page"                          "$(code /)"                      "200"
+        is "it serves stats.json"                        "$(curl -s "http://127.0.0.1:$WEBPORT/data/stats.json")" '{"now":1}'
+        is "a file readsb has not written is a 503"      "$(code /data/aircraft.json)"    "503"
+        is "other files in the directory are not served" "$(code /data/other.json)"      "404"
+        is "nor is anything outside it"                  "$(code /data/../../etc/passwd)" "404"
+        is "nor is a listing"                            "$(code /data/)"                 "404"
+    fi
+    kill "$WEBPID" 2>/dev/null; wait "$WEBPID" 2>/dev/null
+    rm -rf "$WEB" "$WEB.log"
+else
+    printf '  skip statistics server: curl not installed\n'
+fi
 
 echo "== config resync =="
 grep -q 'config-sync)     config_sync' src/ogn-maintenance \

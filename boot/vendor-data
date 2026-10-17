@@ -1034,11 +1034,11 @@ wireguard_apply() {
 # ADSB.* rather than configuration in its own right. Under the read-only
 # overlay /etc is RAM and forgets itself at every reboot, so it has to be.
 #
-# Nothing here writes to the card, and nothing anywhere writes continuously:
-# readsb is started with no --write-json, because this image ships no map and
-# a JSON directory rewritten every second is precisely the wear the overlay
-# exists to prevent. The multilateration clients keep their settings in /run
-# for the same reason.
+# Nothing here writes to the card. readsb writes its JSON to /run/readsb,
+# which is RAM, for the statistics page on ADSB_WEB_PORT to read; the image's
+# drop-in strips upstream's own --write-json, so this is the only place it
+# comes from. The multilateration clients keep their settings in /run for the
+# same reason.
 # --------------------------------------------------------------------------
 ADSB_DEFAULT="${OGN_ADSB_DEFAULT:-/etc/default/readsb}"
 ADSB_MLAT_DIR="${OGN_ADSB_MLAT_DIR:-/run/ogn-bootstrap/mlat}"
@@ -1049,6 +1049,11 @@ ADSB_MOTD="${OGN_ADSB_MOTD:-/etc/motd.d/50-ogn-adsb}"
 ADSB_AVR_PORT=30002
 ADSB_BEAST_PORT=30005
 ADSB_MLAT_IN_PORT=30104
+
+# readsb's statistics, served by adsb-stats.py from the JSON it writes to
+# ADSB_JSON_DIR. Clear of the OGN status pages on HTTP.Port and the port after.
+ADSB_WEB_PORT=8084
+ADSB_JSON_DIR=/run/readsb
 
 # The sites this receiver knows how to feed, and the only ones a tick box can
 # reach. Kept here rather than on the card so that a hostname cannot be
@@ -1221,9 +1226,9 @@ adsb_render() {
     printf 'DECODER_OPTIONS="--max-range 360"\n'
     printf 'NET_OPTIONS="--net --net-heartbeat 60 --net-ro-port %s --net-bo-port %s --net-bi-port %s%s"\n' \
         "$ADSB_AVR_PORT" "$ADSB_BEAST_PORT" "$ADSB_MLAT_IN_PORT" "$conn"
-    # Deliberately empty. A map would want --write-json; this image ships none,
-    # and the directory would be rewritten every second for nobody to read.
-    printf 'JSON_OPTIONS=""\n'
+    # Into RAM, never the card. readsb's own RuntimeDirectory, so it is there
+    # before readsb starts and goes when it stops.
+    printf 'JSON_OPTIONS="--write-json %s"\n' "$ADSB_JSON_DIR"
     return 0
 }
 
@@ -1256,8 +1261,8 @@ adsb_down() {
     fi
     for f in $ADSB_FEEDS; do
         inst=$(adsb_feed_instance "$f")
-        systemctl is-enabled --quiet "ogn-mlat@$inst.service" 2>/dev/null \
-            && systemctl disable --now "ogn-mlat@$inst.service" >/dev/null 2>&1 || true
+        systemctl is-active --quiet "ogn-mlat@$inst.service" 2>/dev/null \
+            && systemctl stop "ogn-mlat@$inst.service" >/dev/null 2>&1 || true
         rm -f "$ADSB_MLAT_DIR/$inst.env"
     done
     rm -f "$ADSB_DEFAULT" "$ADSB_MOTD"
@@ -1266,6 +1271,13 @@ adsb_down() {
 
 # adsb_mlat_apply — one mlat-client per site that is switched on, and none
 # for any that is not. Returns 1 if a wanted one could not be configured.
+#
+# Started and stopped, never enabled or disabled. ogn-mlat@.service has no
+# [Install] section, so is-enabled answers "static" — which counts as success
+# — and every enable or disable is a daemon-reload. Run from the 10-minute
+# timer, that reloaded systemd once per site that was off. Nothing is lost by
+# not enabling: the environment is in /run, so ogn-adsb.service starts each
+# instance afresh at every boot.
 adsb_mlat_apply() {
     local f inst tmp on=0 rc=0
     conf_bool ADSB.Feed.MLAT false && on=1
@@ -1286,11 +1298,11 @@ adsb_mlat_apply() {
                 systemctl --no-block restart "ogn-mlat@$inst.service" >/dev/null 2>&1 || true
             fi
             rm -f "$tmp"
-            systemctl is-enabled --quiet "ogn-mlat@$inst.service" 2>/dev/null \
-                || systemctl --no-block enable --now "ogn-mlat@$inst.service" >/dev/null 2>&1 || true
+            systemctl is-active --quiet "ogn-mlat@$inst.service" 2>/dev/null \
+                || systemctl --no-block start "ogn-mlat@$inst.service" >/dev/null 2>&1 || true
         else
-            systemctl is-enabled --quiet "ogn-mlat@$inst.service" 2>/dev/null \
-                && systemctl disable --now "ogn-mlat@$inst.service" >/dev/null 2>&1 || true
+            systemctl is-active --quiet "ogn-mlat@$inst.service" 2>/dev/null \
+                && systemctl stop "ogn-mlat@$inst.service" >/dev/null 2>&1 || true
             rm -f "$ADSB_MLAT_DIR/$inst.env"
         fi
     done
@@ -1309,6 +1321,7 @@ adsb_feed_summary() {
 ADSB_MOTD_TEMPLATE='
   ADS-B:       readsb on stick %s, feeding %s
                Is it hearing anything?  sudo ogn-adsb status
+               Statistics:              http://<this-pi>:%s/
 
 '
 adsb_motd_update() {
@@ -1317,7 +1330,7 @@ adsb_motd_update() {
     tmp=$(mktemp) || return 0
     # shellcheck disable=SC2059
     printf "$ADSB_MOTD_TEMPLATE" \
-        "$(conf_get ADSB.DeviceSerial '?')" "$(adsb_feed_summary)" > "$tmp"
+        "$(conf_get ADSB.DeviceSerial '?')" "$(adsb_feed_summary)" "$ADSB_WEB_PORT" > "$tmp"
     cmp -s "$tmp" "$ADSB_MOTD" || install -m 0644 "$tmp" "$ADSB_MOTD" 2>/dev/null || true
     rm -f "$tmp"
     return 0
@@ -1371,6 +1384,11 @@ adsb_apply() {
         fi
     fi
 
+    # Started, never enabled, for the same reason as the mlat clients. It is
+    # BindsTo=readsb, so a restart above stops it and this brings it back.
+    systemctl is-active --quiet ogn-adsb-web.service 2>/dev/null \
+        || systemctl --no-block start ogn-adsb-web.service >/dev/null 2>&1 || true
+
     adsb_mlat_apply || { adsb_motd_update; return 1; }
     adsb_motd_update
     return 0
@@ -1420,6 +1438,231 @@ motd_set() {
 }
 OGN_PAYLOAD_ogn_common_sh
 chmod 0644 $LIBDIR/ogn-common.sh
+
+cat > $LIBDIR/adsb-stats.py <<'OGN_PAYLOAD_adsb_stats_py'
+#!/usr/bin/env python3
+#
+# adsb-stats.py — readsb's statistics, on a web page.
+#
+#   python3 -I adsb-stats.py [--port 8084] [--dir /run/readsb]
+#
+# readsb writes its JSON to /run/readsb, which is RAM, because adsb_render
+# asks it to in JSON_OPTIONS. Nothing touches the card. This serves those
+# files, and nothing else:
+#
+#   /                   a page that shows them
+#   /data/stats.json    message rates, signal levels, range
+#   /data/receiver.json what readsb says about itself
+#   /data/aircraft.json what it is hearing right now
+#
+# Everything else is a 404, in the same spirit as the decoder's own status
+# pages: a fixed set of paths, never a directory listing. Standard library
+# only, because nothing else is installed on the image.
+#
+# Run by ogn-adsb-web.service, which goes up and down with readsb.
+#
+# Copyright (c) 2026 ifly7charlie. MIT licence, see LICENSE.
+
+import argparse
+import os
+import sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+DATA_FILES = ("stats.json", "receiver.json", "aircraft.json")
+
+PAGE = b"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ADS-B statistics</title>
+<style>
+  :root { --bg:#fff; --fg:#1d1d1f; --mute:#6e6e73; --line:#d2d2d7; --bad:#b00020; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#161617; --fg:#f5f5f7; --mute:#a1a1a6; --line:#3a3a3c; --bad:#ff6b6b; }
+  }
+  body { background:var(--bg); color:var(--fg); margin:0 auto; max-width:60rem;
+         padding:1rem; font:15px/1.4 system-ui, sans-serif; }
+  h1 { font-size:1.3rem; margin:0 0 .2rem; }
+  h2 { font-size:1rem; margin:1.5rem 0 .4rem; }
+  .mute { color:var(--mute); }
+  .bad { color:var(--bad); }
+  .scroll { overflow-x:auto; }
+  table { border-collapse:collapse; width:100%; font-variant-numeric:tabular-nums; }
+  th, td { text-align:right; padding:.25rem .6rem; border-bottom:1px solid var(--line);
+           white-space:nowrap; }
+  th:first-child, td:first-child { text-align:left; }
+  th { font-weight:600; }
+  a { color:inherit; }
+</style>
+</head>
+<body>
+<h1>ADS-B statistics</h1>
+<div id="status" class="mute">Loading&hellip;</div>
+
+<h2>Now</h2>
+<div class="scroll"><table id="now"></table></div>
+
+<h2>By period</h2>
+<div class="scroll"><table id="periods"></table></div>
+
+<p class="mute">Raw data:
+  <a href="data/stats.json">stats.json</a> &middot;
+  <a href="data/receiver.json">receiver.json</a> &middot;
+  <a href="data/aircraft.json">aircraft.json</a>.
+  Refreshes every 10&nbsp;s.</p>
+
+<script>
+"use strict";
+const PERIODS = [["last1min", "Last minute"], ["last5min", "Last 5 min"],
+                 ["last15min", "Last 15 min"], ["total", "Since start"]];
+
+function dash(v) { return (v === undefined || v === null || Number.isNaN(v)) ? "\\u2014" : v; }
+function num(v, d) { return typeof v === "number" ? v.toFixed(d || 0) : dash(v); }
+function sum(a) { return Array.isArray(a) ? a.reduce((x, y) => x + y, 0) : a; }
+function km(m) { return typeof m === "number" ? (m / 1000).toFixed(1) + " km" : dash(m); }
+function dur(s) {
+  if (typeof s !== "number" || s < 0) return dash();
+  const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
+  return (d ? d + "d " : "") + (d || h ? h + "h " : "") + m + "m";
+}
+
+function row(cells, tag) {
+  const tr = document.createElement("tr");
+  for (const c of cells) {
+    const el = document.createElement(tag || "td");
+    el.textContent = c;
+    tr.appendChild(el);
+  }
+  return tr;
+}
+
+function render(st, ac) {
+  const now = document.getElementById("now");
+  now.replaceChildren();
+  const withPos = st.aircraft_with_pos, without = st.aircraft_without_pos;
+  const total = (typeof withPos === "number" && typeof without === "number") ? withPos + without
+              : (ac && Array.isArray(ac.aircraft) ? ac.aircraft.length : undefined);
+  now.appendChild(row(["Aircraft", dash(total)]));
+  now.appendChild(row(["\\u2026 with a position", dash(withPos)]));
+  now.appendChild(row(["\\u2026 without", dash(without)]));
+  if (ac && typeof ac.messages === "number")
+    now.appendChild(row(["Messages since start", ac.messages]));
+  if (st.total && typeof st.total.start === "number" && typeof st.now === "number")
+    now.appendChild(row(["readsb up for", dur(st.now - st.total.start)]));
+
+  const t = document.getElementById("periods");
+  t.replaceChildren();
+  t.appendChild(row(["", "Messages/s", "Signal dBFS", "Noise dBFS", "Peak dBFS",
+                     "Strong (>-3)", "Max range", "Positions"], "th"));
+  for (const [key, label] of PERIODS) {
+    const p = st[key];
+    if (!p) continue;
+    const secs = (p.end - p.start) || NaN;
+    const local = p.local || {};
+    const msgs = typeof p.messages_valid === "number" ? p.messages_valid : p.messages;
+    t.appendChild(row([label,
+      num(msgs / secs, 1),
+      num(local.signal, 1), num(local.noise, 1), num(local.peak_signal, 1),
+      dash(local.strong_signals),
+      km(p.max_distance),
+      dash(p.position_count_total !== undefined ? p.position_count_total
+                                                : (p.cpr && sum(p.cpr.global_ok)))]));
+  }
+}
+
+async function get(name) {
+  const r = await fetch("data/" + name, {cache: "no-store"});
+  if (!r.ok) throw new Error(name + ": HTTP " + r.status);
+  return r.json();
+}
+
+async function refresh() {
+  const status = document.getElementById("status");
+  try {
+    const st = await get("stats.json");
+    let ac = null;
+    try { ac = await get("aircraft.json"); } catch (e) { /* the table copes */ }
+    render(st, ac);
+    status.className = "mute";
+    status.textContent = "Updated " + new Date().toLocaleTimeString() + ".";
+  } catch (e) {
+    status.className = "bad";
+    status.textContent = "No statistics from readsb yet (" + e.message +
+      "). It writes the first set a minute after it starts; if this persists, " +
+      "run: sudo ogn-adsb status";
+  }
+}
+refresh();
+setInterval(refresh, 10000);
+</script>
+</body>
+</html>
+"""
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "ogn-adsb-stats"
+    sys_version = ""
+    data_dir = "/run/readsb"
+
+    def _send(self, code, body, ctype, head_only):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        if not head_only:
+            self.wfile.write(body)
+
+    def _serve(self, head_only):
+        path = self.path.split("?", 1)[0]
+        if path in ("/", "/index.html"):
+            return self._send(200, PAGE, "text/html; charset=utf-8", head_only)
+        if path.startswith("/data/") and path[6:] in DATA_FILES:
+            try:
+                with open(os.path.join(self.data_dir, path[6:]), "rb") as f:
+                    body = f.read()
+            except OSError:
+                return self._send(503, b"readsb has not written this yet\n",
+                                  "text/plain; charset=utf-8", head_only)
+            return self._send(200, body, "application/json", head_only)
+        return self._send(404, b"not found\n", "text/plain; charset=utf-8", head_only)
+
+    def do_GET(self):
+        self._serve(False)
+
+    def do_HEAD(self):
+        self._serve(True)
+
+    # One line per request would fill the journal for nobody to read.
+    def log_message(self, fmt, *args):
+        pass
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Serve readsb's statistics over HTTP.")
+    ap.add_argument("--port", type=int, default=8084)
+    ap.add_argument("--dir", default="/run/readsb")
+    args = ap.parse_args()
+
+    Handler.data_dir = args.dir
+    httpd = ThreadingHTTPServer(("", args.port), Handler)
+    httpd.daemon_threads = True
+    # The bound port, not the asked-for one: --port 0 is how the tests get a
+    # free port, and they read it from here.
+    print(f"serving {args.dir} on port {httpd.server_port}", file=sys.stderr, flush=True)
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()
+OGN_PAYLOAD_adsb_stats_py
+chmod 0644 $LIBDIR/adsb-stats.py
 
 cat > /usr/local/sbin/ogn-install <<'OGN_PAYLOAD_ogn_install'
 #!/bin/bash
@@ -1936,6 +2179,8 @@ EOF
 # One instance per tracking site that multilateration is switched on for.
 # The environment comes from /run, which is where it belongs: it is a
 # rendering of the card, and the root filesystem is RAM under the overlay.
+# Debian's mlat-client-adsbfi names its program after the package, not
+# mlat-client. Its own LSB service stays idle: START_CLIENT defaults to no.
 write_unit ogn-mlat@.service <<'EOF'
 [Unit]
 Description=OGN receiver ADS-B multilateration: %i
@@ -1947,7 +2192,7 @@ BindsTo=readsb.service
 [Service]
 Type=simple
 EnvironmentFile=/run/ogn-bootstrap/mlat/%i.env
-ExecStart=/usr/bin/mlat-client --input-type beast --input-connect ${MLAT_INPUT} \
+ExecStart=/usr/bin/mlat-client-adsbfi --input-type beast --input-connect ${MLAT_INPUT} \
     --server ${MLAT_SERVER} --user ${MLAT_CALL} \
     --lat ${MLAT_LAT} --lon ${MLAT_LON} --alt ${MLAT_ALT} \
     --results ${MLAT_RESULTS}
@@ -1955,6 +2200,25 @@ Restart=always
 RestartSec=30
 StandardOutput=journal
 StandardError=journal
+EOF
+
+# readsb's statistics page. Static, like ogn-mlat@: adsb_apply starts it, and
+# BindsTo takes it down whenever readsb goes. A dynamic user that can read
+# /run/readsb and nothing it could write to, on a port above 1024.
+write_unit ogn-adsb-web.service <<EOF
+[Unit]
+Description=OGN receiver ADS-B statistics page
+Documentation=https://github.com/glidernet/ogn-bootstrap
+After=readsb.service
+BindsTo=readsb.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -I $LIBDIR/adsb-stats.py --port $ADSB_WEB_PORT --dir $ADSB_JSON_DIR
+DynamicUser=yes
+NoNewPrivileges=yes
+Restart=always
+RestartSec=15
 EOF
 systemctl enable ogn-adsb.service >/dev/null
 

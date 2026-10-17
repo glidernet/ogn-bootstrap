@@ -996,11 +996,11 @@ wireguard_apply() {
 # ADSB.* rather than configuration in its own right. Under the read-only
 # overlay /etc is RAM and forgets itself at every reboot, so it has to be.
 #
-# Nothing here writes to the card, and nothing anywhere writes continuously:
-# readsb is started with no --write-json, because this image ships no map and
-# a JSON directory rewritten every second is precisely the wear the overlay
-# exists to prevent. The multilateration clients keep their settings in /run
-# for the same reason.
+# Nothing here writes to the card. readsb writes its JSON to /run/readsb,
+# which is RAM, for the statistics page on ADSB_WEB_PORT to read; the image's
+# drop-in strips upstream's own --write-json, so this is the only place it
+# comes from. The multilateration clients keep their settings in /run for the
+# same reason.
 # --------------------------------------------------------------------------
 ADSB_DEFAULT="${OGN_ADSB_DEFAULT:-/etc/default/readsb}"
 ADSB_MLAT_DIR="${OGN_ADSB_MLAT_DIR:-/run/ogn-bootstrap/mlat}"
@@ -1011,6 +1011,11 @@ ADSB_MOTD="${OGN_ADSB_MOTD:-/etc/motd.d/50-ogn-adsb}"
 ADSB_AVR_PORT=30002
 ADSB_BEAST_PORT=30005
 ADSB_MLAT_IN_PORT=30104
+
+# readsb's statistics, served by adsb-stats.py from the JSON it writes to
+# ADSB_JSON_DIR. Clear of the OGN status pages on HTTP.Port and the port after.
+ADSB_WEB_PORT=8084
+ADSB_JSON_DIR=/run/readsb
 
 # The sites this receiver knows how to feed, and the only ones a tick box can
 # reach. Kept here rather than on the card so that a hostname cannot be
@@ -1183,9 +1188,9 @@ adsb_render() {
     printf 'DECODER_OPTIONS="--max-range 360"\n'
     printf 'NET_OPTIONS="--net --net-heartbeat 60 --net-ro-port %s --net-bo-port %s --net-bi-port %s%s"\n' \
         "$ADSB_AVR_PORT" "$ADSB_BEAST_PORT" "$ADSB_MLAT_IN_PORT" "$conn"
-    # Deliberately empty. A map would want --write-json; this image ships none,
-    # and the directory would be rewritten every second for nobody to read.
-    printf 'JSON_OPTIONS=""\n'
+    # Into RAM, never the card. readsb's own RuntimeDirectory, so it is there
+    # before readsb starts and goes when it stops.
+    printf 'JSON_OPTIONS="--write-json %s"\n' "$ADSB_JSON_DIR"
     return 0
 }
 
@@ -1218,8 +1223,8 @@ adsb_down() {
     fi
     for f in $ADSB_FEEDS; do
         inst=$(adsb_feed_instance "$f")
-        systemctl is-enabled --quiet "ogn-mlat@$inst.service" 2>/dev/null \
-            && systemctl disable --now "ogn-mlat@$inst.service" >/dev/null 2>&1 || true
+        systemctl is-active --quiet "ogn-mlat@$inst.service" 2>/dev/null \
+            && systemctl stop "ogn-mlat@$inst.service" >/dev/null 2>&1 || true
         rm -f "$ADSB_MLAT_DIR/$inst.env"
     done
     rm -f "$ADSB_DEFAULT" "$ADSB_MOTD"
@@ -1228,6 +1233,13 @@ adsb_down() {
 
 # adsb_mlat_apply — one mlat-client per site that is switched on, and none
 # for any that is not. Returns 1 if a wanted one could not be configured.
+#
+# Started and stopped, never enabled or disabled. ogn-mlat@.service has no
+# [Install] section, so is-enabled answers "static" — which counts as success
+# — and every enable or disable is a daemon-reload. Run from the 10-minute
+# timer, that reloaded systemd once per site that was off. Nothing is lost by
+# not enabling: the environment is in /run, so ogn-adsb.service starts each
+# instance afresh at every boot.
 adsb_mlat_apply() {
     local f inst tmp on=0 rc=0
     conf_bool ADSB.Feed.MLAT false && on=1
@@ -1248,11 +1260,11 @@ adsb_mlat_apply() {
                 systemctl --no-block restart "ogn-mlat@$inst.service" >/dev/null 2>&1 || true
             fi
             rm -f "$tmp"
-            systemctl is-enabled --quiet "ogn-mlat@$inst.service" 2>/dev/null \
-                || systemctl --no-block enable --now "ogn-mlat@$inst.service" >/dev/null 2>&1 || true
+            systemctl is-active --quiet "ogn-mlat@$inst.service" 2>/dev/null \
+                || systemctl --no-block start "ogn-mlat@$inst.service" >/dev/null 2>&1 || true
         else
-            systemctl is-enabled --quiet "ogn-mlat@$inst.service" 2>/dev/null \
-                && systemctl disable --now "ogn-mlat@$inst.service" >/dev/null 2>&1 || true
+            systemctl is-active --quiet "ogn-mlat@$inst.service" 2>/dev/null \
+                && systemctl stop "ogn-mlat@$inst.service" >/dev/null 2>&1 || true
             rm -f "$ADSB_MLAT_DIR/$inst.env"
         fi
     done
@@ -1271,6 +1283,7 @@ adsb_feed_summary() {
 ADSB_MOTD_TEMPLATE='
   ADS-B:       readsb on stick %s, feeding %s
                Is it hearing anything?  sudo ogn-adsb status
+               Statistics:              http://<this-pi>:%s/
 
 '
 adsb_motd_update() {
@@ -1279,7 +1292,7 @@ adsb_motd_update() {
     tmp=$(mktemp) || return 0
     # shellcheck disable=SC2059
     printf "$ADSB_MOTD_TEMPLATE" \
-        "$(conf_get ADSB.DeviceSerial '?')" "$(adsb_feed_summary)" > "$tmp"
+        "$(conf_get ADSB.DeviceSerial '?')" "$(adsb_feed_summary)" "$ADSB_WEB_PORT" > "$tmp"
     cmp -s "$tmp" "$ADSB_MOTD" || install -m 0644 "$tmp" "$ADSB_MOTD" 2>/dev/null || true
     rm -f "$tmp"
     return 0
@@ -1332,6 +1345,11 @@ adsb_apply() {
             return 1
         fi
     fi
+
+    # Started, never enabled, for the same reason as the mlat clients. It is
+    # BindsTo=readsb, so a restart above stops it and this brings it back.
+    systemctl is-active --quiet ogn-adsb-web.service 2>/dev/null \
+        || systemctl --no-block start ogn-adsb-web.service >/dev/null 2>&1 || true
 
     adsb_mlat_apply || { adsb_motd_update; return 1; }
     adsb_motd_update
