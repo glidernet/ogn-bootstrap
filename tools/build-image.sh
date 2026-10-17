@@ -62,7 +62,9 @@ WORK_DIR="${WORK_DIR:-$REPO_ROOT/.build}"
 # mlat-client-adsbfi is here for exactly the same reason: ADSB is outside the
 # Install section, so a second dongle added to a receiver in a field has to
 # come up from an edit on the card alone. It is a stock Debian package --
-# nothing here adds an apt source.
+# nothing here adds an apt source. python3-pyasyncore goes with it: the client
+# imports asyncore, gone from the standard library since Python 3.12, and the
+# package does not depend on it.
 PACKAGES=(
     rtl-sdr
     librtlsdr0
@@ -75,6 +77,7 @@ PACKAGES=(
     autossh
     wireguard-tools
     mlat-client-adsbfi
+    python3-pyasyncore
     procserv
 )
 

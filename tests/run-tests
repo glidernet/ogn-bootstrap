@@ -1107,11 +1107,15 @@ grep -q 'src/ogn-adsb' tools/build-vendor-data \
     || bad "and the payload generator knows about it"
 # Shipped in the image for the same reason as wireguard-tools: ADSB is outside
 # the Install section, so a dongle added later never comes back through apt.
-for pkg in readsb mlat-client-adsbfi; do
+for pkg in readsb mlat-client-adsbfi python3-pyasyncore; do
     grep -q "$pkg" tools/build-image.sh \
         && ok "the image ships $pkg, so the card alone can switch it on" \
         || bad "the image ships $pkg, so the card alone can switch it on"
 done
+# mlat-client-adsbfi imports asyncore but does not depend on python3-pyasyncore.
+grep -q 'PACKAGES+=(mlat-client-adsbfi python3-pyasyncore)' src/ogn-install \
+    && ok "a hand-built Pi gets asyncore along with mlat-client-adsbfi" \
+    || bad "a hand-built Pi gets asyncore along with mlat-client-adsbfi"
 # Everything comes from Debian. A third-party apt source in this file would
 # make the promise at the top of build-image.yml false.
 code_of tools/build-image.sh src/ogn-install src/ogn-adsb src/ogn-common.sh \

@@ -1863,7 +1863,9 @@ conf_bool Network.WireGuard.Enable && PACKAGES+=(wireguard-tools)
 # Same reasoning for ADS-B: the ADSB section is outside Install, so switching
 # it on later never comes back through here. The image ships both already.
 conf_bool ADSB.Enable && PACKAGES+=(readsb)
-conf_bool ADSB.Feed.MLAT && PACKAGES+=(mlat-client-adsbfi)
+# python3-pyasyncore: mlat-client-adsbfi imports asyncore, which left the
+# standard library in Python 3.12, and the package does not depend on it.
+conf_bool ADSB.Feed.MLAT && PACKAGES+=(mlat-client-adsbfi python3-pyasyncore)
 apt_install "${PACKAGES[@]}"
 
 # ---------------------------------------------------------------------------
