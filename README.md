@@ -150,6 +150,24 @@ ssh <user>@<hostname>.local          then run: systemctl status rtlsdr-ogn
 Within a few minutes, your receiver should appear on
 [live.glidernet.org](https://live.glidernet.org).
 
+**If it doesn't appear**, the Pi checks itself for the most common problems
+two minutes after every start-up. Those are mistakes in `MyReceiver.conf`
+(like a position still set to 0,0), an SDR stick it can't see or a serial
+number that doesn't match, downloads that didn't finish, and parts of the
+receiver that keep stopping. It shows what it found:
+
+- on a screen plugged into the Pi, above the login prompt
+- when you log in, over ssh or through Raspberry Pi Connect
+- in the log, with `journalctl -u ogn-check`
+
+The report always lists the SDR sticks it can see, with their serial numbers
+and which USB port each one is in. That's handy for working out which stick is
+which when you have two. Once you've fixed something, run the check again with:
+
+```
+sudo ogn-check
+```
+
 **If the Pi couldn't get online the first time**, it keeps trying. It waits up to
 five minutes for a network connection. If it still can't download what it
 needs, it tries again every 15 minutes and every time it starts up, until it
