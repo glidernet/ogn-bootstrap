@@ -1,0 +1,104 @@
+#!/bin/bash
+#
+# ogn-wireguard — bring the Network.WireGuard tunnel up, down, or into step
+# with whatever the card now says.
+#
+#   sudo ogn-wireguard            apply Network.WireGuard from the card
+#   sudo ogn-wireguard status     is it up, and is it talking to the server
+#   sudo ogn-wireguard down       take it down until the next boot
+#   sudo ogn-wireguard --config X use a different config file
+#
+# Run at every boot by ogn-wireguard.service, once the network is up, and
+# every 10 minutes after that by ogn-wireguard.timer — which is what puts the
+# tunnel back when the server moves to a new address, the case a tunnel for
+# remote administration is least able to tell you about.
+#
+# Copyright (c) 2026 ifly7charlie. MIT licence, see LICENSE.
+
+set -euo pipefail
+
+LIBDIR="${OGN_LIBDIR:-/usr/local/lib/ogn-bootstrap}"
+# shellcheck source=src/ogn-common.sh
+. "$LIBDIR/ogn-common.sh"
+
+ACTION=apply
+while [ $# -gt 0 ]; do
+    case "$1" in
+        apply|--apply)   ACTION=apply ;;
+        down|--down)     ACTION=down ;;
+        status|--status) ACTION=status ;;
+        --config)        BOOT_CONF="$2"; shift ;;
+        -h|--help)       sed -n '3,15p' "$0"; exit 0 ;;
+        *)               die "unknown argument: $1  (try: ogn-wireguard status)" ;;
+    esac
+    shift
+done
+
+need_root
+
+# --------------------------------------------------------------------------
+# status
+# --------------------------------------------------------------------------
+if [ "$ACTION" = status ]; then
+    conf_load "$BOOT_CONF"
+    trap conf_cleanup EXIT
+    if ! conf_bool Network.WireGuard.Enable false; then
+        printf 'WireGuard is switched off in %s.\n' "$BOOT_CONF"
+        wg_up && printf 'The %s interface is still up; it goes at the next boot.\n' "$WG_IFACE"
+        exit 0
+    fi
+    printf 'configured:  %s on %s, through %s\n' \
+        "$(conf_get Network.WireGuard.Address '<unset>')" "$WG_IFACE" \
+        "$(conf_get Network.WireGuard.Peer.Endpoint '<unset>')"
+    if ! wg_up; then
+        printf 'interface:   DOWN\n\n'
+        printf 'Bring it up with:  sudo ogn-wireguard\n'
+        printf 'Why it is down:    journalctl -u ogn-wireguard\n'
+        exit 1
+    fi
+    printf 'interface:   up\n\n'
+    wg show "$WG_IFACE"
+    # A tunnel with no handshake looks exactly like a working one from here,
+    # so spell out the difference rather than leaving it to be read off.
+    HS=$(wg show "$WG_IFACE" latest-handshakes | awk 'NR == 1 { print $2 }')
+    case "$HS" in
+        ''|0) printf '\nNo handshake yet: the server has not answered. Check its [Peer]\n'
+              printf 'has this receiver'"'"'s public key, and that %s is reachable.\n' \
+                  "$(conf_get Network.WireGuard.Peer.Endpoint '')" ;;
+        *)    printf '\nLast handshake %ss ago.\n' "$(( $(date +%s) - HS ))" ;;
+    esac
+    exit 0
+fi
+
+# --------------------------------------------------------------------------
+# down — by hand, for the length of this boot
+# --------------------------------------------------------------------------
+if [ "$ACTION" = down ]; then
+    conf_load "$BOOT_CONF"
+    trap conf_cleanup EXIT
+    wireguard_down
+    conf_bool Network.WireGuard.Enable false \
+        && log "still enabled on the card, so it comes back at the next boot"
+    exit 0
+fi
+
+# --------------------------------------------------------------------------
+# apply
+# --------------------------------------------------------------------------
+[ -r "$BOOT_CONF" ] || { log "no $BOOT_CONF on the card; nothing to do"; exit 0; }
+conf_load "$BOOT_CONF"
+trap conf_cleanup EXIT
+
+# The timer is the repair loop, and it is worth having only on a receiver that
+# is actually using a tunnel. Enabling it from here rather than from the
+# installer is what lets WireGuard be switched on by editing the card alone,
+# with no re-install and no network.
+if conf_bool Network.WireGuard.Enable false; then
+    systemctl is-enabled --quiet ogn-wireguard.timer 2>/dev/null \
+        || systemctl enable --now ogn-wireguard.timer >/dev/null 2>&1 || true
+else
+    systemctl is-enabled --quiet ogn-wireguard.timer 2>/dev/null \
+        && systemctl disable --now ogn-wireguard.timer >/dev/null 2>&1 || true
+fi
+
+wireguard_apply

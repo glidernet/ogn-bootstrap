@@ -16,6 +16,10 @@
 # It does NOT enable any remote access unless you asked for it in
 # MyReceiver.conf. Everything under Install.RemoteAdmin is off by default.
 #
+# It does NOT send what this receiver hears to anyone except OGN. ADS-B
+# reception is off until you switch it on, and the tracking sites under
+# ADSB.Feed are each off until you pick them.
+#
 # Nothing here needs editing. Your settings all live in MyReceiver.conf,
 # next to this file.
 #
@@ -56,7 +60,16 @@ STATE_DIR="$BOOT_DIR/ogn-bootstrap"
 CONFIG_APPLIED="$STATE_DIR/config.applied"
 # shellcheck disable=SC2034
 INSTALL_APPLIED="$STATE_DIR/install.applied"
-MANIFEST_URL="${OGN_MANIFEST_URL:-https://raw.githubusercontent.com/glidernet/ogn-bootstrap/master/versions.json}"
+# A test image follows its branch's versions.json, as recorded in the image
+# stamp by build-image.sh. raw.githubusercontent.com only: its TLS is what
+# makes the SHA256s trustworthy.
+IMAGE_STAMP="${OGN_IMAGE_STAMP:-/etc/ogn-bootstrap-image}"
+MANIFEST_URL="${OGN_MANIFEST_URL:-}"
+if [ -z "$MANIFEST_URL" ] && [ -r "$IMAGE_STAMP" ]; then
+    MANIFEST_URL=$(sed -n 's|^OGN_MANIFEST_URL=\(https://raw\.githubusercontent\.com/.*\)$|\1|p' "$IMAGE_STAMP" | head -n 1)
+fi
+MANIFEST_MASTER_URL="https://raw.githubusercontent.com/glidernet/ogn-bootstrap/master/versions.json"
+MANIFEST_URL="${MANIFEST_URL:-$MANIFEST_MASTER_URL}"
 MANIFEST_CACHE="/var/lib/ogn-bootstrap/versions.json"
 MOTD_FILE="/etc/motd.d/10-ogn-bootstrap"
 
@@ -121,14 +134,19 @@ _libconfig_flatten() {
                     if (d == "\"") { ins = 1; val = val d; j++; continue }
                     if (d == "[" || d == "(") { bd++; val = val d; j++; continue }
                     if (d == "]" || d == ")") { bd--; val = val d; j++; continue }
-                    if (d == ";" && bd <= 0) break
+                    if ((d == ";" || d == ",") && bd <= 0) { j++; break }
+                    # libconfig makes the terminator optional, so a value
+                    # also ends at the end of its line or at the closing
+                    # brace, which is left for the group to consume.
+                    if (d == "}" && bd <= 0) break
+                    if (d == "\n" && bd <= 0 && val ~ /[^ \t\r]/) break
                     val = val d; j++
                 }
                 p = ""
                 for (k = 1; k <= np; k++) p = p stack[k] "."
                 gsub(/^[ \t\r\n]+/, "", val); gsub(/[ \t\r\n]+$/, "", val)
                 print p pending "=" val
-                pending = ""; i = j + 1; continue }
+                pending = ""; i = j; continue }
             i++
         }
     }' "$1"
@@ -210,9 +228,9 @@ conf_set_value() {
     {
         line = $0
         code = line
-        # libconfig takes # and // alike, and the templates in the wild use
-        # both. A brace inside a string value would corrupt the depth count,
-        # and no such line opens or closes a block anyway.
+        # Our own stripper, not libconfig: # and // only, no /* */. A block
+        # comment, or a brace inside a string, corrupts the depth count —
+        # neither appears in the template.
         sub(/\/\/.*$/, "", code)
         sub(/#.*$/, "", code)
         countable = (index(code, "\"") == 0)
@@ -320,6 +338,23 @@ fetch() {
          -o "$dest" "$url"
 }
 
+# network_wait <host> — wait up to OGN_NETWORK_WAIT seconds (default 300) for
+# <host> to resolve. First-boot wifi takes longer than curl's retries.
+network_wait() {
+    local host="$1" limit="${OGN_NETWORK_WAIT:-300}" waited=0
+    while ! getent hosts "$host" >/dev/null 2>&1; do
+        if [ "$waited" -ge "$limit" ]; then
+            warn "no network after ${waited}s: cannot resolve $host"
+            return 1
+        fi
+        [ $((waited % 30)) -eq 0 ] && log "waiting for the network (cannot resolve $host yet)"
+        sleep 5
+        waited=$((waited + 5))
+    done
+    [ "$waited" -gt 0 ] && log "network is up after ${waited}s"
+    return 0
+}
+
 verify_sha256() {
     local file="$1" expected="$2" actual
     [ -n "$expected" ] || die "no expected SHA256 supplied for $file"
@@ -346,6 +381,10 @@ verify_md5() {
 # json_get uses python3, which Raspberry Pi OS Lite ships. Keeping the manifest
 # as JSON means tools/add-version and the GitHub action can edit it safely.
 # --------------------------------------------------------------------------
+manifest_download() {
+    fetch "$1" "$2" && python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$2"
+}
+
 manifest_fetch() {
     local tmp
     if ! mkdir -p "$(dirname "$MANIFEST_CACHE")" 2>/dev/null; then
@@ -355,7 +394,14 @@ manifest_fetch() {
         return 1
     fi
     tmp=$(mktemp)
-    if fetch "$MANIFEST_URL" "$tmp" && python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$tmp"; then
+    if manifest_download "$MANIFEST_URL" "$tmp"; then
+        mv "$tmp" "$MANIFEST_CACHE"
+        return 0
+    fi
+    # The branch may since have been deleted.
+    if [ "$MANIFEST_URL" != "$MANIFEST_MASTER_URL" ] \
+       && manifest_download "$MANIFEST_MASTER_URL" "$tmp"; then
+        warn "could not fetch $MANIFEST_URL; using master's version manifest instead"
         mv "$tmp" "$MANIFEST_CACHE"
         return 0
     fi
@@ -455,6 +501,191 @@ boot_replace() {
     sync -f "$dest" 2>/dev/null || sync
     [ "$was_ro" -eq 1 ] && boot_ro
     return 0
+}
+
+# --------------------------------------------------------------------------
+# The read-only root overlay
+#
+# Debian's overlayroot, switched with overlayroot=tmpfs in cmdline.txt on the
+# FAT partition. Not /etc/overlayroot.conf: /etc is on the root filesystem,
+# which the overlay hides, so an edit there is discarded by the reboot meant
+# to apply it and the overlay could never be switched off from inside itself.
+# --------------------------------------------------------------------------
+CMDLINE_FILE="$BOOT_DIR/cmdline.txt"
+CONFIG_TXT="$BOOT_DIR/config.txt"
+OVERLAY_PARAM="overlayroot=tmpfs"
+
+# What this boot did is in /proc/cmdline, which anybody can read. What the
+# next boot will do is in cmdline.txt on the boot partition, which is mounted
+# root-only so that the credentials beside it stay that way — see
+# boot_partition_options in ogn-install. So the answer is published at every
+# boot, and whenever it changes, to a file anyone can read.
+#
+# In /run deliberately: it is a cache of something authoritative elsewhere, and
+# tmpfs means it cannot survive a reboot into disagreeing with the card.
+OVERLAY_STATE="${OGN_OVERLAY_STATE:-/run/ogn-bootstrap/overlay-next-boot}"
+
+overlay_active() { grep -qw -- "$OVERLAY_PARAM" /proc/cmdline 2>/dev/null; }
+
+overlay_next_boot() {
+    if [ -r "$CMDLINE_FILE" ]; then
+        grep -qw -- "$OVERLAY_PARAM" "$CMDLINE_FILE" 2>/dev/null
+    else
+        grep -qx 'enabled' "$OVERLAY_STATE" 2>/dev/null
+    fi
+}
+
+# overlay_next_boot_known — false when neither source can be read, so that a
+# status display can say "cannot tell" rather than quietly saying "disabled".
+overlay_next_boot_known() { [ -r "$CMDLINE_FILE" ] || [ -r "$OVERLAY_STATE" ]; }
+
+# overlay_state_publish — refresh that cache. Called at every boot, and by
+# cmdline_write, which is the only thing that changes the answer.
+overlay_state_publish() {
+    [ -r "$CMDLINE_FILE" ] || return 0
+    install -d -m 0755 "$(dirname "$OVERLAY_STATE")" 2>/dev/null || return 0
+    if grep -qw -- "$OVERLAY_PARAM" "$CMDLINE_FILE" 2>/dev/null; then
+        printf 'enabled\n' > "$OVERLAY_STATE"
+    else
+        printf 'disabled\n' > "$OVERLAY_STATE"
+    fi
+    chmod 0644 "$OVERLAY_STATE" 2>/dev/null || true
+    return 0
+}
+
+overlay_status() {
+    local now next
+    overlay_active && now=active || now=inactive
+    if overlay_next_boot_known; then
+        overlay_next_boot && next=enabled || next=disabled
+    else
+        next=unknown
+    fi
+    printf '%s now=%s next_boot=%s\n' "$next" "$now" "$next"
+}
+
+# cmdline_write <param> <1 to add, 0 to remove>
+#
+# cmdline.txt is one line of space-separated parameters. Rebuilt from its own
+# tokens rather than patched with sed: no escaping to get wrong, no duplicates,
+# and no stray second line, which the bootloader would ignore.
+cmdline_write() {
+    local param="$1" want="$2" out
+    [ -r "$CMDLINE_FILE" ] || { warn "cannot read $CMDLINE_FILE"; return 1; }
+    out=$(LC_ALL=C awk -v param="$param" -v want="$want" '
+        { for (i = 1; i <= NF; i++) if ($i != param) toks[++n] = $i }
+        END {
+            if (want == "1") toks[++n] = param
+            line = ""
+            for (i = 1; i <= n; i++) line = line (i > 1 ? " " : "") toks[i]
+            print line
+        }' "$CMDLINE_FILE")
+    # A truncated cmdline.txt is an unbootable Pi. Never write one.
+    case "$out" in
+        ""|"$OVERLAY_PARAM") warn "refusing to write a suspiciously short $CMDLINE_FILE"; return 1 ;;
+    esac
+    printf '%s\n' "$out" | boot_replace "$CMDLINE_FILE" || return 1
+    overlay_state_publish
+}
+
+# The parameter is inert without an initramfs to act on it, and that failure is
+# silent — the Pi boots normally and keeps writing to the card. Check first.
+overlay_preflight() {
+    local problems=0
+    if ! dpkg-query -W -f='${Status}' overlayroot 2>/dev/null | grep -q "ok installed"; then
+        warn "the overlayroot package is not installed"
+        problems=1
+    fi
+    if ! grep -qE '^[[:space:]]*auto_initramfs=1' "$CONFIG_TXT" 2>/dev/null; then
+        warn "auto_initramfs=1 is not set in $CONFIG_TXT, so no initramfs will be loaded"
+        problems=1
+    fi
+    return "$problems"
+}
+
+# auto_initramfs=1 picks up whatever initramfs-tools last built, so it survives
+# kernel upgrades; naming one file does not.
+overlay_ensure_initramfs() {
+    grep -qE '^[[:space:]]*auto_initramfs=1' "$CONFIG_TXT" 2>/dev/null && return 0
+    [ -r "$CONFIG_TXT" ] || { warn "no $CONFIG_TXT; cannot enable the initramfs"; return 1; }
+    log "adding auto_initramfs=1 to $CONFIG_TXT"
+    { cat "$CONFIG_TXT"; printf '\n# Load the initramfs the overlay needs. Added by ogn-bootstrap.\nauto_initramfs=1\n'; } \
+        | boot_replace "$CONFIG_TXT"
+}
+
+OVERLAY_MOTD=/etc/motd.d/30-ogn-overlay
+
+# overlay_motd_update — report the overlay in the login banner.
+#
+# A file rewritten at boot, not a script run per login: the live state is fixed
+# by the initramfs, so it cannot change while the system is up. What the next
+# boot will do can, and everything that changes it calls this.
+overlay_motd_update() {
+    local tmp
+    mkdir -p "$(dirname "$OVERLAY_MOTD")" 2>/dev/null || return 0
+    tmp=$(mktemp) || return 0
+    if overlay_active && overlay_next_boot; then
+        cat > "$tmp" <<'EOF'
+
+  Filesystem:  READ-ONLY. Anything you change is discarded at the next reboot.
+               To make a change stick:  sudo overlay off --reboot
+
+EOF
+    elif overlay_active; then
+        cat > "$tmp" <<'EOF'
+
+  Filesystem:  READ-ONLY for now, but switched OFF for the next boot.
+               Reboot and this receiver comes up writable.
+               Changed your mind?  sudo overlay on
+
+EOF
+    elif overlay_next_boot; then
+        cat > "$tmp" <<'EOF'
+
+  Filesystem:  WRITABLE, and read-only again after the next reboot.
+               Finish what you are doing, then:  sudo reboot
+
+EOF
+    else
+        cat > "$tmp" <<'EOF'
+
+  *** Filesystem: WRITABLE. The read-only overlay is OFF. ***
+
+  This receiver is writing to its SD card. That is fine while you are working
+  on it, and a bad way to leave it: a card written to continuously, on a
+  machine that loses power without warning, is the commonest way a receiver
+  dies in the field.
+
+  When you have finished:  sudo overlay on --reboot
+
+EOF
+    fi
+    # Only touch the file if it actually changed. This runs at every boot, and
+    # with the overlay off it is a write to the SD card.
+    cmp -s "$tmp" "$OVERLAY_MOTD" || install -m 0644 "$tmp" "$OVERLAY_MOTD" 2>/dev/null || true
+    rm -f "$tmp"
+    return 0
+}
+
+# Swap on a tmpfs overlay is pathological: the backing file lives in the RAM
+# upper layer, so the system pins memory to hold a "disk" that is itself
+# memory, and the overlay slowly fills. Disable the units that recreate it
+# rather than just swapoff, or it returns at the next boot.
+#
+# On Trixie the units come from rpi-swap-generator, regenerated under /run at
+# every boot, so `systemctl disable` cannot touch them; only its own config
+# can. Must be written while the root filesystem is still writable.
+SWAP_DROPIN="${OGN_SWAP_DROPIN:-/etc/rpi/swap.conf.d/90-ogn-bootstrap.conf}"
+swap_disable() {
+    local u
+    install -d -m 0755 "$(dirname "$SWAP_DROPIN")"
+    printf '# Written by ogn-bootstrap: no swap under the read-only overlay.\n[Main]\nMechanism=none\n' \
+        > "$SWAP_DROPIN"
+    swapoff -a 2>/dev/null || true
+    for u in rpi-setup-loop@var-swap.service rpi-resize-swap-file.service dphys-swapfile.service; do
+        systemctl disable --now "$u" >/dev/null 2>&1 || true
+    done
+    rm -f /var/swap 2>/dev/null || true
 }
 
 # --------------------------------------------------------------------------
@@ -563,6 +794,647 @@ wifi_apply() {
 }
 
 # --------------------------------------------------------------------------
+# WireGuard from the card
+#
+# The same argument as the wifi above: a tunnel that exists so you can reach
+# an unreachable receiver is no use if fixing it needs you to reach the
+# receiver. So Network.WireGuard is applied from the FAT partition at every
+# boot, and /etc/wireguard is treated as a rendering of the card rather than
+# as configuration in its own right — which it has to be anyway, since under
+# the read-only overlay /etc is RAM and forgets itself at every reboot.
+#
+# The private key is in clear on the card. Say it out loud, in the template
+# and in the README, and keep it out of the world-readable copy of
+# MyReceiver.conf that the decoder gets.
+# --------------------------------------------------------------------------
+WG_IFACE="${OGN_WG_IFACE:-wg-ogn}"
+WG_DIR="${OGN_WG_DIR:-/etc/wireguard}"
+WG_CONF="$WG_DIR/$WG_IFACE.conf"
+WG_MOTD="${OGN_WG_MOTD:-/etc/motd.d/40-ogn-wireguard}"
+# [s] without a handshake before the endpoint is re-resolved. Longer than the
+# 2-minute interval WireGuard itself retries a handshake at, so this only
+# fires once WireGuard has given up rather than racing it.
+WG_STALE=300
+
+# A WireGuard key is 32 bytes of base64: 43 characters and a '='.
+wg_key_ok() { printf '%s' "$1" | grep -Eq '^[A-Za-z0-9+/]{43}=$'; }
+
+wg_up() { ip link show "$WG_IFACE" >/dev/null 2>&1; }
+
+# wireguard_render — print a wg-quick config from the loaded card settings.
+#
+# Pure: reads the config, writes stdout, touches nothing. Returns 1, saying
+# what is missing, rather than rendering something that cannot work.
+wireguard_render() {
+    local key addr mtu pub psk endpoint allowed keepalive ok=1
+
+    key=$(conf_get Network.WireGuard.PrivateKey "")
+    addr=$(conf_get Network.WireGuard.Address "")
+    mtu=$(conf_get Network.WireGuard.MTU 0)
+    pub=$(conf_get Network.WireGuard.Peer.PublicKey "")
+    psk=$(conf_get Network.WireGuard.Peer.PresharedKey "")
+    endpoint=$(conf_get Network.WireGuard.Peer.Endpoint "")
+    allowed=$(conf_get Network.WireGuard.Peer.AllowedIPs "")
+    keepalive=$(conf_get Network.WireGuard.Peer.PersistentKeepalive 25)
+
+    [ -n "$key" ]      || { warn "Network.WireGuard.PrivateKey is empty"; ok=0; }
+    [ -n "$addr" ]     || { warn "Network.WireGuard.Address is empty"; ok=0; }
+    [ -n "$pub" ]      || { warn "Network.WireGuard.Peer.PublicKey is empty"; ok=0; }
+    [ -n "$endpoint" ] || { warn "Network.WireGuard.Peer.Endpoint is empty"; ok=0; }
+    [ -n "$allowed" ]  || { warn "Network.WireGuard.Peer.AllowedIPs is empty"; ok=0; }
+    [ "$ok" -eq 1 ] || return 1
+
+    wg_key_ok "$key" || { warn "Network.WireGuard.PrivateKey is not a WireGuard key (44 characters of base64)"; ok=0; }
+    wg_key_ok "$pub" || { warn "Network.WireGuard.Peer.PublicKey is not a WireGuard key (44 characters of base64)"; ok=0; }
+    if [ -n "$psk" ] && ! wg_key_ok "$psk"; then
+        warn "Network.WireGuard.Peer.PresharedKey is not a WireGuard key (44 characters of base64)"; ok=0
+    fi
+    # The commonest way to get this wrong is to paste the private key into the
+    # peer, which otherwise fails silently: the tunnel comes up and no
+    # handshake ever completes.
+    if [ "$key" = "$pub" ]; then
+        warn "Network.WireGuard.Peer.PublicKey is this receiver's own key; it wants the SERVER's public key"; ok=0
+    fi
+    case "$addr" in
+        */*) ;;
+        *)   warn "Network.WireGuard.Address ('$addr') has no prefix length; it should look like 10.6.0.7/32"; ok=0 ;;
+    esac
+    case "$endpoint" in
+        *:[0-9]*) ;;
+        *)        warn "Network.WireGuard.Peer.Endpoint ('$endpoint') is not host:port"; ok=0 ;;
+    esac
+    case "$keepalive" in
+        ''|*[!0-9]*) warn "Network.WireGuard.Peer.PersistentKeepalive ('$keepalive') is not a number"; ok=0 ;;
+    esac
+    case "$mtu" in
+        ''|*[!0-9]*) warn "Network.WireGuard.MTU ('$mtu') is not a number"; ok=0 ;;
+    esac
+    [ "$ok" -eq 1 ] || return 1
+
+    printf '# Generated from %s by ogn-bootstrap. Edit the card, not this file:\n' "$BOOT_CONF"
+    printf '# this is rewritten from Network.WireGuard at every boot.\n\n'
+    printf '[Interface]\n'
+    printf 'PrivateKey = %s\n' "$key"
+    printf 'Address = %s\n' "$addr"
+    [ "$mtu" != "0" ] && printf 'MTU = %s\n' "$mtu"
+    printf '\n[Peer]\n'
+    printf 'PublicKey = %s\n' "$pub"
+    [ -n "$psk" ] && printf 'PresharedKey = %s\n' "$psk"
+    printf 'Endpoint = %s\n' "$endpoint"
+    printf 'AllowedIPs = %s\n' "$allowed"
+    [ "$keepalive" != "0" ] && printf 'PersistentKeepalive = %s\n' "$keepalive"
+    return 0
+}
+
+# conf_redact_secrets <file> — blank every credential in a copy of the config.
+#
+# The copy of MyReceiver.conf the decoder runs from is world-readable, and the
+# decoder has no use for any of these: the wifi password, a Raspberry Pi
+# Connect auth key, or the WireGuard keys. The card keeps the only copy that
+# needs them. Written through a temp file rather than `sed -i` so the target
+# keeps the ownership and mode it was installed with.
+#
+# Named by key, not by path, because the flattener is not available here and a
+# copy of this file is the one place a name collision could not do harm: every
+# one of these names appears exactly once in the template, and blanking one
+# line too many would only cost the decoder something it does not read.
+OGN_SECRET_KEYS="Password ConnectAuthKey PrivateKey PresharedKey"
+conf_redact_secrets() {
+    local file="$1" tmp key args=() note="blanked by ogn-bootstrap: it is on the card"
+    tmp=$(mktemp) || return 1
+    for key in $OGN_SECRET_KEYS; do
+        args+=(-e "s|^\\( *$key *= *\\)\"[^\"]*\"|\\1\"\";   # $note|")
+    done
+    sed "${args[@]}" "$file" > "$tmp" && cat "$tmp" > "$file" \
+        || warn "could not blank the credentials in $file; it still holds them"
+    rm -f "$tmp"
+    return 0
+}
+
+# wireguard_down — take the tunnel down and forget it.
+wireguard_down() {
+    if wg_up; then
+        log "taking the WireGuard tunnel $WG_IFACE down"
+        if command -v wg-quick >/dev/null 2>&1 && [ -s "$WG_CONF" ]; then
+            wg-quick down "$WG_IFACE" >/dev/null 2>&1 || ip link delete "$WG_IFACE" 2>/dev/null || true
+        else
+            ip link delete "$WG_IFACE" 2>/dev/null || true
+        fi
+    fi
+    rm -f "$WG_CONF" "$WG_MOTD"
+    return 0
+}
+
+# wireguard_refresh — re-resolve the endpoint if the handshake has stopped.
+#
+# WireGuard resolves Endpoint once, when the peer is configured, and never
+# again. A server on a dynamic address therefore takes the tunnel with it when
+# it moves — silently, and precisely when the tunnel is the only way in. One
+# `wg set` re-resolves the name without disturbing the interface, its routes,
+# or anything already running over it.
+wireguard_refresh() {
+    local pub endpoint last age
+    endpoint=$(conf_get Network.WireGuard.Peer.Endpoint "")
+    pub=$(conf_get Network.WireGuard.Peer.PublicKey "")
+    # A literal address cannot have moved, so there is nothing to re-resolve.
+    case "$endpoint" in ''|\[*) return 0 ;; [0-9]*.[0-9]*.[0-9]*.[0-9]*:*) return 0 ;; esac
+
+    last=$(wg show "$WG_IFACE" latest-handshakes 2>/dev/null | awk -v p="$pub" '$1 == p { print $2; exit }')
+    case "$last" in ''|*[!0-9]*) return 0 ;; esac
+    age=$(( $(date +%s) - last ))
+    [ "$age" -ge "$WG_STALE" ] || return 0
+
+    if [ "$last" -eq 0 ]; then
+        log "WireGuard has never completed a handshake; re-resolving $endpoint"
+    else
+        log "no WireGuard handshake for ${age}s; re-resolving $endpoint"
+    fi
+    wg set "$WG_IFACE" peer "$pub" endpoint "$endpoint" 2>/dev/null \
+        || warn "could not re-resolve the WireGuard endpoint '$endpoint'"
+    return 0
+}
+
+WG_MOTD_TEMPLATE='
+  WireGuard:   %s on %s, through %s
+               Is it talking?  sudo ogn-wireguard status
+
+'
+wireguard_motd_update() {
+    local tmp
+    mkdir -p "$(dirname "$WG_MOTD")" 2>/dev/null || return 0
+    tmp=$(mktemp) || return 0
+    # shellcheck disable=SC2059
+    printf "$WG_MOTD_TEMPLATE" \
+        "$(conf_get Network.WireGuard.Address "")" "$WG_IFACE" \
+        "$(conf_get Network.WireGuard.Peer.Endpoint "")" > "$tmp"
+    cmp -s "$tmp" "$WG_MOTD" || install -m 0644 "$tmp" "$WG_MOTD" 2>/dev/null || true
+    rm -f "$tmp"
+    return 0
+}
+
+# wireguard_apply — make Network.WireGuard the live tunnel. Needs conf_load
+# first. Returns 1 only when a tunnel was asked for and could not be provided,
+# so that the unit holding this reports a failure someone can see.
+wireguard_apply() {
+    local tmp out
+
+    if ! conf_bool Network.WireGuard.Enable false; then
+        wireguard_down
+        return 0
+    fi
+
+    if ! command -v wg-quick >/dev/null 2>&1; then
+        warn "Network.WireGuard is enabled but wireguard-tools is not installed"
+        return 1
+    fi
+
+    tmp=$(mktemp)
+    if ! wireguard_render > "$tmp"; then
+        rm -f "$tmp"
+        warn "WireGuard is enabled but not usably configured; leaving the network alone"
+        return 1
+    fi
+
+    # Unchanged and already up: nothing to do but check it is still talking.
+    if cmp -s "$tmp" "$WG_CONF" && wg_up; then
+        rm -f "$tmp"
+        wireguard_refresh
+        return 0
+    fi
+
+    install -d -m 0700 "$WG_DIR"
+    install -m 0600 "$tmp" "$WG_CONF"
+    rm -f "$tmp"
+
+    # wg-quick installs a kill-switch rule for a default route through the
+    # tunnel, and needs a firewall command to do it. Saying so here turns an
+    # obscure failure two lines down into an explicable one.
+    case "$(conf_get Network.WireGuard.Peer.AllowedIPs "")" in
+        *0.0.0.0/0*|*::/0*)
+            command -v nft >/dev/null 2>&1 || command -v iptables >/dev/null 2>&1 \
+                || warn "AllowedIPs routes everything through the tunnel, which needs nftables or iptables on this Pi" ;;
+    esac
+
+    log "bringing up the WireGuard tunnel $WG_IFACE"
+    wg-quick down "$WG_IFACE" >/dev/null 2>&1 || true
+    if ! out=$(wg-quick up "$WG_IFACE" 2>&1); then
+        printf '%s\n' "$out" | sed 's/^/  /' >&2
+        warn "could not bring up the WireGuard tunnel $WG_IFACE"
+        return 1
+    fi
+    [ -n "$out" ] && printf '%s\n' "$out" | sed 's/^/  /'
+    wireguard_motd_update
+    return 0
+}
+
+# --------------------------------------------------------------------------
+# ADS-B from the card
+#
+# The same argument as WireGuard above: /etc/default/readsb is a rendering of
+# ADSB.* rather than configuration in its own right. Under the read-only
+# overlay /etc is RAM and forgets itself at every reboot, so it has to be.
+#
+# Nothing here writes to the card. readsb writes its JSON to /run/readsb,
+# which is RAM, for the statistics page on ADSB_WEB_PORT to read; the image's
+# drop-in strips upstream's own --write-json, so this is the only place it
+# comes from. The multilateration clients keep their settings in /run for the
+# same reason.
+# --------------------------------------------------------------------------
+ADSB_DEFAULT="${OGN_ADSB_DEFAULT:-/etc/default/readsb}"
+ADSB_MLAT_DIR="${OGN_ADSB_MLAT_DIR:-/run/ogn-bootstrap/mlat}"
+ADSB_MOTD="${OGN_ADSB_MOTD:-/etc/motd.d/50-ogn-adsb}"
+
+# readsb's own port conventions, and the ones every ADS-B instruction written
+# for a Pi assumes: raw AVR out, Beast out, and Beast in for MLAT results.
+ADSB_AVR_PORT=30002
+ADSB_BEAST_PORT=30005
+ADSB_MLAT_IN_PORT=30104
+
+# readsb's statistics, served by adsb-stats.py from the JSON it writes to
+# ADSB_JSON_DIR. Clear of the OGN status pages on HTTP.Port and the port after.
+ADSB_WEB_PORT=8084
+ADSB_JSON_DIR=/run/readsb
+
+# The sites this receiver knows how to feed, and the only ones a tick box can
+# reach. Kept here rather than on the card so that a hostname cannot be
+# mistyped into a receiver nobody can get back to, and so that what a given
+# setting sends, and to whom, can be read in one place.
+#
+# All four take Beast on 30004 and multilateration on 31090.
+ADSB_FEEDS="ADSBExchange ADSBFi ADSBLol AirplanesLive"
+ADSB_FEED_PORT=30004
+ADSB_MLAT_PORT=31090
+
+adsb_feed_host() {
+    case "$1" in
+        ADSBExchange)  printf 'feed.adsbexchange.com' ;;
+        ADSBFi)        printf 'feed.adsb.fi' ;;
+        ADSBLol)       printf 'feed.adsb.lol' ;;
+        AirplanesLive) printf 'feed.airplanes.live' ;;
+        *)             return 1 ;;
+    esac
+}
+
+# systemd instance names, so it reads ogn-mlat@adsbfi rather than @ADSBFi.
+adsb_feed_instance() { printf '%s' "$1" | tr 'A-Z' 'a-z'; }
+
+# The feeds switched on, one per line. Needs conf_load first.
+adsb_enabled_feeds() {
+    local f
+    for f in $ADSB_FEEDS; do
+        conf_bool "ADSB.Feed.$f" false && printf '%s\n' "$f"
+    done
+    return 0
+}
+
+# A number, possibly negative, possibly with a decimal point. readsb's -10
+# means "let the tuner decide", so a bare - is not enough to reject on.
+adsb_number_ok() { printf '%s' "$1" | grep -Eq '^-?[0-9]+(\.[0-9]+)?$'; }
+
+# Where this receiver's identity comes from, first one readable wins: the Pi's
+# own serial number, then machine-id for anything that is not a Pi.
+ADSB_ID_SOURCES="${OGN_ADSB_ID_SOURCES:-/sys/firmware/devicetree/base/serial-number /proc/cpuinfo /etc/machine-id}"
+
+adsb_uuid_ok() { printf '%s' "$1" | grep -Eq '^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$'; }
+
+# adsb_uuid — the UUID readsb gives the feed sites, so they can tell this
+# receiver's data from everyone else's. Without one readsb still feeds, but
+# anonymously, and complains about it on every connection.
+#
+# ADSB.Feed.UUID on the card wins, for a receiver already registered with a
+# site. Otherwise it is derived from the hardware serial rather than generated
+# and stored: the same at every boot and across a reflash, so the sites keep
+# the station's history, with nothing written to the card. Hashed, so the
+# serial itself never leaves the Pi. Prints nothing if there is no source.
+adsb_uuid() {
+    local id src h v
+    id=$(conf_get ADSB.Feed.UUID "")
+    if [ -n "$id" ]; then printf '%s' "$id"; return 0; fi
+    for src in $ADSB_ID_SOURCES; do
+        [ -r "$src" ] || continue
+        case "$src" in
+            */cpuinfo) id=$(sed -n 's/^Serial[[:space:]]*:[[:space:]]*//p' "$src" | head -1) ;;
+            *)         id=$(tr -d '\0\n' < "$src") ;;
+        esac
+        # An all-zero serial is what a board without one reports.
+        case "$id" in ''|*[!0]*) ;; *) id="" ;; esac
+        [ -n "$id" ] && break
+    done
+    [ -n "$id" ] || return 0
+    h=$(printf 'ogn-bootstrap-adsb:%s' "$id" | sha256_stdin)
+    # Shaped as a version 4 UUID, which is what the sites' own scripts make.
+    v=$(printf '%s' "89ab" | cut -c$(( 0x${h:16:1} % 4 + 1 )))
+    printf '%s-%s-4%s-%s%s-%s' "${h:0:8}" "${h:8:4}" "${h:13:3}" "$v" "${h:17:3}" "${h:20:12}"
+}
+
+# adsb_render — print /etc/default/readsb from the loaded card settings.
+#
+# Pure: reads the config (and the hardware serial, for adsb_uuid), writes
+# stdout, touches nothing. Returns 1, saying what is wrong, rather than
+# rendering something that cannot work.
+adsb_render() {
+    local serial ogn_serial gain custom entry host f conn="" feeds="" ok=1 uuid
+
+    serial=$(conf_get ADSB.DeviceSerial "")
+    ogn_serial=$(conf_get RF.DeviceSerial "")
+    gain=$(conf_get ADSB.Gain auto)
+    custom=$(conf_get ADSB.Feed.Custom "")
+
+    [ -n "$serial" ] || {
+        warn "ADSB.DeviceSerial is empty; it wants the serial of the 1090 MHz stick"; ok=0; }
+
+    # Two dongles and only one of them named is the trap this whole section is
+    # built around: RF.Device is an index, indexes are handed out in USB
+    # enumeration order, and so the OGN decoder can open the ADS-B stick and
+    # hear nothing for reasons nothing reports.
+    if [ -z "$ogn_serial" ]; then
+        warn "ADS-B needs RF.DeviceSerial set as well, so the OGN decoder cannot open the ADS-B stick by accident"
+        ok=0
+    elif [ "$serial" = "$ogn_serial" ]; then
+        warn "ADSB.DeviceSerial and RF.DeviceSerial are both '$serial'; one stick cannot do 868 and 1090 at once"
+        ok=0
+    fi
+
+    # "auto" is readsb's own autogain, which steps the gain down as soon as
+    # anything comes close to clipping. -10 is the tuner's AGC instead, and
+    # any other number a fixed gain in dB.
+    [ "$(printf '%s' "$gain" | tr '[:upper:]' '[:lower:]')" = auto ] && gain=auto
+    [ "$gain" = auto ] || adsb_number_ok "$gain" \
+        || { warn "ADSB.Gain ('$gain') is not \"auto\" or a number"; ok=0; }
+
+    # Multilateration works by comparing arrival times between receivers, so a
+    # receiver that is not where it says it is makes everyone else's answers
+    # worse. Refuse rather than quietly feed a template default.
+    if conf_bool ADSB.Feed.MLAT false; then
+        local lat lon
+        lat=$(conf_get Position.Latitude 0)
+        lon=$(conf_get Position.Longitude 0)
+        if awk "BEGIN{exit !($lat == 0 && $lon == 0)}" 2>/dev/null; then
+            warn "ADSB.Feed.MLAT needs a real Position; it is still 0,0"
+            ok=0
+        elif awk "BEGIN{exit !($lat < -90 || $lat > 90 || $lon < -180 || $lon > 180)}" 2>/dev/null; then
+            warn "ADSB.Feed.MLAT needs a real Position; $lat,$lon is out of range"
+            ok=0
+        fi
+        [ -n "$(adsb_enabled_feeds)" ] || {
+            warn "ADSB.Feed.MLAT is on but no site is switched on to send it to"; ok=0; }
+    fi
+
+    for f in $(adsb_enabled_feeds); do
+        host=$(adsb_feed_host "$f") || continue
+        conn="$conn --net-connector $host,$ADSB_FEED_PORT,beast_reduce_plus_out"
+        feeds="$feeds $f"
+    done
+
+    # Custom is a comma-separated scalar rather than a libconfig array,
+    # because the flattener keeps an array as one opaque bracketed string and
+    # conf_get has no way to take it apart.
+    local IFS_SAVE="$IFS"
+    IFS=','
+    for entry in $custom; do
+        IFS="$IFS_SAVE"
+        entry=$(printf '%s' "$entry" | tr -d '[:space:]')
+        [ -n "$entry" ] || continue
+        case "$entry" in
+            *:[0-9]*) conn="$conn --net-connector ${entry%:*},${entry##*:},beast_reduce_plus_out" ;;
+            *)        warn "ADSB.Feed.Custom entry '$entry' is not host:port"; ok=0 ;;
+        esac
+        IFS=','
+    done
+    IFS="$IFS_SAVE"
+
+    # Only sent to the sites, so only worth having when there are some.
+    if [ -n "$conn" ]; then
+        uuid=$(adsb_uuid)
+        if [ -z "$uuid" ]; then
+            warn "no hardware serial or machine-id to identify this receiver to the feed sites; feeding anonymously"
+        elif adsb_uuid_ok "$uuid"; then
+            conn="$conn --uuid $uuid"
+        else
+            warn "ADSB.Feed.UUID ('$uuid') is not a UUID; it looks like 01234567-89ab-cdef-0123-456789abcdef"
+            ok=0
+        fi
+    fi
+
+    [ "$ok" -eq 1 ] || return 1
+
+    printf '# Generated from %s by ogn-bootstrap. Edit the card, not this file:\n' "$BOOT_CONF"
+    printf '# this is rewritten from ADSB at every boot.\n'
+    printf '#\n'
+    if [ -n "$feeds" ]; then
+        printf '# Sharing with:%s\n' "$feeds"
+    else
+        printf '# Not shared with anyone: the OGN decoder reads it on %s and that is all.\n' "$ADSB_AVR_PORT"
+    fi
+    printf '\n'
+    printf 'RECEIVER_OPTIONS="--device %s --device-type rtlsdr --gain %s --ppm 0"\n' "$serial" "$gain"
+    printf 'DECODER_OPTIONS="--max-range 360"\n'
+    printf 'NET_OPTIONS="--net --net-heartbeat 60 --net-ro-port %s --net-bo-port %s --net-bi-port %s%s"\n' \
+        "$ADSB_AVR_PORT" "$ADSB_BEAST_PORT" "$ADSB_MLAT_IN_PORT" "$conn"
+    # Into RAM, never the card. readsb's own RuntimeDirectory, so it is there
+    # before readsb starts and goes when it stops.
+    printf 'JSON_OPTIONS="--write-json %s"\n' "$ADSB_JSON_DIR"
+    return 0
+}
+
+# adsb_mlat_render <feed> — print the environment for one ogn-mlat@ instance.
+#
+# Pure, as above. mlat-client reads Beast from readsb and sends its answers
+# back in on ADSB_MLAT_IN_PORT, so multilaterated aircraft reach OGN too.
+adsb_mlat_render() {
+    local feed="$1" host call
+    host=$(adsb_feed_host "$feed") || { warn "no multilateration server known for '$feed'"; return 1; }
+    call=$(conf_get APRS.Call "")
+    [ -n "$call" ] || { warn "APRS.Call is empty; multilateration servers want a station name"; return 1; }
+
+    printf 'MLAT_SERVER=%s:%s\n' "$host" "$ADSB_MLAT_PORT"
+    printf 'MLAT_LAT=%s\n'   "$(conf_get Position.Latitude 0)"
+    printf 'MLAT_LON=%s\n'   "$(conf_get Position.Longitude 0)"
+    printf 'MLAT_ALT=%s\n'   "$(conf_get Position.Altitude 0)"
+    printf 'MLAT_CALL=%s\n'  "$call"
+    printf 'MLAT_INPUT=localhost:%s\n'   "$ADSB_BEAST_PORT"
+    printf 'MLAT_RESULTS=beast,connect,localhost:%s\n' "$ADSB_MLAT_IN_PORT"
+    return 0
+}
+
+# adsb_down — stop decoding, stop feeding, and forget how.
+adsb_down() {
+    local f inst
+    if systemctl is-enabled --quiet readsb 2>/dev/null || systemctl is-active --quiet readsb 2>/dev/null; then
+        log "switching ADS-B off"
+        systemctl disable --now readsb >/dev/null 2>&1 || true
+    fi
+    for f in $ADSB_FEEDS; do
+        inst=$(adsb_feed_instance "$f")
+        systemctl is-active --quiet "ogn-mlat@$inst.service" 2>/dev/null \
+            && systemctl stop "ogn-mlat@$inst.service" >/dev/null 2>&1 || true
+        rm -f "$ADSB_MLAT_DIR/$inst.env"
+    done
+    rm -f "$ADSB_DEFAULT" "$ADSB_MOTD"
+    return 0
+}
+
+# adsb_mlat_apply — one mlat-client per site that is switched on, and none
+# for any that is not. Returns 1 if a wanted one could not be configured.
+#
+# Started and stopped, never enabled or disabled. ogn-mlat@.service has no
+# [Install] section, so is-enabled answers "static" — which counts as success
+# — and every enable or disable is a daemon-reload. Run from the 10-minute
+# timer, that reloaded systemd once per site that was off. Nothing is lost by
+# not enabling: the environment is in /run, so ogn-adsb.service starts each
+# instance afresh at every boot.
+adsb_mlat_apply() {
+    local f inst tmp on=0 rc=0
+    conf_bool ADSB.Feed.MLAT false && on=1
+    [ "$on" -eq 1 ] && install -d -m 0755 "$ADSB_MLAT_DIR" 2>/dev/null
+
+    for f in $ADSB_FEEDS; do
+        inst=$(adsb_feed_instance "$f")
+        if [ "$on" -eq 1 ] && conf_bool "ADSB.Feed.$f" false; then
+            tmp=$(mktemp) || return 1
+            if ! adsb_mlat_render "$f" > "$tmp"; then
+                rm -f "$tmp"; rc=1; continue
+            fi
+            if ! cmp -s "$tmp" "$ADSB_MLAT_DIR/$inst.env"; then
+                install -m 0644 "$tmp" "$ADSB_MLAT_DIR/$inst.env"
+                # --no-block throughout: these units wait for
+                # network-online.target, and a caller ordered before it would
+                # otherwise wait for them forever.
+                systemctl --no-block restart "ogn-mlat@$inst.service" >/dev/null 2>&1 || true
+            fi
+            rm -f "$tmp"
+            systemctl is-active --quiet "ogn-mlat@$inst.service" 2>/dev/null \
+                || systemctl --no-block start "ogn-mlat@$inst.service" >/dev/null 2>&1 || true
+        else
+            systemctl is-active --quiet "ogn-mlat@$inst.service" 2>/dev/null \
+                && systemctl stop "ogn-mlat@$inst.service" >/dev/null 2>&1 || true
+            rm -f "$ADSB_MLAT_DIR/$inst.env"
+        fi
+    done
+    return $rc
+}
+
+# What this receiver is sharing with, in a form fit for a one-line summary.
+adsb_feed_summary() {
+    local f out=""
+    for f in $(adsb_enabled_feeds); do
+        out="$out, $(adsb_feed_host "$f")"
+    done
+    if [ -z "$out" ]; then printf 'OGN only'; else printf 'OGN%s' "$out"; fi
+}
+
+ADSB_MOTD_TEMPLATE='
+  ADS-B:       readsb on stick %s, feeding %s
+               Is it hearing anything?  sudo ogn-adsb status
+               Statistics:              http://<this-pi>:%s/
+
+'
+adsb_motd_update() {
+    local tmp
+    mkdir -p "$(dirname "$ADSB_MOTD")" 2>/dev/null || return 0
+    tmp=$(mktemp) || return 0
+    # shellcheck disable=SC2059
+    printf "$ADSB_MOTD_TEMPLATE" \
+        "$(conf_get ADSB.DeviceSerial '?')" "$(adsb_feed_summary)" "$ADSB_WEB_PORT" > "$tmp"
+    cmp -s "$tmp" "$ADSB_MOTD" || install -m 0644 "$tmp" "$ADSB_MOTD" 2>/dev/null || true
+    rm -f "$tmp"
+    return 0
+}
+
+# adsb_apply — make ADSB the live state. Needs conf_load first. Returns 1
+# only when ADS-B was asked for and could not be provided, so that the unit
+# holding this reports a failure someone can see.
+adsb_apply() {
+    local tmp changed=0
+
+    if ! conf_bool ADSB.Enable false; then
+        adsb_down
+        return 0
+    fi
+
+    if ! command -v readsb >/dev/null 2>&1; then
+        warn "ADSB.Enable is true but readsb is not installed"
+        return 1
+    fi
+
+    # Never enabled: ogn-adsb.service starts it at every boot, once the card
+    # has been read. Enabled, it starts on its own before that, on whatever
+    # /etc/default/readsb survived -- and an enable made while the root was
+    # writable survives the overlay. Earlier versions did exactly that.
+    if systemctl is-enabled --quiet readsb 2>/dev/null; then
+        systemctl disable readsb >/dev/null 2>&1 || true
+    fi
+
+    tmp=$(mktemp)
+    if ! adsb_render > "$tmp"; then
+        rm -f "$tmp"
+        warn "ADS-B is enabled but not usably configured; leaving the receiver alone"
+        return 1
+    fi
+
+    if cmp -s "$tmp" "$ADSB_DEFAULT" && systemctl is-active --quiet readsb 2>/dev/null; then
+        rm -f "$tmp"
+    else
+        install -d -m 0755 "$(dirname "$ADSB_DEFAULT")"
+        install -m 0644 "$tmp" "$ADSB_DEFAULT"
+        rm -f "$tmp"
+        changed=1
+    fi
+
+    if [ "$changed" -eq 1 ]; then
+        log "starting readsb on the ADS-B stick"
+        if ! systemctl restart readsb >/dev/null 2>&1; then
+            warn "readsb would not start; see journalctl -u readsb"
+            return 1
+        fi
+    fi
+
+    # Started, never enabled, for the same reason as the mlat clients. It is
+    # BindsTo=readsb, so a restart above stops it and this brings it back.
+    systemctl is-active --quiet ogn-adsb-web.service 2>/dev/null \
+        || systemctl --no-block start ogn-adsb-web.service >/dev/null 2>&1 || true
+
+    adsb_mlat_apply || { adsb_motd_update; return 1; }
+    adsb_motd_update
+    return 0
+}
+
+# --------------------------------------------------------------------------
+# The first reboot
+#
+# On first boot the installer leaves the overlay unarmed and hands the reboot
+# to ogn-first-reboot.timer, which waits until nothing else still needs a
+# writable root: cloud-init finishing Imager's settings, and Raspberry Pi
+# Connect spending the auth key Imager gave it. A sign-in made under the
+# overlay is forgotten at the next reboot, and the key is single-use, so it
+# has to happen here or not at all.
+# --------------------------------------------------------------------------
+FIRST_REBOOT_DIR="${OGN_FIRST_REBOOT_DIR:-/var/lib/ogn-bootstrap}"
+FIRST_REBOOT_PENDING="$FIRST_REBOOT_DIR/first-reboot.pending"
+FIRST_REBOOT_MOTD="${OGN_FIRST_REBOOT_MOTD:-/etc/motd.d/15-ogn-first-reboot}"
+# A personal auth key expires six hours after it is made. Past that there is
+# nothing left to wait for.
+FIRST_REBOOT_LIMIT="${OGN_FIRST_REBOOT_LIMIT:-21600}"
+HOME_ROOT="${OGN_HOME_ROOT:-/home}"
+
+cloud_init_running() {
+    command -v cloud-init >/dev/null 2>&1 \
+        && cloud-init status 2>/dev/null | grep -q 'status: running'
+}
+
+# connect_signin_pending — an auth key is waiting to be spent by an account
+# that is not signed in yet. Connect removes the key once it has tried, and
+# state.json is what a successful sign-in leaves behind.
+connect_signin_pending() {
+    local key
+    for key in "$HOME_ROOT"/*/.config/com.raspberrypi.connect/auth.key; do
+        [ -e "$key" ] || continue
+        [ -s "$(dirname "$key")/state.json" ] || return 0
+    done
+    return 1
+}
+
+# --------------------------------------------------------------------------
 # MOTD
 # --------------------------------------------------------------------------
 motd_set() {
@@ -571,6 +1443,231 @@ motd_set() {
 }
 OGN_PAYLOAD_ogn_common_sh
 chmod 0644 $LIBDIR/ogn-common.sh
+
+cat > $LIBDIR/adsb-stats.py <<'OGN_PAYLOAD_adsb_stats_py'
+#!/usr/bin/env python3
+#
+# adsb-stats.py — readsb's statistics, on a web page.
+#
+#   python3 -I adsb-stats.py [--port 8084] [--dir /run/readsb]
+#
+# readsb writes its JSON to /run/readsb, which is RAM, because adsb_render
+# asks it to in JSON_OPTIONS. Nothing touches the card. This serves those
+# files, and nothing else:
+#
+#   /                   a page that shows them
+#   /data/stats.json    message rates, signal levels, range
+#   /data/receiver.json what readsb says about itself
+#   /data/aircraft.json what it is hearing right now
+#
+# Everything else is a 404, in the same spirit as the decoder's own status
+# pages: a fixed set of paths, never a directory listing. Standard library
+# only, because nothing else is installed on the image.
+#
+# Run by ogn-adsb-web.service, which goes up and down with readsb.
+#
+# Copyright (c) 2026 ifly7charlie. MIT licence, see LICENSE.
+
+import argparse
+import os
+import sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+DATA_FILES = ("stats.json", "receiver.json", "aircraft.json")
+
+PAGE = b"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ADS-B statistics</title>
+<style>
+  :root { --bg:#fff; --fg:#1d1d1f; --mute:#6e6e73; --line:#d2d2d7; --bad:#b00020; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#161617; --fg:#f5f5f7; --mute:#a1a1a6; --line:#3a3a3c; --bad:#ff6b6b; }
+  }
+  body { background:var(--bg); color:var(--fg); margin:0 auto; max-width:60rem;
+         padding:1rem; font:15px/1.4 system-ui, sans-serif; }
+  h1 { font-size:1.3rem; margin:0 0 .2rem; }
+  h2 { font-size:1rem; margin:1.5rem 0 .4rem; }
+  .mute { color:var(--mute); }
+  .bad { color:var(--bad); }
+  .scroll { overflow-x:auto; }
+  table { border-collapse:collapse; width:100%; font-variant-numeric:tabular-nums; }
+  th, td { text-align:right; padding:.25rem .6rem; border-bottom:1px solid var(--line);
+           white-space:nowrap; }
+  th:first-child, td:first-child { text-align:left; }
+  th { font-weight:600; }
+  a { color:inherit; }
+</style>
+</head>
+<body>
+<h1>ADS-B statistics</h1>
+<div id="status" class="mute">Loading&hellip;</div>
+
+<h2>Now</h2>
+<div class="scroll"><table id="now"></table></div>
+
+<h2>By period</h2>
+<div class="scroll"><table id="periods"></table></div>
+
+<p class="mute">Raw data:
+  <a href="data/stats.json">stats.json</a> &middot;
+  <a href="data/receiver.json">receiver.json</a> &middot;
+  <a href="data/aircraft.json">aircraft.json</a>.
+  Refreshes every 10&nbsp;s.</p>
+
+<script>
+"use strict";
+const PERIODS = [["last1min", "Last minute"], ["last5min", "Last 5 min"],
+                 ["last15min", "Last 15 min"], ["total", "Since start"]];
+
+function dash(v) { return (v === undefined || v === null || Number.isNaN(v)) ? "\\u2014" : v; }
+function num(v, d) { return typeof v === "number" ? v.toFixed(d || 0) : dash(v); }
+function sum(a) { return Array.isArray(a) ? a.reduce((x, y) => x + y, 0) : a; }
+function km(m) { return typeof m === "number" ? (m / 1000).toFixed(1) + " km" : dash(m); }
+function dur(s) {
+  if (typeof s !== "number" || s < 0) return dash();
+  const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
+  return (d ? d + "d " : "") + (d || h ? h + "h " : "") + m + "m";
+}
+
+function row(cells, tag) {
+  const tr = document.createElement("tr");
+  for (const c of cells) {
+    const el = document.createElement(tag || "td");
+    el.textContent = c;
+    tr.appendChild(el);
+  }
+  return tr;
+}
+
+function render(st, ac) {
+  const now = document.getElementById("now");
+  now.replaceChildren();
+  const withPos = st.aircraft_with_pos, without = st.aircraft_without_pos;
+  const total = (typeof withPos === "number" && typeof without === "number") ? withPos + without
+              : (ac && Array.isArray(ac.aircraft) ? ac.aircraft.length : undefined);
+  now.appendChild(row(["Aircraft", dash(total)]));
+  now.appendChild(row(["\\u2026 with a position", dash(withPos)]));
+  now.appendChild(row(["\\u2026 without", dash(without)]));
+  if (ac && typeof ac.messages === "number")
+    now.appendChild(row(["Messages since start", ac.messages]));
+  if (st.total && typeof st.total.start === "number" && typeof st.now === "number")
+    now.appendChild(row(["readsb up for", dur(st.now - st.total.start)]));
+
+  const t = document.getElementById("periods");
+  t.replaceChildren();
+  t.appendChild(row(["", "Messages/s", "Signal dBFS", "Noise dBFS", "Peak dBFS",
+                     "Strong (>-3)", "Max range", "Positions"], "th"));
+  for (const [key, label] of PERIODS) {
+    const p = st[key];
+    if (!p) continue;
+    const secs = (p.end - p.start) || NaN;
+    const local = p.local || {};
+    const msgs = typeof p.messages_valid === "number" ? p.messages_valid : p.messages;
+    t.appendChild(row([label,
+      num(msgs / secs, 1),
+      num(local.signal, 1), num(local.noise, 1), num(local.peak_signal, 1),
+      dash(local.strong_signals),
+      km(p.max_distance),
+      dash(p.position_count_total !== undefined ? p.position_count_total
+                                                : (p.cpr && sum(p.cpr.global_ok)))]));
+  }
+}
+
+async function get(name) {
+  const r = await fetch("data/" + name, {cache: "no-store"});
+  if (!r.ok) throw new Error(name + ": HTTP " + r.status);
+  return r.json();
+}
+
+async function refresh() {
+  const status = document.getElementById("status");
+  try {
+    const st = await get("stats.json");
+    let ac = null;
+    try { ac = await get("aircraft.json"); } catch (e) { /* the table copes */ }
+    render(st, ac);
+    status.className = "mute";
+    status.textContent = "Updated " + new Date().toLocaleTimeString() + ".";
+  } catch (e) {
+    status.className = "bad";
+    status.textContent = "No statistics from readsb yet (" + e.message +
+      "). It writes the first set a minute after it starts; if this persists, " +
+      "run: sudo ogn-adsb status";
+  }
+}
+refresh();
+setInterval(refresh, 10000);
+</script>
+</body>
+</html>
+"""
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "ogn-adsb-stats"
+    sys_version = ""
+    data_dir = "/run/readsb"
+
+    def _send(self, code, body, ctype, head_only):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        if not head_only:
+            self.wfile.write(body)
+
+    def _serve(self, head_only):
+        path = self.path.split("?", 1)[0]
+        if path in ("/", "/index.html"):
+            return self._send(200, PAGE, "text/html; charset=utf-8", head_only)
+        if path.startswith("/data/") and path[6:] in DATA_FILES:
+            try:
+                with open(os.path.join(self.data_dir, path[6:]), "rb") as f:
+                    body = f.read()
+            except OSError:
+                return self._send(503, b"readsb has not written this yet\n",
+                                  "text/plain; charset=utf-8", head_only)
+            return self._send(200, body, "application/json", head_only)
+        return self._send(404, b"not found\n", "text/plain; charset=utf-8", head_only)
+
+    def do_GET(self):
+        self._serve(False)
+
+    def do_HEAD(self):
+        self._serve(True)
+
+    # One line per request would fill the journal for nobody to read.
+    def log_message(self, fmt, *args):
+        pass
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Serve readsb's statistics over HTTP.")
+    ap.add_argument("--port", type=int, default=8084)
+    ap.add_argument("--dir", default="/run/readsb")
+    args = ap.parse_args()
+
+    Handler.data_dir = args.dir
+    httpd = ThreadingHTTPServer(("", args.port), Handler)
+    httpd.daemon_threads = True
+    # The bound port, not the asked-for one: --port 0 is how the tests get a
+    # free port, and they read it from here.
+    print(f"serving {args.dir} on port {httpd.server_port}", file=sys.stderr, flush=True)
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()
+OGN_PAYLOAD_adsb_stats_py
+chmod 0644 $LIBDIR/adsb-stats.py
 
 cat > /usr/local/sbin/ogn-install <<'OGN_PAYLOAD_ogn_install'
 #!/bin/bash
@@ -607,6 +1704,74 @@ done
 need_root
 mkdir -p /var/lib/ogn-bootstrap
 
+# The retry timer and a person at the keyboard can both start this.
+exec 9>/run/ogn-install.lock
+flock -w 60 9 || die "another ogn-install is already running"
+
+write_unit() {
+    local name="$1" tmp
+    tmp=$(mktemp)
+    cat > "$tmp"
+    if ! cmp -s "$tmp" "/etc/systemd/system/$name"; then
+        install -m 0644 "$tmp" "/etc/systemd/system/$name"
+        log "updated $name"
+    fi
+    rm -f "$tmp"
+}
+
+# ---------------------------------------------------------------------------
+# 0. Retry a failed first install
+#
+# cloud-init runs this only once, so a first boot without network would leave
+# a dead receiver. The timer reruns it until the "installed" marker exists.
+# Not armed on an installed receiver, so a failed re-run does not loop.
+# ---------------------------------------------------------------------------
+INSTALLED_MARKER="$STATE_DIR/installed"
+FIRST_INSTALL=0
+if [ ! -e "$INSTALLED_MARKER" ]; then
+    FIRST_INSTALL=1
+    install -d -m 0755 /etc/systemd/system
+    write_unit ogn-install-retry.service <<EOF
+[Unit]
+Description=OGN receiver: retry a first install that did not finish
+Documentation=https://github.com/glidernet/ogn-bootstrap
+After=network-online.target cloud-final.service
+Wants=network-online.target
+ConditionPathExists=!$INSTALLED_MARKER
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ogn-install
+TimeoutStartSec=30min
+EOF
+    write_unit ogn-install-retry.timer <<EOF
+[Unit]
+Description=OGN receiver: retry a first install that did not finish
+Documentation=https://github.com/glidernet/ogn-bootstrap
+ConditionPathExists=!$INSTALLED_MARKER
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=15min
+
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl enable ogn-install-retry.timer >/dev/null 2>&1 || true
+fi
+
+install_exit() {
+    local rc=$?
+    conf_cleanup || true
+    # Enabled covers the next boot; started covers this one.
+    if [ "$rc" -ne 0 ] && [ "$FIRST_INSTALL" -eq 1 ] && [ ! -e "$INSTALLED_MARKER" ]; then
+        systemctl start --no-block ogn-install-retry.timer >/dev/null 2>&1 || true
+        printf '%s ogn-bootstrap: install did not finish; retrying every 15 minutes and at every boot (systemctl status ogn-install-retry.timer)\n' "$(date -Is)" >&2
+    fi
+}
+trap install_exit EXIT
+
 # ---------------------------------------------------------------------------
 # 1. Read and sanity-check the configuration
 # ---------------------------------------------------------------------------
@@ -628,7 +1793,6 @@ fi
 
 log "reading $BOOT_CONF"
 conf_load "$BOOT_CONF"
-trap conf_cleanup EXIT
 
 OGN_USER=$(detect_ogn_user) || die "could not work out which account to install for; pass OGN_USER_OVERRIDE"
 OGN_HOME=$(user_home "$OGN_USER")
@@ -683,22 +1847,30 @@ WINDOW=$(conf_get Install.MaintenanceWindow "")
 # ---------------------------------------------------------------------------
 wifi_apply
 
+# Not fatal: if it never comes, step 4 fails and the retry timer takes over.
+network_wait download.glidernet.org || true
+
 # ---------------------------------------------------------------------------
 # 2. Packages
 #
 # Trixie substitutions worth knowing: libconfig9 -> libconfig11 (and the 0.3.2
 # binaries static-link it anyway), ntp/ntpdate are gone entirely, and the
 # decoder needs libpng16 rather than the libjpeg8 the old guides all mention.
-#
-# procServ and telnet are deliberately absent. The older images ran both
-# binaries inside procServ so you could telnet to ports 50000/50001 and watch
-# the console. Here they are ordinary systemd services, so the same output is
-# in the journal -- which survives, is rotated, and can be read remotely --
-# and there is no console to attach to. `journalctl -u ogn-decode -f`.
+# procserv: see on_procserv.
 # ---------------------------------------------------------------------------
-PACKAGES=(rtl-sdr librtlsdr0 libpng16-16t64 lynx curl ca-certificates unattended-upgrades)
+PACKAGES=(rtl-sdr librtlsdr0 libpng16-16t64 lynx curl ca-certificates unattended-upgrades procserv)
 [ "$READONLY_FS" -eq 1 ] && PACKAGES+=(overlayroot)
 conf_bool Install.RemoteAdmin.OGNTeam && PACKAGES+=(autossh)
+# Network.WireGuard is not in the Install section, so switching it on later
+# never comes back through here. The image ships wireguard-tools for exactly
+# that reason; this line is for a Pi being set up by hand.
+conf_bool Network.WireGuard.Enable && PACKAGES+=(wireguard-tools)
+# Same reasoning for ADS-B: the ADSB section is outside Install, so switching
+# it on later never comes back through here. The image ships both already.
+conf_bool ADSB.Enable && PACKAGES+=(readsb)
+# python3-pyasyncore: mlat-client-adsbfi imports asyncore, which left the
+# standard library in Python 3.12, and the package does not depend on it.
+conf_bool ADSB.Feed.MLAT && PACKAGES+=(mlat-client-adsbfi python3-pyasyncore)
 apt_install "${PACKAGES[@]}"
 
 # ---------------------------------------------------------------------------
@@ -741,8 +1913,10 @@ conf_load "$BOOT_CONF"
 # ---------------------------------------------------------------------------
 # 5. Place the configuration
 #
-# Copied, not regenerated: what was edited on the card is what runs. One value
-# is ever rewritten, and only when the operator left it for us.
+# Copied, not regenerated: what was edited on the card is what runs. Two lines
+# are ever rewritten: the receiver name, when the operator left it for us, and
+# the WireGuard private key, which is blanked because this copy is readable by
+# anyone with an account on the Pi.
 # ---------------------------------------------------------------------------
 TARGET_CONF="$REAL_DIR/MyReceiver.conf"
 log "writing $TARGET_CONF"
@@ -751,6 +1925,9 @@ install -o "$OGN_USER" -g "$OGN_GROUP" -m 0644 "$BOOT_CONF" "$TARGET_CONF"
 if [ "$CALL_SOURCE" = "hostname" ]; then
     sed -i "s|^\( *Call *= *\)\"\"|\1\"$CALL\"|" "$TARGET_CONF"
 fi
+
+# The decoder's copy is world-readable and has no use for a VPN key.
+conf_redact_secrets "$TARGET_CONF"
 
 # The geoid grid lets the decoder convert between ellipsoid and sea-level
 # heights properly, which is why GeoidSepar is deliberately absent from the
@@ -766,15 +1943,13 @@ fi
 # ---------------------------------------------------------------------------
 install -d -m 0755 /etc/systemd/system
 
-write_unit() {
-    local name="$1" tmp
-    tmp=$(mktemp)
-    cat > "$tmp"
-    if ! cmp -s "$tmp" "/etc/systemd/system/$name"; then
-        install -m 0644 "$tmp" "/etc/systemd/system/$name"
-        log "updated $name"
-    fi
-    rm -f "$tmp"
+# on_procserv <port> <name> <command...> — ExecStart running it under procServ.
+# ogn-rf segfaults without a terminal on stdin; procServ provides one, plus the
+# console on localhost:<port>. Logs go to the journal; --oneshot leaves
+# restarts to systemd. Never add --allow: it opens the console to the network.
+on_procserv() {
+    local port="$1" name="$2"; shift 2
+    printf '/usr/bin/procServ --foreground --logfile=- --oneshot --name=%s %s %s' "$name" "$port" "$*"
 }
 
 write_unit ogn-rf.service <<EOF
@@ -789,7 +1964,7 @@ Wants=time-sync.target
 Type=simple
 User=$OGN_USER
 WorkingDirectory=$REAL_DIR
-ExecStart=$REAL_DIR/ogn-rf MyReceiver.conf
+ExecStart=$(on_procserv 50000 ogn-rf "$REAL_DIR/ogn-rf" MyReceiver.conf)
 Restart=always
 RestartSec=10
 StandardOutput=journal
@@ -808,11 +1983,17 @@ Wants=time-sync.target
 Type=simple
 User=$OGN_USER
 WorkingDirectory=$REAL_DIR
-ExecStart=$REAL_DIR/ogn-decode MyReceiver.conf
+ExecStart=$(on_procserv 50001 ogn-decode "$REAL_DIR/ogn-decode" MyReceiver.conf)
 Restart=always
 RestartSec=10
 StandardOutput=journal
 StandardError=journal
+# ogn-decode echoes every packet it uplinks, each followed by a blank line.
+# With ADS-B on that is several lines a second, enough to push everything
+# else out of the RAM journal within hours. The procServ console
+# (telnet localhost 50001) still shows them.
+LogFilterPatterns=~^APRS <-
+LogFilterPatterns=~^[[:space:]]*\$
 EOF
 
 # The grouping unit exists so that 'systemctl restart rtlsdr-ogn' does the
@@ -867,6 +2048,15 @@ RuntimeWatchdogSec=15
 RebootWatchdogSec=3min
 EOF
 
+# systemd-remount-fs fails on an overlay root ("No changes allowed in
+# reconfigure") and leaves the system "degraded". It has nothing to do there.
+install -d -m 0755 /etc/systemd/system/systemd-remount-fs.service.d
+cat > /etc/systemd/system/systemd-remount-fs.service.d/ogn-overlay.conf <<EOF
+# Skipped under the read-only overlay. Installed by ogn-bootstrap.
+[Unit]
+ConditionKernelCommandLine=!$OVERLAY_PARAM
+EOF
+
 # ---------------------------------------------------------------------------
 # 9. Logs
 #
@@ -881,10 +2071,8 @@ EOF
 #   RuntimeMaxUse     capped, because the flip side of a journal in RAM is a
 #                     journal competing with the decoder for RAM.
 #
-# This is also why the services log to the journal rather than running under
-# procServ as the older images did: procServ writes plain files under
-# /var/log, which persist whenever the overlay is off, and it never rotates
-# them.
+# Hence procServ logs to the journal, not the unrotated /var/log files the
+# older images used.
 # ---------------------------------------------------------------------------
 install -d -m 0755 /etc/systemd/journald.conf.d
 cat > /etc/systemd/journald.conf.d/10-ogn.conf <<'EOF'
@@ -909,6 +2097,137 @@ fi
 # 10. Optional remote administration — all off unless explicitly enabled
 # ---------------------------------------------------------------------------
 ogn-remote-admin --config "$BOOT_CONF" --user "$OGN_USER"
+
+# ---------------------------------------------------------------------------
+# 10a. WireGuard
+#
+# The units are written and the service enabled whatever the card currently
+# says, and ogn-wireguard does nothing at all while Network.WireGuard.Enable
+# is false. That is deliberate: WireGuard lives in the Network section, which
+# is re-read from the card at every boot and never re-runs this installer, so
+# turning the tunnel on later has to work with nothing but an edit on a
+# laptop. The timer, which is the only part with a running cost, is switched
+# on and off by ogn-wireguard itself to match.
+#
+# After network-online, unlike the wifi: wg-quick has to resolve the server's
+# name before it can configure the peer.
+# ---------------------------------------------------------------------------
+write_unit ogn-wireguard.service <<'EOF'
+[Unit]
+Description=OGN receiver WireGuard tunnel
+Documentation=https://github.com/glidernet/ogn-bootstrap
+After=network-online.target nss-lookup.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ogn-wireguard --apply
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Not RemainAfterExit: the timer re-runs this same service, and a service that
+# stays "active" after a successful run cannot be started again.
+write_unit ogn-wireguard.timer <<'EOF'
+[Unit]
+Description=Keep the OGN WireGuard tunnel up
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=10min
+
+[Install]
+WantedBy=timers.target
+EOF
+systemctl enable ogn-wireguard.service >/dev/null
+
+# ---------------------------------------------------------------------------
+# 10b. ADS-B
+#
+# Written and enabled whatever the card says, for the same reason as the
+# WireGuard units above: ADSB lives outside the Install section, so it is
+# re-read at every boot and never re-runs this installer. ogn-adsb does
+# nothing while ADSB.Enable is false, and switches its own timer on and off
+# to match.
+#
+# Deliberately NOT PartOf=rtlsdr-ogn.service. ogn-calibrate stops that group
+# to take the OGN stick for a GSM scan, and ADS-B is on the other stick and
+# has no business going down with it.
+# ---------------------------------------------------------------------------
+write_unit ogn-adsb.service <<'EOF'
+[Unit]
+Description=OGN receiver ADS-B
+Documentation=https://github.com/glidernet/ogn-bootstrap
+After=network-online.target nss-lookup.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ogn-adsb --apply
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Not RemainAfterExit, as above: the timer re-runs this same service.
+write_unit ogn-adsb.timer <<'EOF'
+[Unit]
+Description=Keep ADS-B reception and its feeds up
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=10min
+
+[Install]
+WantedBy=timers.target
+EOF
+
+# One instance per tracking site that multilateration is switched on for.
+# The environment comes from /run, which is where it belongs: it is a
+# rendering of the card, and the root filesystem is RAM under the overlay.
+# Debian's mlat-client-adsbfi names its program after the package, not
+# mlat-client. Its own LSB service stays idle: START_CLIENT defaults to no.
+write_unit ogn-mlat@.service <<'EOF'
+[Unit]
+Description=OGN receiver ADS-B multilateration: %i
+Documentation=https://github.com/glidernet/ogn-bootstrap
+After=readsb.service network-online.target
+Wants=network-online.target
+BindsTo=readsb.service
+
+[Service]
+Type=simple
+EnvironmentFile=/run/ogn-bootstrap/mlat/%i.env
+ExecStart=/usr/bin/mlat-client-adsbfi --input-type beast --input-connect ${MLAT_INPUT} \
+    --server ${MLAT_SERVER} --user ${MLAT_CALL} \
+    --lat ${MLAT_LAT} --lon ${MLAT_LON} --alt ${MLAT_ALT} \
+    --results ${MLAT_RESULTS}
+Restart=always
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+EOF
+
+# readsb's statistics page. Static, like ogn-mlat@: adsb_apply starts it, and
+# BindsTo takes it down whenever readsb goes. A dynamic user that can read
+# /run/readsb and nothing it could write to, on a port above 1024.
+write_unit ogn-adsb-web.service <<EOF
+[Unit]
+Description=OGN receiver ADS-B statistics page
+Documentation=https://github.com/glidernet/ogn-bootstrap
+After=readsb.service
+BindsTo=readsb.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -I $LIBDIR/adsb-stats.py --port $ADSB_WEB_PORT --dir $ADSB_JSON_DIR
+DynamicUser=yes
+NoNewPrivileges=yes
+Restart=always
+RestartSec=15
+EOF
+systemctl enable ogn-adsb.service >/dev/null
 
 # ---------------------------------------------------------------------------
 # 11. Unattended security updates, and the maintenance timer
@@ -997,10 +2316,26 @@ systemctl enable ogn-boot-check.service >/dev/null
 
 systemctl daemon-reload
 
+# Now that the units exist, put the tunnel up (or take it down) to match the
+# card. Never fatal: a receiver that cannot reach a VPN server is still a
+# receiver, and the journal says why.
+ogn-wireguard --config "$BOOT_CONF" --apply || warn "the WireGuard tunnel is not up; see journalctl -u ogn-wireguard"
+
+# Same again for ADS-B. Never fatal: a receiver that cannot decode ADS-B is
+# still doing the job it was put on the airfield to do.
+ogn-adsb --config "$BOOT_CONF" --apply || warn "ADS-B is not running; see journalctl -u ogn-adsb"
+
 # ---------------------------------------------------------------------------
 # 12. Start it, or explain why not
 # ---------------------------------------------------------------------------
 VERSION=$(basename "$REAL_DIR")
+
+# The decoder's page is always HTTP.Port + 1 and not separately configurable.
+PORT=$(conf_get HTTP.Port 8080)
+case "$PORT" in
+    ''|*[!0-9]*) warn "HTTP.Port '$PORT' is not a number; assuming 8080"; PORT=8080 ;;
+esac
+
 if [ "$POSITION_OK" -eq 1 ]; then
     systemctl enable rtlsdr-ogn.service >/dev/null
     systemctl restart rtlsdr-ogn.service
@@ -1008,7 +2343,8 @@ if [ "$POSITION_OK" -eq 1 ]; then
     motd_set <<EOF
 
   OGN receiver $CALL — $VERSION
-  Status page:  http://$(hostname -s).local:$(conf_get HTTP.Port 8080)/
+  RF page:      http://$(hostname -s).local:$PORT/
+  Decoder page: http://$(hostname -s).local:$((PORT + 1))/
   Service:      systemctl status rtlsdr-ogn
   Logs:         journalctl -u ogn-decode -f
   Settings:     $TARGET_CONF
@@ -1036,29 +2372,95 @@ EOF
 fi
 
 # ---------------------------------------------------------------------------
-# 13. Read-only root, last of all
+# 13. The boot partition, and read-only root, last of all
 # ---------------------------------------------------------------------------
-if [ "$READONLY_FS" -eq 1 ]; then
-    # The boot partition is FAT, and FAT is what corrupts on an unclean power
-    # cycle. raspi-config refuses to change this once the overlay is active,
-    # so it has to happen first.
-    if ! grep -qE '^[^#]*/boot/firmware.*\bro\b' /etc/fstab; then
-        log "mounting the boot partition read-only"
-        raspi-config nonint do_bootro 0 || warn "could not set the boot partition read-only"
+# Two mount options on /boot/firmware, for two different reasons:
+#
+#   ro            FAT is what corrupts on an unclean power cycle, so the
+#                 partition is opened only for the moment it takes to write.
+#                 Tied to ReadOnlyFS, since it is the same argument.
+#   umask=0077    everything on that partition is readable by every account on
+#                 the Pi otherwise -- including the wifi password Imager wrote
+#                 there, a WireGuard private key, and a Connect auth key.
+#                 Nothing but root has any business reading it, so this is set
+#                 whatever else was asked for.
+#
+# The umask takes effect at the NEXT boot and not before: vfat re-reads only
+# the ro flag on a remount, so the live mount keeps the permissions it was
+# mounted with. The ro option is the same, which is why boot_rw/boot_ro drive
+# the live mount directly rather than relying on this.
+#
+# Must run before the overlay goes on: /etc/fstab is on the root filesystem,
+# so an edit made with the overlay active is discarded.
+#
+# boot_partition_options <option...> — ensure each is on the /boot/firmware
+# line in /etc/fstab. An option already present, with any value, is left alone:
+# it was somebody's deliberate choice and this is not the place to overrule it.
+boot_partition_options() {
+    local tmp rc=0
+    if ! grep -qE '^[^#][^[:space:]]*[[:space:]]+/boot/firmware[[:space:]]' /etc/fstab; then
+        warn "no /boot/firmware line in /etc/fstab; leaving the boot partition alone"
+        return 0
     fi
+    tmp=$(mktemp)
+    LC_ALL=C awk -v want="$*" '
+        $1 !~ /^#/ && $2 == "/boot/firmware" {
+            n = split(want, opt, " ")
+            for (i = 1; i <= n; i++) {
+                name = opt[i]; sub(/=.*/, "", name)
+                if ($4 !~ "(^|,)" name "(=|,|$)") { $4 = $4 "," opt[i]; changed = 1 }
+            }
+        }
+        { print }
+        END { exit(changed ? 0 : 1) }
+    ' /etc/fstab > "$tmp" || rc=$?
+    if [ "$rc" -eq 0 ]; then
+        install -m 0644 "$tmp" /etc/fstab
+        log "boot partition options in /etc/fstab: $* (from the next boot)"
+    fi
+    rm -f "$tmp"
+    return 0
+}
 
+BOOT_OPTS=(umask=0077)
+[ "$READONLY_FS" -eq 1 ] && BOOT_OPTS+=(ro)
+boot_partition_options "${BOOT_OPTS[@]}"
+grep -qE '^[^#][^[:space:]]*[[:space:]]+/boot/firmware[[:space:]].*umask=0077' /etc/fstab \
+    || warn "/etc/fstab sets its own umask on /boot/firmware, so the wifi password and any
+     WireGuard key on the card stay readable by every account on this Pi"
+
+ARM_OVERLAY=0
+if [ "$READONLY_FS" -eq 1 ]; then
     if ogn-maintenance --overlay-status | grep -q '^enabled'; then
         log "read-only overlay already enabled"
+    elif [ "$REBOOT_WHEN_DONE" -eq 1 ]; then
+        # Armed by the first reboot itself, once nothing still needs the root
+        # writable -- so a power cut while it waits comes back writable, and
+        # still waiting, rather than read-only with the waiting forgotten.
+        # Checked now all the same, so a missing piece fails the install,
+        # and is retried, rather than surfacing as a writable receiver later.
+        overlay_ensure_initramfs && overlay_preflight \
+            || die "the read-only overlay could not be prepared"
+        log "the read-only overlay is enabled at the reboot"
+        ARM_OVERLAY=1
     else
         log "enabling the read-only overlay (takes effect at the next reboot)"
         ogn-maintenance --overlay-enable
-        if [ "$REBOOT_WHEN_DONE" -eq 0 ]; then
-            warn "the read-only overlay is armed but will not be active until you reboot"
-        fi
+        warn "the read-only overlay is armed but will not be active until you reboot"
     fi
 fi
 
-date -Is | boot_write "$STATE_DIR/installed"
+# After step 13, so both reflect the overlay decision. Refreshed at every boot
+# thereafter by ogn-config-sync.
+overlay_motd_update
+overlay_state_publish
+
+date -Is | boot_write "$INSTALLED_MARKER"
+
+if [ "$FIRST_INSTALL" -eq 1 ]; then
+    systemctl disable ogn-install-retry.timer >/dev/null 2>&1 || true
+    systemctl stop --no-block ogn-install-retry.timer >/dev/null 2>&1 || true
+fi
 
 # What the card said when we last acted on it: ogn-config-sync watches the
 # first, ogn-boot-check the second. Written last, so a failed install does not
@@ -1069,8 +2471,57 @@ conf_digest Install | boot_write "$INSTALL_APPLIED"
 log "setup complete"
 
 if [ "$REBOOT_WHEN_DONE" -eq 1 ]; then
-    log "rebooting"
-    systemctl reboot
+    # On first boot this runs as cloud-init's scripts_vendor, and Imager's own
+    # settings -- Raspberry Pi Connect, passwordless sudo, SSH -- are runcmd,
+    # which runs in scripts_user, after it. Rebooting from here cut them off,
+    # so they ran instead on the next boot, under the overlay: in RAM, and
+    # again at every boot after, re-presenting a single-use Connect key that
+    # had already been spent.
+    #
+    # So the reboot is handed to a timer, which waits for cloud-init to finish
+    # and for Connect to sign in -- for as long as the network takes, up to
+    # the key's six-hour life -- and only then arms the overlay and reboots.
+    # A unit on disk rather than a transient one, so that it survives a power
+    # cut while it waits.
+    install -d -m 0755 "$FIRST_REBOOT_DIR"
+    if [ "$ARM_OVERLAY" -eq 1 ]; then
+        printf 'overlay\n' > "$FIRST_REBOOT_PENDING"
+    else
+        printf 'reboot\n' > "$FIRST_REBOOT_PENDING"
+    fi
+    write_unit ogn-first-reboot.service <<EOF
+[Unit]
+Description=OGN receiver: the reboot that finishes setup
+Documentation=https://github.com/glidernet/ogn-bootstrap
+After=cloud-final.service
+ConditionPathExists=$FIRST_REBOOT_PENDING
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ogn-maintenance --first-reboot
+EOF
+    write_unit ogn-first-reboot.timer <<EOF
+[Unit]
+Description=OGN receiver: reboot to finish setup, once nothing needs a writable root
+Documentation=https://github.com/glidernet/ogn-bootstrap
+ConditionPathExists=$FIRST_REBOOT_PENDING
+
+[Timer]
+OnBootSec=1min
+OnUnitInactiveSec=1min
+
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl enable ogn-first-reboot.timer >/dev/null 2>&1 || true
+    if cloud_init_running; then
+        log "rebooting once cloud-init has finished and Raspberry Pi Connect, if set up, has signed in"
+    else
+        # Run by hand: usually nothing to wait for, so this reboots now.
+        ogn-maintenance --first-reboot
+    fi
+    systemctl start --no-block ogn-first-reboot.timer >/dev/null 2>&1 || true
 fi
 OGN_PAYLOAD_ogn_install
 chmod 0755 /usr/local/sbin/ogn-install
@@ -1127,6 +2578,11 @@ if [ -z "$CHANNEL" ]; then
         CHANNEL=$(conf_get Install.UpdateChannel stable)
     else
         CHANNEL=stable
+        # The boot partition is mounted root-only, so this is the ordinary case
+        # for a --check run by hand. Say which channel is being assumed rather
+        # than reporting against one the card may not have asked for.
+        [ "$(id -u)" -eq 0 ] \
+            || warn "cannot read $BOOT_CONF as this user; reporting against the '$CHANNEL' channel"
     fi
 fi
 
@@ -1273,42 +2729,18 @@ state_clear() {
 }
 
 # --- overlay -------------------------------------------------------------
-# On Trixie raspi-config drives Debian's overlayroot with a plain
-# overlayroot=tmpfs kernel parameter. That is a real improvement on the old
-# scheme, which baked a uname-specific initrd name into config.txt and so
-# broke silently across kernel upgrades.
-overlay_active()    { grep -q 'overlayroot=tmpfs' /proc/cmdline; }
-overlay_next_boot() { grep -q 'overlayroot=tmpfs' "$BOOT_DIR/cmdline.txt" 2>/dev/null; }
-
-overlay_status() {
-    local now next
-    overlay_active    && now=active   || now=inactive
-    overlay_next_boot && next=enabled || next=disabled
-    printf '%s now=%s next_boot=%s\n' "$next" "$now" "$next"
-}
-
+# The mechanism lives in ogn-common.sh, shared with the `overlay` command, so
+# the two cannot disagree about what "enabled" means.
 overlay_set() {
-    # raspi-config's convention is inverted: 0 enables, 1 disables.
     local want="$1"
-    command -v raspi-config >/dev/null || die "raspi-config is not installed; cannot manage the overlay"
     if [ "$want" = enable ]; then
-        raspi-config nonint do_overlayfs 0
+        overlay_ensure_initramfs || { warn "could not arrange for an initramfs"; return 1; }
+        overlay_preflight        || { warn "not enabling an overlay that would not engage"; return 1; }
+        swap_disable
+        cmdline_write "$OVERLAY_PARAM" 1
     else
-        raspi-config nonint do_overlayfs 1
+        cmdline_write "$OVERLAY_PARAM" 0
     fi
-}
-
-# Swap on a tmpfs overlay is pathological: the backing file lives in the RAM
-# upper layer, so the system pins memory to hold a "disk" that is itself
-# memory, and the overlay slowly fills. Disable the units that recreate it
-# rather than just swapoff, or it returns at the next boot.
-swap_disable() {
-    local u
-    swapoff -a 2>/dev/null || true
-    for u in rpi-setup-loop@var-swap.service rpi-resize-swap-file.service dphys-swapfile.service; do
-        systemctl disable --now "$u" >/dev/null 2>&1 || true
-    done
-    rm -f /var/swap 2>/dev/null || true
 }
 
 # --- the actual updating -------------------------------------------------
@@ -1362,6 +2794,13 @@ EOF
 config_sync() {
     local user group home link real target call lat lon old_freq
 
+    # Before anything that can bail out: this runs at every boot, including the
+    # middle boot of a maintenance cycle where the receiver is writable. The
+    # published state is what `overlay status` reads without sudo, now that the
+    # boot partition it would otherwise read is root-only.
+    overlay_motd_update
+    overlay_state_publish
+
     [ -r "$BOOT_CONF" ] || { log "no $BOOT_CONF on the card; nothing to sync"; return 0; }
     trap conf_cleanup EXIT
     conf_load "$BOOT_CONF"
@@ -1370,6 +2809,30 @@ config_sync() {
     # keyfiles are in RAM, so "unchanged" does not mean "still applied".
     # wifi_apply is itself a no-op when the live config already matches.
     wifi_apply
+
+    # WireGuard and ADS-B belong to their own services, which wait for the
+    # network -- exactly what this must not do, since it runs before
+    # network-online.target and anything here that waits on a unit ordered
+    # after it waits forever. What is left for here is an edit applied by hand
+    # to a receiver that is already up: `ogn-maintenance --config-sync`.
+    #
+    # Asked of systemd rather than inferred from what is running: readsb left
+    # enabled by an earlier version is already up at boot, and taking that to
+    # mean "run by hand" is how a boot hung here.
+    local booting=0
+    case "$(systemctl is-system-running 2>/dev/null)" in
+        initializing|starting) booting=1 ;;
+    esac
+
+    if [ "$booting" -eq 0 ] && wg_up; then
+        ogn-wireguard --config "$BOOT_CONF" --apply \
+            || warn "could not re-apply Network.WireGuard; see journalctl -u ogn-wireguard"
+    fi
+
+    if [ "$booting" -eq 0 ] && systemctl is-active --quiet readsb 2>/dev/null; then
+        ogn-adsb --config "$BOOT_CONF" --apply \
+            || warn "could not re-apply ADSB; see journalctl -u ogn-adsb"
+    fi
 
     # Before the digest, and before the receiver starts: nothing else has the
     # SDR yet. Disarms itself, so this is a no-op on all but the asked-for boot.
@@ -1423,9 +2886,13 @@ config_sync() {
     if [ -z "$(conf_get APRS.Call "")" ]; then
         sed -i "s|^\( *Call *= *\)\"\"|\1\"$call\"|" "$target"
     fi
-    if ! conf_has RF.FreqCorr && [ -n "$old_freq" ]; then
+    # Checked against the file itself, not the parsed settings: a second
+    # FreqCorr is a duplicate setting, which libconfig refuses outright and
+    # takes the receiver off the air.
+    if [ -n "$old_freq" ] && ! grep -q '^ *FreqCorr *=' "$target"; then
         sed -i "s|^\( *SampleRate *=\)|  FreqCorr = $old_freq;   # measured by ogn-calibrate\n\1|" "$target"
     fi
+    conf_redact_secrets "$target"
 
     printf '%s\n' "$want_all" | boot_write "$CONFIG_APPLIED"
 
@@ -1454,7 +2921,8 @@ begin_cycle() {
     attempts=$(( $(state_count) + 1 ))
     log "disabling the read-only overlay and rebooting to apply updates"
     state_write updating "$attempts"
-    overlay_set disable
+    # Warn rather than abort: resume_cycle re-checks after the reboot.
+    overlay_set disable || warn "could not disable the overlay; the cycle will abort after the reboot"
     systemctl reboot
 }
 
@@ -1464,7 +2932,7 @@ resume_cycle() {
     if [ "$attempts" -gt "$MAX_ATTEMPTS" ]; then
         warn "maintenance has failed $attempts times; giving up and restoring the overlay"
         state_write restoring "$attempts"
-        overlay_set enable
+        overlay_set enable || warn "the overlay could not be re-enabled; this receiver will come up WRITABLE"
         state_clear
         systemctl reboot
         return 0
@@ -1480,7 +2948,7 @@ resume_cycle() {
     do_updates
     log "re-enabling the read-only overlay and rebooting"
     state_write restoring "$attempts"
-    overlay_set enable
+    overlay_set enable || warn "the overlay could not be re-enabled; this receiver will come up WRITABLE"
     state_clear
     systemctl reboot
 }
@@ -1518,6 +2986,51 @@ install_check() {
     fi
 }
 
+# --- the first reboot ----------------------------------------------------
+# Run by ogn-first-reboot.timer, and once directly by the installer. Returns
+# without doing anything until the root no longer needs to be writable; then
+# arms the overlay if the installer asked for it, and reboots. See
+# FIRST_REBOOT_PENDING in ogn-common.sh.
+first_reboot() {
+    local since now until
+    [ -e "$FIRST_REBOOT_PENDING" ] || return 0
+
+    if cloud_init_running; then
+        log "first reboot: waiting for cloud-init to finish"
+        return 0
+    fi
+
+    if connect_signin_pending; then
+        now=$(date +%s)
+        [ -s "$FIRST_REBOOT_PENDING.since" ] || printf '%s\n' "$now" > "$FIRST_REBOOT_PENDING.since"
+        since=$(cat "$FIRST_REBOOT_PENDING.since")
+        if [ $((now - since)) -lt "$FIRST_REBOOT_LIMIT" ]; then
+            until=$(date -d "@$((since + FIRST_REBOOT_LIMIT))" '+%H:%M' 2>/dev/null || printf 'later')
+            log "first reboot: waiting for Raspberry Pi Connect to sign in (gives up at $until)"
+            mkdir -p "$(dirname "$FIRST_REBOOT_MOTD")"
+            cat > "$FIRST_REBOOT_MOTD" <<EOF
+
+  Setup is finished, but the read-only root is not on yet: waiting for
+  Raspberry Pi Connect to sign in, which needs the network. It reboots into
+  read-only mode by itself once Connect is signed in, or at $until regardless.
+
+EOF
+            return 0
+        fi
+        warn "Raspberry Pi Connect did not sign in within $((FIRST_REBOOT_LIMIT / 3600)) hours; its auth key has expired"
+        warn "sign in by hand with the overlay off: see 'Connect and the read-only root' in the README"
+    fi
+
+    if [ "$(cat "$FIRST_REBOOT_PENDING")" = overlay ]; then
+        log "enabling the read-only overlay"
+        overlay_set enable || warn "the overlay could not be enabled; this receiver will come up WRITABLE"
+    fi
+    rm -f "$FIRST_REBOOT_PENDING" "$FIRST_REBOOT_PENDING.since" "$FIRST_REBOOT_MOTD"
+    systemctl disable ogn-first-reboot.timer >/dev/null 2>&1 || true
+    log "rebooting"
+    systemctl reboot
+}
+
 boot_check() {
     case "$(state_read)" in
         updating)
@@ -1530,7 +3043,7 @@ boot_check() {
                 state_clear
             else
                 warn "the overlay was not re-enabled after maintenance; re-enabling now"
-                overlay_set enable
+                overlay_set enable || warn "the overlay could not be re-enabled; this receiver will come up WRITABLE"
                 state_clear
                 systemctl reboot
             fi
@@ -1555,6 +3068,7 @@ while [ $# -gt 0 ]; do
         --overlay-status) MODE=overlay-status ;;
         --overlay-enable) MODE=overlay-enable ;;
         --overlay-disable) MODE=overlay-disable ;;
+        --first-reboot)   MODE=first-reboot ;;
         -h|--help)        sed -n '3,21p' "$0"; exit 0 ;;
         *)                die "unknown option: $1" ;;
     esac
@@ -1564,7 +3078,15 @@ done
 case "$MODE" in
     overlay-status) overlay_status; exit 0 ;;
     status)
-        printf 'state:   %s (since %s)\n' "$(state_read)" "$([ -r "$STATE_FILE" ] && cut -d' ' -f3 "$STATE_FILE" || printf 'n/a')"
+        # The markers are on the boot partition, which is mounted root-only.
+        # Saying "idle" to someone who simply cannot see them would be a wrong
+        # answer dressed as a reassuring one.
+        if [ "$(id -u)" -eq 0 ] || [ -r "$STATE_DIR" ]; then
+            printf 'state:   %s (since %s)\n' "$(state_read)" "$([ -r "$STATE_FILE" ] && cut -d' ' -f3 "$STATE_FILE" || printf 'n/a')"
+        else
+            printf 'state:   unknown — the boot partition is readable only by root\n'
+            printf '         For a definite answer:  sudo ogn-maintenance --status\n'
+        fi
         printf 'overlay: %s\n' "$(overlay_status)"
         if [ "$(id -u)" -eq 0 ] || [ -r "$MANIFEST_CACHE" ]; then
             ogn-update --check || true
@@ -1575,8 +3097,10 @@ esac
 need_root
 
 case "$MODE" in
-    overlay-enable)  swap_disable; overlay_set enable ;;
+    # For the installer; `overlay on` is the front end for people.
+    overlay-enable)  overlay_set enable ;;
     overlay-disable) overlay_set disable ;;
+    first-reboot)    first_reboot ;;
     boot-check)      boot_check ;;
     config-sync)     config_sync ;;
     scheduled|now)   begin_cycle ;;
@@ -1695,6 +3219,10 @@ if conf_bool Install.RemoteAdmin.Connect; then
   Run this as $USER_NAME and follow the link it prints:
 
       rpi-connect signin
+
+  With the read-only root on, a sign-in is forgotten at the next reboot.
+  Make it stick with:  sudo overlay off --reboot, sign in, then
+                       sudo overlay on --reboot
 
 EOF
     else
@@ -1897,15 +3425,27 @@ if awk "BEGIN{exit !($(conf_get RF.OGN.CenterFreq 868.8) > 900)}" 2>/dev/null; t
     BAND_OPT="--gsm-850"
 fi
 
+# gsm_scan defaults to device 0, which on a two-dongle receiver may be the
+# ADS-B stick — and the result is written back as though it were right. Follow
+# the same selection ogn-rf uses: DeviceSerial wins where set.
+DEV_SERIAL=$(conf_get RF.DeviceSerial "")
+if [ -n "$DEV_SERIAL" ]; then
+    DEV_OPT="--serial $DEV_SERIAL"
+    DEV_DESC="serial $DEV_SERIAL"
+else
+    DEV_OPT="--device $(conf_get RF.Device 0)"
+    DEV_DESC="device $(conf_get RF.Device 0)"
+fi
+
 # --ppm 0 deliberately, not a previous measurement: a stale estimate pulls the
 # scan off, and 0 is what a low-drift stick actually is.
 SCAN_GAIN=$(conf_get RF.GSM.Gain 25.0)
 
-[ "$QUIET" -eq 1 ] || log "scanning for GSM carriers (up to ${SCAN_TIMEOUT}s) — this needs the aerial connected"
+[ "$QUIET" -eq 1 ] || log "scanning for GSM carriers on $DEV_DESC (up to ${SCAN_TIMEOUT}s) — this needs the aerial connected"
 
 # shellcheck disable=SC2086
 OUT=$(cd "$INSTALL_DIR" && timeout "$SCAN_TIMEOUT" \
-      ./gsm_scan --ppm 0 --gain "$SCAN_GAIN" $BAND_OPT 2>&1) || true
+      ./gsm_scan --ppm 0 --gain "$SCAN_GAIN" $DEV_OPT $BAND_OPT 2>&1) || true
 
 # Too little or too much gain is gsm_scan's usual first answer. One pass cannot
 # fix that, so name the knob that can.
@@ -1984,6 +3524,398 @@ if [ "$FROM_CONFIG" -eq 1 ]; then
 fi
 OGN_PAYLOAD_ogn_calibrate
 chmod 0755 /usr/local/sbin/ogn-calibrate
+
+cat > /usr/local/sbin/ogn-overlay <<'OGN_PAYLOAD_ogn_overlay'
+#!/bin/bash
+#
+# ogn-overlay — turn the read-only root filesystem on and off by hand.
+#
+#   overlay status           what is on now, and after a reboot
+#   overlay off              come up writable at the next boot
+#   overlay on               go back to protected at the next boot
+#   overlay off --reboot     ... and reboot now
+#   overlay on  --reboot
+#
+# Also installed as `overlay`. For maintenance the weekly window does not
+# cover: with the overlay on, changes are discarded at the next boot.
+#
+#   sudo overlay off --reboot     # comes back writable
+#   ... do the work ...
+#   sudo overlay on --reboot      # back to protected
+#
+# Switching always takes effect at the next boot: the overlay is established by
+# the initramfs, before the root filesystem is mounted.
+#
+# Copyright (c) 2026 ifly7charlie. MIT licence, see LICENSE.
+
+set -euo pipefail
+
+LIBDIR="${OGN_LIBDIR:-/usr/local/lib/ogn-bootstrap}"
+# shellcheck source=src/ogn-common.sh
+. "$LIBDIR/ogn-common.sh"
+
+REBOOT=0
+ACTION=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        on|enable)    ACTION=on ;;
+        off|disable)  ACTION=off ;;
+        status)       ACTION=status ;;
+        --reboot)     REBOOT=1 ;;
+        -h|--help)    sed -n '3,19p' "$0"; exit 0 ;;
+        *)            die "unknown argument: $1  (try: overlay status)" ;;
+    esac
+    shift
+done
+
+# --------------------------------------------------------------------------
+# status — readable by anyone, so a check does not need sudo
+# --------------------------------------------------------------------------
+if [ "$ACTION" = status ] || [ -z "$ACTION" ]; then
+    if overlay_active; then
+        printf 'now:        ACTIVE — the root filesystem is read-only.\n'
+        printf '            Changes you make are discarded at the next reboot.\n'
+    else
+        printf 'now:        inactive — the root filesystem is writable.\n'
+        printf '            Changes you make persist, and are written to the SD card.\n'
+    fi
+    # cmdline.txt holds the answer and the boot partition is root-only, so for
+    # anyone else it comes from the copy published at boot. If that is missing
+    # too, say so: "inactive" would be a guess, and the wrong one is the one
+    # that reads as reassuring.
+    if ! overlay_next_boot_known; then
+        printf 'next boot:  unknown — cannot read %s,\n' "$CMDLINE_FILE"
+        printf '            and no published copy at %s\n' "$OVERLAY_STATE"
+        printf '\nFor a definite answer:  sudo overlay status\n'
+        exit 0
+    fi
+    if overlay_next_boot; then
+        printf 'next boot:  ACTIVE\n'
+    else
+        printf 'next boot:  inactive\n'
+    fi
+    if overlay_active && ! overlay_next_boot; then
+        printf '\nA reboot will leave this receiver WRITABLE and unprotected.\n'
+        printf 'Run "sudo overlay on" to undo that.\n'
+    elif ! overlay_active && overlay_next_boot; then
+        printf '\nA reboot will make it read-only.\n'
+    fi
+    [ -z "$ACTION" ] && printf '\nTo change it:  sudo overlay off   |   sudo overlay on\n'
+    exit 0
+fi
+
+need_root
+
+# --------------------------------------------------------------------------
+# off — writable at the next boot
+# --------------------------------------------------------------------------
+if [ "$ACTION" = off ]; then
+    if ! overlay_next_boot; then
+        log "the overlay is already disabled for the next boot"
+    else
+        cmdline_write "$OVERLAY_PARAM" 0 || die "could not update $CMDLINE_FILE"
+        log "overlay disabled — the next boot will come up writable"
+    fi
+
+    overlay_motd_update
+
+    if overlay_active; then
+        warn "still read-only until you reboot"
+    fi
+    if [ "$REBOOT" -eq 1 ]; then
+        log "rebooting"
+        systemctl reboot
+    else
+        log "reboot when ready:  sudo reboot"
+    fi
+    exit 0
+fi
+
+# --------------------------------------------------------------------------
+# on — protected at the next boot
+# --------------------------------------------------------------------------
+overlay_ensure_initramfs || die "could not arrange for an initramfs to be loaded"
+
+if ! overlay_preflight; then
+    die "the overlay cannot be enabled safely yet — see the warnings above.
+     Fix those first: an overlayroot=tmpfs with nothing to act on boots
+     normally and keeps writing to the card, with nothing to tell you so."
+fi
+
+swap_disable
+
+if overlay_next_boot; then
+    log "the overlay is already enabled for the next boot"
+else
+    cmdline_write "$OVERLAY_PARAM" 1 || die "could not update $CMDLINE_FILE"
+    log "overlay enabled — the next boot will come up read-only"
+fi
+
+overlay_motd_update
+
+if ! overlay_active; then
+    warn "still writable until you reboot"
+fi
+if [ "$REBOOT" -eq 1 ]; then
+    log "rebooting"
+    systemctl reboot
+else
+    log "reboot when ready:  sudo reboot"
+fi
+OGN_PAYLOAD_ogn_overlay
+chmod 0755 /usr/local/sbin/ogn-overlay
+
+cat > /usr/local/sbin/ogn-wireguard <<'OGN_PAYLOAD_ogn_wireguard'
+#!/bin/bash
+#
+# ogn-wireguard — bring the Network.WireGuard tunnel up, down, or into step
+# with whatever the card now says.
+#
+#   sudo ogn-wireguard            apply Network.WireGuard from the card
+#   sudo ogn-wireguard status     is it up, and is it talking to the server
+#   sudo ogn-wireguard down       take it down until the next boot
+#   sudo ogn-wireguard --config X use a different config file
+#
+# Run at every boot by ogn-wireguard.service, once the network is up, and
+# every 10 minutes after that by ogn-wireguard.timer — which is what puts the
+# tunnel back when the server moves to a new address, the case a tunnel for
+# remote administration is least able to tell you about.
+#
+# Copyright (c) 2026 ifly7charlie. MIT licence, see LICENSE.
+
+set -euo pipefail
+
+LIBDIR="${OGN_LIBDIR:-/usr/local/lib/ogn-bootstrap}"
+# shellcheck source=src/ogn-common.sh
+. "$LIBDIR/ogn-common.sh"
+
+ACTION=apply
+while [ $# -gt 0 ]; do
+    case "$1" in
+        apply|--apply)   ACTION=apply ;;
+        down|--down)     ACTION=down ;;
+        status|--status) ACTION=status ;;
+        --config)        BOOT_CONF="$2"; shift ;;
+        -h|--help)       sed -n '3,15p' "$0"; exit 0 ;;
+        *)               die "unknown argument: $1  (try: ogn-wireguard status)" ;;
+    esac
+    shift
+done
+
+need_root
+
+# --------------------------------------------------------------------------
+# status
+# --------------------------------------------------------------------------
+if [ "$ACTION" = status ]; then
+    conf_load "$BOOT_CONF"
+    trap conf_cleanup EXIT
+    if ! conf_bool Network.WireGuard.Enable false; then
+        printf 'WireGuard is switched off in %s.\n' "$BOOT_CONF"
+        wg_up && printf 'The %s interface is still up; it goes at the next boot.\n' "$WG_IFACE"
+        exit 0
+    fi
+    printf 'configured:  %s on %s, through %s\n' \
+        "$(conf_get Network.WireGuard.Address '<unset>')" "$WG_IFACE" \
+        "$(conf_get Network.WireGuard.Peer.Endpoint '<unset>')"
+    if ! wg_up; then
+        printf 'interface:   DOWN\n\n'
+        printf 'Bring it up with:  sudo ogn-wireguard\n'
+        printf 'Why it is down:    journalctl -u ogn-wireguard\n'
+        exit 1
+    fi
+    printf 'interface:   up\n\n'
+    wg show "$WG_IFACE"
+    # A tunnel with no handshake looks exactly like a working one from here,
+    # so spell out the difference rather than leaving it to be read off.
+    HS=$(wg show "$WG_IFACE" latest-handshakes | awk 'NR == 1 { print $2 }')
+    case "$HS" in
+        ''|0) printf '\nNo handshake yet: the server has not answered. Check its [Peer]\n'
+              printf 'has this receiver'"'"'s public key, and that %s is reachable.\n' \
+                  "$(conf_get Network.WireGuard.Peer.Endpoint '')" ;;
+        *)    printf '\nLast handshake %ss ago.\n' "$(( $(date +%s) - HS ))" ;;
+    esac
+    exit 0
+fi
+
+# --------------------------------------------------------------------------
+# down — by hand, for the length of this boot
+# --------------------------------------------------------------------------
+if [ "$ACTION" = down ]; then
+    conf_load "$BOOT_CONF"
+    trap conf_cleanup EXIT
+    wireguard_down
+    conf_bool Network.WireGuard.Enable false \
+        && log "still enabled on the card, so it comes back at the next boot"
+    exit 0
+fi
+
+# --------------------------------------------------------------------------
+# apply
+# --------------------------------------------------------------------------
+[ -r "$BOOT_CONF" ] || { log "no $BOOT_CONF on the card; nothing to do"; exit 0; }
+conf_load "$BOOT_CONF"
+trap conf_cleanup EXIT
+
+# The timer is the repair loop, and it is worth having only on a receiver that
+# is actually using a tunnel. Enabling it from here rather than from the
+# installer is what lets WireGuard be switched on by editing the card alone,
+# with no re-install and no network.
+if conf_bool Network.WireGuard.Enable false; then
+    systemctl is-enabled --quiet ogn-wireguard.timer 2>/dev/null \
+        || systemctl enable --now ogn-wireguard.timer >/dev/null 2>&1 || true
+else
+    systemctl is-enabled --quiet ogn-wireguard.timer 2>/dev/null \
+        && systemctl disable --now ogn-wireguard.timer >/dev/null 2>&1 || true
+fi
+
+wireguard_apply
+OGN_PAYLOAD_ogn_wireguard
+chmod 0755 /usr/local/sbin/ogn-wireguard
+
+cat > /usr/local/sbin/ogn-adsb <<'OGN_PAYLOAD_ogn_adsb'
+#!/bin/bash
+#
+# ogn-adsb — bring ADS-B reception up, down, or into step with whatever the
+# card now says.
+#
+#   sudo ogn-adsb              apply ADSB from the card
+#   sudo ogn-adsb status       is readsb running, and is it hearing aircraft
+#   sudo ogn-adsb down         switch it off until the next boot
+#   sudo ogn-adsb --config X   use a different config file
+#
+# Run at every boot by ogn-adsb.service, and every 10 minutes after that by
+# ogn-adsb.timer — which is what puts a feed back when a tracking site moves
+# to a new address, or when the ADS-B stick is unplugged and returned.
+#
+# Copyright (c) 2026 ifly7charlie. MIT licence, see LICENSE.
+
+set -euo pipefail
+
+LIBDIR="${OGN_LIBDIR:-/usr/local/lib/ogn-bootstrap}"
+# shellcheck source=src/ogn-common.sh
+. "$LIBDIR/ogn-common.sh"
+
+ACTION=apply
+while [ $# -gt 0 ]; do
+    case "$1" in
+        apply|--apply)   ACTION=apply ;;
+        down|--down)     ACTION=down ;;
+        status|--status) ACTION=status ;;
+        --config)        BOOT_CONF="$2"; shift ;;
+        -h|--help)       sed -n '3,15p' "$0"; exit 0 ;;
+        *)               die "unknown argument: $1  (try: ogn-adsb status)" ;;
+    esac
+    shift
+done
+
+need_root
+
+# --------------------------------------------------------------------------
+# status
+# --------------------------------------------------------------------------
+
+# Is anything actually arriving on the AVR port? A listening socket says only
+# that readsb started, which is also what a receiver with the aerial off the
+# back of the stick looks like. /dev/tcp rather than nc, which this image does
+# not ship.
+adsb_frames_seen() {
+    local n=0 line
+    exec 3<>"/dev/tcp/127.0.0.1/$ADSB_AVR_PORT" 2>/dev/null || return 1
+    while [ "$n" -lt 3 ] && read -r -t 8 line <&3; do
+        [ -n "$line" ] && n=$((n + 1))
+    done
+    exec 3<&- 2>/dev/null || true
+    [ "$n" -gt 0 ]
+}
+
+if [ "$ACTION" = status ]; then
+    conf_load "$BOOT_CONF"
+    trap conf_cleanup EXIT
+    if ! conf_bool ADSB.Enable false; then
+        printf 'ADS-B is switched off in %s.\n' "$BOOT_CONF"
+        systemctl is-active --quiet readsb 2>/dev/null \
+            && printf 'readsb is still running; it goes at the next boot.\n'
+        exit 0
+    fi
+
+    printf 'configured:  stick %s, gain %s\n' \
+        "$(conf_get ADSB.DeviceSerial '<unset>')" "$(conf_get ADSB.Gain -10)"
+    printf 'sharing:     %s\n' "$(adsb_feed_summary)"
+
+    if ! systemctl is-active --quiet readsb 2>/dev/null; then
+        printf 'readsb:      STOPPED\n\n'
+        printf 'Start it with:  sudo ogn-adsb\n'
+        printf 'Why it is not: journalctl -u readsb\n'
+        exit 1
+    fi
+    printf 'readsb:      running\n'
+
+    # The distinction worth drawing: running, versus running and hearing
+    # something. Nothing else on this page separates the two.
+    if adsb_frames_seen; then
+        printf 'aircraft:    frames arriving on %s\n' "$ADSB_AVR_PORT"
+    else
+        printf 'aircraft:    NOTHING on %s in 8s\n\n' "$ADSB_AVR_PORT"
+        printf 'readsb is up but decoding nothing. Check the aerial is on the\n'
+        printf '1090 stick, that it is a 1090 aerial, and that ADSB.DeviceSerial\n'
+        printf '(%s) is the right stick:  rtl_test\n' "$(conf_get ADSB.DeviceSerial '<unset>')"
+        exit 1
+    fi
+
+    if conf_bool ADSB.Feed.MLAT false; then
+        printf '\n'
+        for f in $(adsb_enabled_feeds); do
+            inst=$(adsb_feed_instance "$f")
+            if systemctl is-active --quiet "ogn-mlat@$inst.service" 2>/dev/null; then
+                printf 'mlat:        %-14s running\n' "$f"
+            else
+                printf 'mlat:        %-14s STOPPED  (journalctl -u ogn-mlat@%s)\n' "$f" "$inst"
+            fi
+        done
+    fi
+    exit 0
+fi
+
+# --------------------------------------------------------------------------
+# down — by hand, for the length of this boot
+# --------------------------------------------------------------------------
+if [ "$ACTION" = down ]; then
+    conf_load "$BOOT_CONF"
+    trap conf_cleanup EXIT
+    adsb_down
+    conf_bool ADSB.Enable false \
+        && log "still enabled on the card, so it comes back at the next boot"
+    exit 0
+fi
+
+# --------------------------------------------------------------------------
+# apply
+# --------------------------------------------------------------------------
+[ -r "$BOOT_CONF" ] || { log "no $BOOT_CONF on the card; nothing to do"; exit 0; }
+conf_load "$BOOT_CONF"
+trap conf_cleanup EXIT
+
+# The timer is the repair loop, and it is worth having only on a receiver that
+# is actually decoding ADS-B. Enabling it from here rather than from the
+# installer is what lets ADS-B be switched on by editing the card alone, with
+# no re-install and no network.
+if conf_bool ADSB.Enable false; then
+    systemctl is-enabled --quiet ogn-adsb.timer 2>/dev/null \
+        || systemctl enable --now ogn-adsb.timer >/dev/null 2>&1 || true
+else
+    systemctl is-enabled --quiet ogn-adsb.timer 2>/dev/null \
+        && systemctl disable --now ogn-adsb.timer >/dev/null 2>&1 || true
+fi
+
+adsb_apply
+OGN_PAYLOAD_ogn_adsb
+chmod 0755 /usr/local/sbin/ogn-adsb
+
+# `overlay` is the name the documentation uses, and the one anyone logging in
+# to do a piece of maintenance will actually type. ogn-overlay is the script;
+# this is the name that is memorable at 2am on an airfield.
+ln -sfn ogn-overlay /usr/local/sbin/overlay
 
 # Hand over to the installer. Its output goes to the cloud-init log, which is
 # /var/log/cloud-init-output.log, and to the journal.

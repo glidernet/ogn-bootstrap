@@ -16,6 +16,10 @@ PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); printf '  ok   %s\n' "$1"; }
 bad()  { FAIL=$((FAIL+1)); printf '  FAIL %s\n' "$1"; [ $# -gt 1 ] && printf '       %s\n' "$2"; }
 is()   { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "expected [$3], got [$2]"; fi; }
+# Code with the comments stripped. Several of the names below appear in
+# comments on purpose, explaining what is deliberately no longer used, so a
+# plain grep would match the explanation and report the bug it warns about.
+code_of() { sed 's/[[:space:]]#.*$//; /^[[:space:]]*#/d' "$@"; }
 
 export OGN_LIBDIR="$PWD/src"
 # shellcheck source=src/ogn-common.sh
@@ -48,12 +52,28 @@ is "SampleRate"                    "$(conf_get RF.SampleRate)"                 "
 is "nested CenterFreq"             "$(conf_get RF.OGN.CenterFreq)"             "868.8"
 is "HTTP port"                     "$(conf_get HTTP.Port)"                     "8080"
 is "UpdateChannel"                 "$(conf_get Install.UpdateChannel)"         "stable"
-is "MaintenanceWindow keeps spaces" "$(conf_get Install.MaintenanceWindow)"    "Sun *-*-* 03:00:00"
+is "MaintenanceWindow keeps spaces" "$(conf_get Install.MaintenanceWindow)"    "Mon *-*-* 03:00:00"
+# Monday, not Sunday: a broken update is then found with a week to fix it,
+# rather than on the morning of a weekend's flying.
+grep -qE '^ *MaintenanceWindow *= *"Mon ' boot/MyReceiver.conf \
+    && ok "the window is early Monday" || bad "the window is early Monday"
 is "deeply nested RemoteAdmin"     "$(conf_get Install.RemoteAdmin.Connect)"   "false"
 is "FreqCorr ships as zero"        "$(conf_get RF.FreqCorr)"                   "+0"
-is "GSM channel ships as a default" "$(conf_get RF.GSM.CenterFreq)"            "938.6"
+is "GSM tracking ships switched off" "$(conf_get RF.GSM.CenterFreq)"           "0"
 is "GSM gain is not the OGN gain"  "$(conf_get RF.GSM.Gain)"                   "25.0"
 is "GeoidSepar deliberately absent"   "$(conf_get Position.GeoidSepar '<none>')" "<none>"
+
+# Dongle selection.
+is "Device selects the first stick" "$(conf_get RF.Device)"                     "0"
+is "DeviceSerial ships commented out" "$(conf_get RF.DeviceSerial '<none>')"    "<none>"
+
+# ADS-B is opt-in by absence.
+is "no ADSB section, so ADS-B is off" "$(conf_get ADSB.AVR '<none>')"           "<none>"
+is "and no MaxAlt either"             "$(conf_get ADSB.MaxAlt '<none>')"        "<none>"
+grep -q '^# ADSB:' boot/MyReceiver.conf \
+    && ok "the ADSB section is present but commented" \
+    || bad "the ADSB section is present but commented"
+
 conf_bool Install.ReadOnlyFS            && ok "ReadOnlyFS reads as true"  || bad "ReadOnlyFS reads as true"
 conf_bool Install.RemoteAdmin.OGNTeam   && bad "OGNTeam reads as false"   || ok "OGNTeam reads as false"
 conf_bool Nothing.At.All                && bad "missing key is false"     || ok "missing key is false"
@@ -72,6 +92,13 @@ is "three levels deep"             "$(conf_get Nest.Level2.Level3.Deep)" "42"
 is "sibling after a nested close"  "$(conf_get Nest.Sibling)"        "false"
 is "value after an array"          "$(conf_get Arrays.After)"        "7"
 is "empty string uses the default" "$(conf_get Strings.Empty 'dflt')" "dflt"
+is "no ; before a newline"        "$(conf_get NoSemi.First)"        "1"
+is "no ; before the closing brace" "$(conf_get NoSemi.Last)"         "54"
+is "group after a missing ;"       "$(conf_get AfterNoSemi.Next)"    "x"
+is "comma as terminator"           "$(conf_get AfterNoSemi.Commas)"  "3"
+is "no ; before an inline brace"   "$(conf_get AfterNoSemi.Inline)"  "9"
+conf_has NoSemi.AfterNoSemi.Next   && bad "missing ; does not nest what follows" \
+                                   || ok "missing ; does not nest what follows"
 
 echo "== receiver name validation =="
 check_name() { printf '%s' "$1" | grep -Eq '^[A-Za-z0-9]{1,9}$'; }
@@ -96,17 +123,279 @@ case "$(manifest_field 0.3.2 arm64 sha256)" in
     *)            ok "sha256 is populated" ;;
 esac
 
+echo "== which manifest an image trusts =="
+manifest_url_with() {
+    local stamp; stamp=$(mktemp)
+    printf '%s\n' "$1" > "$stamp"
+    ( unset OGN_MANIFEST_URL; OGN_IMAGE_STAMP="$stamp"; . src/ogn-common.sh; printf '%s' "$MANIFEST_URL" )
+    rm -f "$stamp"
+}
+MASTER_URL=https://raw.githubusercontent.com/glidernet/ogn-bootstrap/master/versions.json
+BRANCH_URL=https://raw.githubusercontent.com/glidernet/ogn-bootstrap/some/branch/versions.json
+is "no stamp: master"                 "$(manifest_url_with 'OGN_IMAGE_VERSION=dev')" "$MASTER_URL"
+is "a test image: its own branch"     "$(manifest_url_with "OGN_MANIFEST_URL=$BRANCH_URL")" "$BRANCH_URL"
+is "anything but raw GitHub: master"  "$(manifest_url_with 'OGN_MANIFEST_URL=http://example.com/versions.json')" "$MASTER_URL"
+is "the environment still wins" \
+   "$(OGN_MANIFEST_URL=https://x.test/v.json OGN_IMAGE_STAMP=/nonexistent bash -c '. src/ogn-common.sh; printf %s "$MANIFEST_URL"')" \
+   "https://x.test/v.json"
+# Only URLs in REACHABLE answer, each with a manifest naming itself.
+fetched_from() {
+    local dir; dir=$(mktemp -d)
+    (
+        MANIFEST_URL="$1"; REACHABLE="$2"; MANIFEST_CACHE="$dir/cache.json"
+        [ -n "${3:-}" ] && printf '{"from": "cache"}' > "$MANIFEST_CACHE"
+        fetch() { case " $REACHABLE " in *" $1 "*) printf '{"from": "%s"}' "$1" > "$2" ;; *) return 22 ;; esac; }
+        manifest_fetch 2>/dev/null || { printf 'FAILED'; exit; }
+        python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["from"], end="")' "$MANIFEST_CACHE"
+    )
+    rm -rf "$dir"
+}
+is "the branch's manifest while the branch exists" "$(fetched_from "$BRANCH_URL" "$BRANCH_URL $MASTER_URL" cached)" "$BRANCH_URL"
+is "master's once it has gone"                     "$(fetched_from "$BRANCH_URL" "$MASTER_URL" cached)" "$MASTER_URL"
+is "the cached copy with no network at all"        "$(fetched_from "$BRANCH_URL" "" cached)" "cache"
+is "and nothing to fall back on is an error"       "$(fetched_from "$BRANCH_URL" "")" "FAILED"
+is "master is not tried twice"                     "$(fetched_from "$MASTER_URL" "" cached)" "cache"
+grep -q 'OGN_MANIFEST_URL=https://raw.githubusercontent.com/$MANIFEST_REPO/$MANIFEST_REF/versions.json' tools/build-image.sh \
+    && ok "the image build records it" || bad "the image build records it"
+grep -q "OGN_MANIFEST_REF: \${{ github.ref_type == 'tag' && 'master' || github.ref_name }}" .github/workflows/build-image.yml \
+    && ok "a release follows master, a branch build its branch" \
+    || bad "a release follows master, a branch build its branch"
+grep -q 'preserve-env=.*OGN_MANIFEST_REF' .github/workflows/build-image.yml \
+    && ok "and sudo passes it through" || bad "and sudo passes it through"
+
 echo "== SD card write protection =="
 for fn in boot_rw boot_ro boot_write; do
     type "$fn" >/dev/null 2>&1 && ok "$fn is defined" || bad "$fn is defined"
 done
 grep -q 'Storage=volatile' src/ogn-install && ok "journal is pinned to RAM" || bad "journal is pinned to RAM"
 grep -q 'RuntimeMaxUse' src/ogn-install && ok "journal size is capped" || bad "journal size is capped"
-grep -q 'do_bootro 0' src/ogn-install && ok "boot partition is set read-only" || bad "boot partition is set read-only"
+grep -q 'boot_partition_options' src/ogn-install && ok "boot partition is set read-only" || bad "boot partition is set read-only"
+# The credentials on the card -- the wifi password Imager wrote, a WireGuard
+# key -- are readable by every account on the Pi without this, and it must not
+# be conditional on ReadOnlyFS the way the ro option is.
+python3 - <<'PY' && ok "and root-only, whatever else was asked for" || bad "and root-only, whatever else was asked for"
+import re
+src = open("src/ogn-install").read()
+m = re.search(r"^BOOT_OPTS=\((.*?)\)$", src, re.M)
+assert m, "no unconditional BOOT_OPTS line"
+assert "umask=0077" in m.group(1), m.group(1)
+# ro is the one that follows ReadOnlyFS.
+assert re.search(r'^\[ "\$READONLY_FS" -eq 1 \] && BOOT_OPTS\+=\(ro\)$', src, re.M)
+PY
+# raspi-config has no do_bootro entry point; enable_bootro is internal.
+code_of src/ogn-install | grep -q 'do_bootro' \
+    && bad "no call to the non-existent raspi-config do_bootro" \
+    || ok "no call to the non-existent raspi-config do_bootro"
 grep -q 'rsyslog' src/ogn-install && ok "rsyslog is disabled if present" || bad "rsyslog is disabled if present"
 grep -q 'boot_write "$STATE_FILE"' src/ogn-maintenance && ok "marker writes go through boot_write" || bad "marker writes go through boot_write"
 grep -q '\[ -e "$STATE_FILE" \] || return 0' src/ogn-maintenance \
     && ok "idle boots do not write to the card" || bad "idle boots do not write to the card"
+
+echo "== read-only overlay =="
+# Detection and the switch must name the same marker, or the overlay never
+# reads as enabled and maintenance writes its updates into RAM.
+is "one marker, defined once" "$OVERLAY_PARAM" "overlayroot=tmpfs"
+code_of src/ogn-* | grep -q 'do_overlayfs' \
+    && bad "raspi-config's overlay mechanism is not used" \
+    || ok "raspi-config's overlay mechanism is not used"
+code_of src/ogn-* | grep -q 'boot=overlay' \
+    && bad "no leftover boot=overlay marker" || ok "no leftover boot=overlay marker"
+for fn in overlay_active overlay_next_boot overlay_status cmdline_write \
+          overlay_preflight overlay_ensure_initramfs swap_disable; do
+    type "$fn" >/dev/null 2>&1 && ok "$fn is defined" || bad "$fn is defined"
+done
+
+# The switch lives on the FAT partition: /etc is hidden by the overlay it
+# would be configuring.
+grep -q 'CMDLINE_FILE="$BOOT_DIR/cmdline.txt"' src/ogn-common.sh \
+    && ok "the switch is on the boot partition" || bad "the switch is on the boot partition"
+code_of src/ogn-* | grep -q 'overlayroot\.conf' \
+    && bad "nothing depends on /etc/overlayroot.conf" \
+    || ok "nothing depends on /etc/overlayroot.conf"
+
+# cmdline.txt rewriting, for real: a truncated or two-line cmdline.txt is an
+# unbootable Pi, so this is worth exercising rather than grepping for.
+T=$(mktemp -d)
+BASE='console=serial0,115200 root=PARTUUID=abc rootfstype=ext4 fsck.repair=yes rootwait'
+CMDLINE_FILE="$T/cmdline.txt"
+OVERLAY_STATE="$T/next-boot"
+printf '%s\n' "$BASE" > "$CMDLINE_FILE"
+cmdline_write "$OVERLAY_PARAM" 1 >/dev/null 2>&1
+is "enabling appends the parameter" "$(cat "$CMDLINE_FILE")" "$BASE $OVERLAY_PARAM"
+is "and cmdline.txt stays one line"  "$(wc -l < "$CMDLINE_FILE" | tr -d ' ')" "1"
+cmdline_write "$OVERLAY_PARAM" 1 >/dev/null 2>&1
+is "enabling twice does not duplicate it" \
+    "$(grep -c -o "$OVERLAY_PARAM" "$CMDLINE_FILE" | tr -d ' ')" "1"
+cmdline_write "$OVERLAY_PARAM" 0 >/dev/null 2>&1
+is "disabling removes it, leaving the rest alone" "$(cat "$CMDLINE_FILE")" "$BASE"
+cmdline_write "$OVERLAY_PARAM" 0 >/dev/null 2>&1
+is "disabling twice is harmless" "$(cat "$CMDLINE_FILE")" "$BASE"
+: > "$CMDLINE_FILE"
+cmdline_write "$OVERLAY_PARAM" 1 >/dev/null 2>&1 \
+    && bad "an empty cmdline.txt is refused, not written" \
+    || ok "an empty cmdline.txt is refused, not written"
+
+# cmdline.txt is root-only once the boot partition is mounted umask=0077, so
+# the answer `overlay status` needs is published where anyone can read it.
+# cmdline_write is the only thing that changes it, so it is the one place that
+# has to remember to say so.
+printf '%s\n' "$BASE" > "$CMDLINE_FILE"
+cmdline_write "$OVERLAY_PARAM" 1 >/dev/null 2>&1
+is "enabling publishes a readable copy"  "$(cat "$OVERLAY_STATE" 2>/dev/null)" "enabled"
+cmdline_write "$OVERLAY_PARAM" 0 >/dev/null 2>&1
+is "disabling publishes it too"          "$(cat "$OVERLAY_STATE" 2>/dev/null)" "disabled"
+MODE=$(stat -f '%Lp' "$OVERLAY_STATE" 2>/dev/null || stat -c '%a' "$OVERLAY_STATE")
+is "and anyone can read it"              "$MODE" "644"
+
+# With cmdline.txt readable it stays authoritative; without it, the published
+# copy is what is left. Neither: say so, rather than guessing "inactive".
+printf '%s %s\n' "$BASE" "$OVERLAY_PARAM" > "$CMDLINE_FILE"
+overlay_next_boot && ok "cmdline.txt wins while it can be read" || bad "cmdline.txt wins while it can be read"
+CMDLINE_FILE="$T/not-readable.txt"
+printf 'enabled\n' > "$OVERLAY_STATE"
+overlay_next_boot && ok "the published copy answers when it cannot" || bad "the published copy answers when it cannot"
+overlay_next_boot_known && ok "and that counts as knowing" || bad "and that counts as knowing"
+printf 'disabled\n' > "$OVERLAY_STATE"
+overlay_next_boot && bad "a disabled copy reads as disabled" || ok "a disabled copy reads as disabled"
+rm -f "$OVERLAY_STATE"
+overlay_next_boot_known && bad "with neither, it admits it does not know" || ok "with neither, it admits it does not know"
+case "$(overlay_status)" in
+    unknown*) ok "and the status line says unknown" ;;
+    *)        bad "and the status line says unknown" "$(overlay_status)" ;;
+esac
+grep -q 'overlay_next_boot_known' src/ogn-overlay \
+    && ok "the overlay command checks before answering" \
+    || bad "the overlay command checks before answering"
+grep -q 'overlay_state_publish' src/ogn-maintenance \
+    && ok "every boot republishes it" || bad "every boot republishes it"
+grep -q 'overlay_state_publish' src/ogn-install \
+    && ok "and so does the installer" || bad "and so does the installer"
+# /run, not /var/lib: a cache that outlived a reboot could disagree with the
+# card and never be corrected.
+grep -q 'OVERLAY_STATE="${OGN_OVERLAY_STATE:-/run/' src/ogn-common.sh \
+    && ok "the published copy lives on tmpfs" \
+    || bad "the published copy lives on tmpfs"
+rm -rf "$T"
+CMDLINE_FILE="$BOOT_DIR/cmdline.txt"
+
+# The hand-operated command. `overlay` is the name people are told to type.
+grep -q 'ln -sfn ogn-overlay /usr/local/sbin/overlay' boot/vendor-data \
+    && ok "vendor-data installs the 'overlay' command" \
+    || bad "vendor-data installs the 'overlay' command"
+grep -q 'ln -sfn ogn-overlay' tools/build-image.sh \
+    && ok "and so does the image build" || bad "and so does the image build"
+for verb in 'on|enable' 'off|disable' 'status'; do
+    grep -qE "^ *$verb\)" src/ogn-overlay \
+        && ok "overlay takes '$verb'" || bad "overlay takes '$verb'"
+done
+# Checking the state should not need sudo; changing it must.
+S=$(grep -n 'ACTION" = status' src/ogn-overlay | head -1 | cut -d: -f1)
+R=$(grep -n '^need_root' src/ogn-overlay | head -1 | cut -d: -f1)
+if [ -n "$S" ] && [ -n "$R" ] && [ "$S" -lt "$R" ]; then
+    ok "overlay status works without sudo, changes do not"
+else
+    bad "overlay status works without sudo, changes do not"
+fi
+# Arming a parameter with no initramfs to act on boots normally and keeps
+# writing to the card, with nothing to say so. Refuse instead.
+grep -q 'overlay_preflight' src/ogn-overlay \
+    && ok "enabling checks it would actually engage" \
+    || bad "enabling checks it would actually engage"
+grep -q 'auto_initramfs=1' src/ogn-common.sh \
+    && ok "an initramfs is arranged for, by a name that survives kernel upgrades" \
+    || bad "an initramfs is arranged for, by a name that survives kernel upgrades"
+
+# The login banner, refreshed at every boot.
+type overlay_motd_update >/dev/null 2>&1 \
+    && ok "overlay_motd_update is defined" || bad "overlay_motd_update is defined"
+grep -q 'overlay_motd_update' src/ogn-maintenance \
+    && ok "the boot-time config sync refreshes it" \
+    || bad "the boot-time config sync refreshes it"
+grep -q 'overlay_motd_update' src/ogn-install \
+    && ok "the installer writes it once set up" || bad "the installer writes it once set up"
+is "overlay_motd_update runs before config_sync can bail out" \
+    "$(awk '/^config_sync\(\)/,/BOOT_CONF" \]/' src/ogn-maintenance | grep -c 'overlay_motd_update')" "1"
+grep -c 'overlay_motd_update' src/ogn-overlay | grep -q '^2$' \
+    && ok "both overlay on and overlay off refresh it" \
+    || bad "both overlay on and overlay off refresh it"
+
+# All four states say something.
+T=$(mktemp -d)
+OVERLAY_MOTD="$T/motd"
+for now in 0 1; do
+    for next in 0 1; do
+        eval "overlay_active()    { return $((1 - now)); }"
+        eval "overlay_next_boot() { return $((1 - next)); }"
+        overlay_motd_update
+        if [ -s "$OVERLAY_MOTD" ]; then
+            ok "active=$now next=$next produces a banner"
+        else
+            bad "active=$now next=$next produces a banner"
+        fi
+    done
+done
+# The one state worth shouting about.
+overlay_active()    { return 1; }
+overlay_next_boot() { return 1; }
+overlay_motd_update
+grep -q 'WRITABLE' "$OVERLAY_MOTD" \
+    && ok "an unprotected receiver says so loudly" || bad "an unprotected receiver says so loudly"
+# Rewriting identical content would be a pointless SD card write every boot.
+cp "$OVERLAY_MOTD" "$T/before"
+touch -t 200001010000 "$OVERLAY_MOTD"
+overlay_motd_update
+if [ "$OVERLAY_MOTD" -nt "$T/before" ]; then
+    bad "an unchanged banner is not rewritten at every boot"
+else
+    ok "an unchanged banner is not rewritten at every boot"
+fi
+rm -rf "$T"
+unset -f overlay_active overlay_next_boot
+. src/ogn-common.sh
+
+python3 - <<'PY' && ok "systemd-remount-fs stands down under the overlay" || bad "systemd-remount-fs stands down under the overlay"
+src = open("src/ogn-install").read()
+dropin = src.split("systemd-remount-fs.service.d/ogn-overlay.conf <<EOF", 1)[1].split("\nEOF", 1)[0]
+assert "ConditionKernelCommandLine=!$OVERLAY_PARAM" in dropin, dropin
+# Not inside the ReadOnlyFS branch: the overlay can be switched on later.
+assert "systemd-remount-fs" not in src.split('if [ "$READONLY_FS" -eq 1 ]; then', 1)[1]
+PY
+is "and the parameter it matches is the one the overlay uses" "$OVERLAY_PARAM" "overlayroot=tmpfs"
+
+echo "== the decoders run under procServ =="
+python3 - <<'PY2' && ok "both decoders get a terminal, logging to the journal" || bad "both decoders get a terminal, logging to the journal"
+import re
+src = open("src/ogn-install").read()
+fn = src.split("on_procserv() {", 1)[1].split("\n}", 1)[0]
+for flag in ("--foreground", "--logfile=-", "--oneshot"):
+    assert flag in fn, flag
+# The console is localhost only. --allow gives the child's stdin to the network.
+assert "--allow" not in fn
+for name, port in (("ogn-rf", 50000), ("ogn-decode", 50001)):
+    unit = src.split(f"write_unit {name}.service <<EOF", 1)[1].split("\nEOF", 1)[0]
+    assert f'ExecStart=$(on_procserv {port} {name} "$REAL_DIR/{name}" MyReceiver.conf)' in unit, name
+    assert "Restart=always" in unit, name
+PY2
+
+python3 - <<'PY2' && ok "ogn-decode keeps per-packet echoes out of the journal" || bad "ogn-decode keeps per-packet echoes out of the journal"
+import re
+src = open("src/ogn-install").read()
+unit = src.split("write_unit ogn-decode.service <<EOF", 1)[1].split("\nEOF", 1)[0]
+# The heredoc is unquoted, so \$ is what reaches the unit file as $.
+pats = [l.split("=~", 1)[1].replace("\\$", "$")
+        for l in unit.splitlines() if l.startswith("LogFilterPatterns=~")]
+assert len(pats) == 2, pats
+# systemd uses PCRE2; Python's re has no POSIX classes, so translate that one.
+pats = [re.compile(p.replace("[[:space:]]", r"\s")) for p in pats]
+drop = ["APRS <- ICA4CAD89>OGADSB:/194455h5950.28N/01713.65E^088/330/A=007520", "", "\r", "  "]
+keep = ["RF: sampling at 2.0 MHz", "APRS: connected to aprs.glidernet.org"]
+for l in drop:
+    assert any(p.search(l) for p in pats), repr(l)
+for l in keep:
+    assert not any(p.search(l) for p in pats), repr(l)
+PY2
+grep -qE '^PACKAGES=\(.* procserv\)' src/ogn-install && ok "the installer asks for procserv" || bad "the installer asks for procserv"
+grep -qE '^    procserv$' tools/build-image.sh && ok "and the image ships it" || bad "and the image ships it"
 
 echo "== wifi from the card =="
 conf_load boot/MyReceiver.conf
@@ -198,6 +487,716 @@ STUBEOF
 wifi_apply >/dev/null 2>&1 && ok "no wifi interface is survivable" || bad "no wifi interface is survivable"
 
 PATH="$OLD_PATH"; rm -rf "$STUB"; unset NMCLI_LOG
+
+echo "== waiting for the network =="
+# getent fails GETENT_FAILS times; sleep only records.
+STUB=$(mktemp -d)
+export GETENT_FAILS="$STUB/fails" SLEEP_LOG="$STUB/sleeps"
+cat > "$STUB/getent" <<'STUBEOF'
+#!/bin/bash
+n=$(cat "$GETENT_FAILS")
+[ "$n" -gt 0 ] || exit 0
+echo $((n - 1)) > "$GETENT_FAILS"; exit 2
+STUBEOF
+cat > "$STUB/sleep" <<'STUBEOF'
+#!/bin/bash
+echo "$1" >> "$SLEEP_LOG"
+STUBEOF
+chmod +x "$STUB/getent" "$STUB/sleep"
+OLD_PATH="$PATH"; PATH="$STUB:$PATH"
+
+echo 0 > "$GETENT_FAILS"; : > "$SLEEP_LOG"
+network_wait example.org >/dev/null 2>&1 && ok "a resolving host returns at once" || bad "a resolving host returns at once"
+is "and does not sleep" "$(wc -l < "$SLEEP_LOG" | tr -d ' ')" "0"
+
+echo 3 > "$GETENT_FAILS"; : > "$SLEEP_LOG"
+network_wait example.org >/dev/null 2>&1 && ok "waits for the network to arrive" || bad "waits for the network to arrive"
+is "polling every 5s until it does" "$(wc -l < "$SLEEP_LOG" | tr -d ' ')" "3"
+
+echo 1000 > "$GETENT_FAILS"; : > "$SLEEP_LOG"
+OGN_NETWORK_WAIT=20 network_wait example.org >/dev/null 2>&1 \
+    && bad "gives up after OGN_NETWORK_WAIT" || ok "gives up after OGN_NETWORK_WAIT"
+is "having waited that long and no longer" "$(wc -l < "$SLEEP_LOG" | tr -d ' ')" "4"
+grep -q 'OGN_NETWORK_WAIT:-300' src/ogn-common.sh \
+    && ok "the limit defaults to five minutes" || bad "the limit defaults to five minutes"
+
+PATH="$OLD_PATH"; rm -rf "$STUB"; unset GETENT_FAILS SLEEP_LOG
+
+python3 - <<'PY' && ok "the installer waits for the network before downloading" || bad "the installer waits for the network before downloading"
+src = open("src/ogn-install").read()
+w, n, u = src.index("\nwifi_apply\n"), src.index("\nnetwork_wait "), src.index("ogn-update --channel")
+assert w < n < u, (w, n, u)
+assert "network_wait download.glidernet.org || true" in src, "network_wait must not end the install"
+PY
+
+echo "== a failed first install retries itself =="
+python3 - <<'PY' && ok "the retry timer is armed before anything can fail" || bad "the retry timer is armed before anything can fail"
+src = open("src/ogn-install").read()
+arm = src.index("systemctl enable ogn-install-retry.timer")
+assert arm < src.index('if [ ! -r "$BOOT_CONF" ]'), "armed after the config check"
+assert arm < src.index("\nwifi_apply\n")
+assert src.index("trap install_exit EXIT") < src.index('if [ ! -r "$BOOT_CONF" ]')
+# Only one EXIT trap: a later `trap ... EXIT` would silently replace it.
+assert src.count("EXIT\n") - src.count("trap install_exit EXIT\n") == 0, "a second EXIT trap"
+PY
+python3 - <<'PY' && ok "and only until the first install succeeds" || bad "and only until the first install succeeds"
+import re
+src = open("src/ogn-install").read()
+assert re.search(r'^if \[ ! -e "\$INSTALLED_MARKER" \]; then\n    FIRST_INSTALL=1', src, re.M)
+for name in ("service", "timer"):
+    unit = src.split(f"write_unit ogn-install-retry.{name} <<EOF", 1)[1].split("\nEOF", 1)[0]
+    assert "ConditionPathExists=!$INSTALLED_MARKER" in unit, name
+svc = src.split("write_unit ogn-install-retry.service <<EOF", 1)[1].split("\nEOF", 1)[0]
+assert re.search(r"^Wants=network-online\.target", svc, re.M)
+assert "RemainAfterExit" not in svc, "RemainAfterExit stops the timer re-running it"
+tmr = src.split("write_unit ogn-install-retry.timer <<EOF", 1)[1].split("\nEOF", 1)[0]
+assert "OnBootSec=" in tmr and "OnUnitInactiveSec=" in tmr
+# The marker is written last, and the timer is disarmed after it.
+mark = src.index('date -Is | boot_write "$INSTALLED_MARKER"')
+assert mark < src.index("systemctl disable ogn-install-retry.timer")
+assert mark > src.index("ogn-update --channel")
+PY
+grep -q 'flock -w' src/ogn-install \
+    && ok "the timer and a person cannot run it at once" \
+    || bad "the timer and a person cannot run it at once"
+
+echo "== the first reboot waits for a writable root to be finished with =="
+# Imager's settings -- Connect, sudo, SSH -- are runcmd, which cloud-init runs
+# after the vendor script. A reboot from inside the vendor script pushed them
+# onto the next boot, under the overlay, where they lived in RAM; and a
+# Connect sign-in that has not happened by the reboot can only ever happen in
+# RAM after it.
+python3 - <<'PY' && ok "the installer hands the reboot to a timer" || bad "the installer hands the reboot to a timer"
+src = open("src/ogn-install").read()
+tail = src.split('if [ "$REBOOT_WHEN_DONE" -eq 1 ]; then\n    # On first boot', 1)[1]
+assert "systemctl reboot" not in tail, "reboots from inside cloud-init"
+assert 'FIRST_REBOOT_PENDING' in tail
+assert "systemctl enable ogn-first-reboot.timer" in tail
+assert "systemctl start --no-block ogn-first-reboot.timer" in tail
+PY
+python3 - <<'PY' && ok "and leaves the overlay for it to arm" || bad "and leaves the overlay for it to arm"
+src = open("src/ogn-install").read()
+block = src.split("ARM_OVERLAY=0\n", 1)[1].split("\nfi\n", 1)[0]
+reboot_branch = block.split('elif [ "$REBOOT_WHEN_DONE" -eq 1 ]; then', 1)[1].split("    else\n", 1)[0]
+assert "--overlay-enable" not in reboot_branch, "armed before the wait"
+assert "overlay_preflight" in reboot_branch, "a broken overlay would only show at the reboot"
+assert "ARM_OVERLAY=1" in reboot_branch
+PY
+python3 - <<'PY' && ok "the timer survives a power cut and stops once done" || bad "the timer survives a power cut and stops once done"
+import re
+src = open("src/ogn-install").read()
+for name in ("service", "timer"):
+    unit = src.split(f"write_unit ogn-first-reboot.{name} <<EOF", 1)[1].split("\nEOF", 1)[0]
+    assert "ConditionPathExists=$FIRST_REBOOT_PENDING" in unit, name
+svc = src.split("write_unit ogn-first-reboot.service <<EOF", 1)[1].split("\nEOF", 1)[0]
+assert "RemainAfterExit" not in svc, "RemainAfterExit stops the timer re-running it"
+assert "--first-reboot" in svc
+tmr = src.split("write_unit ogn-first-reboot.timer <<EOF", 1)[1].split("\nEOF", 1)[0]
+assert "OnBootSec=" in tmr and "OnUnitInactiveSec=" in tmr
+assert re.search(r"^WantedBy=timers\.target", tmr, re.M)
+PY
+python3 - <<'PY' && ok "it waits for cloud-init, then Connect, then arms and reboots" || bad "it waits for cloud-init, then Connect, then arms and reboots"
+src = open("src/ogn-maintenance").read()
+fn = src.split("first_reboot() {", 1)[1].split("\n}\n", 1)[0]
+order = [fn.index(k) for k in ("cloud_init_running", "connect_signin_pending",
+                               "FIRST_REBOOT_LIMIT", "overlay_set enable", "systemctl reboot")]
+assert order == sorted(order), order
+# The marker goes before the reboot, or the timer runs again on the far side.
+assert fn.index('rm -f "$FIRST_REBOOT_PENDING"') < fn.index("systemctl reboot")
+PY
+
+# Whether Connect still has a key to spend. Connect removes auth.key once it
+# has tried, and a sign-in leaves state.json.
+CH=$(mktemp -d); HOME_ROOT="$CH"
+connect_signin_pending && bad "no Connect at all: nothing to wait for" || ok "no Connect at all: nothing to wait for"
+mkdir -p "$CH/pi/.config/com.raspberrypi.connect"
+connect_signin_pending && bad "Connect with no key: nothing to wait for" || ok "Connect with no key: nothing to wait for"
+printf 'key\n' > "$CH/pi/.config/com.raspberrypi.connect/auth.key"
+connect_signin_pending && ok "a key not yet spent: wait" || bad "a key not yet spent: wait"
+printf '{"accessToken":"x"}' > "$CH/pi/.config/com.raspberrypi.connect/state.json"
+connect_signin_pending && bad "signed in: done waiting" || ok "signed in: done waiting"
+rm -f "$CH/pi/.config/com.raspberrypi.connect/state.json" "$CH/pi/.config/com.raspberrypi.connect/auth.key"
+connect_signin_pending && bad "key spent, sign-in failed: nothing left to wait for" || ok "key spent, sign-in failed: nothing left to wait for"
+rm -rf "$CH"; HOME_ROOT=/home
+
+echo "== WireGuard from the card =="
+conf_load boot/MyReceiver.conf
+conf_bool Network.WireGuard.Enable && bad "the shipped template ships it off" || ok "the shipped template ships it off"
+is "and with no key"            "$(conf_get Network.WireGuard.PrivateKey '<empty>')" "<empty>"
+is "keepalive is set for NAT"   "$(conf_get Network.WireGuard.Peer.PersistentKeepalive)" "25"
+is "MTU is worked out by default" "$(conf_get Network.WireGuard.MTU)"                 "0"
+wireguard_render >/dev/null 2>&1 && bad "an empty section renders nothing" || ok "an empty section renders nothing"
+
+conf_load tests/fixtures/wireguard.conf
+WG=$(wireguard_render 2>/dev/null) || bad "a filled-in section renders"
+for expect in \
+    "PrivateKey = FixturePrivateKeyNotARealKey000000000000000=" \
+    "Address = 10.6.0.7/32" \
+    "MTU = 1380" \
+    "PublicKey = FixtureServerPublicKeyNotReal00000000000000=" \
+    "Endpoint = vpn.example.org:51820" \
+    "AllowedIPs = 10.6.0.0/24" \
+    "PersistentKeepalive = 25"; do
+    case "$WG" in
+        *"$expect"*) ok "renders '$expect'" ;;
+        *)           bad "renders '$expect'" "$WG" ;;
+    esac
+done
+is "the interface section comes first" "$(printf '%s\n' "$WG" | grep -c '^\[Interface\]')" "1"
+is "and there is one peer"             "$(printf '%s\n' "$WG" | grep -c '^\[Peer\]')"      "1"
+# An empty PresharedKey is not the same as one set to nothing: wg-quick
+# rejects the line outright.
+printf '%s\n' "$WG" | grep -q 'PresharedKey' \
+    && bad "an unset PresharedKey is left out entirely" \
+    || ok "an unset PresharedKey is left out entirely"
+
+# Every field that must be there, taken away one at a time.
+WGT=$(mktemp -d)
+for field in PrivateKey Address Peer.PublicKey Peer.Endpoint Peer.AllowedIPs; do
+    sed "s|^\( *${field#Peer.} *=\).*|\1 \"\";|" tests/fixtures/wireguard.conf > "$WGT/c.conf"
+    conf_load "$WGT/c.conf"
+    wireguard_render >/dev/null 2>&1 \
+        && bad "an empty $field is refused" \
+        || ok "an empty $field is refused"
+done
+
+# The mistakes that otherwise fail silently: a tunnel that comes up and never
+# handshakes tells the operator nothing at all.
+check_rejects() {
+    sed "$2" tests/fixtures/wireguard.conf > "$WGT/c.conf"
+    conf_load "$WGT/c.conf"
+    if wireguard_render >/dev/null 2>&1; then bad "rejects $1"; else ok "rejects $1"; fi
+}
+check_rejects "a key that is not base64"        's|^\( *PrivateKey *=\).*|\1 "not a key";|'
+check_rejects "the private key in Peer"         's|^\( *PublicKey *=\).*|\1 "FixturePrivateKeyNotARealKey000000000000000=";|'
+check_rejects "an address with no prefix"       's|^\( *Address *=\).*|\1 "10.6.0.7";|'
+check_rejects "an endpoint with no port"        's|^\( *Endpoint *=\).*|\1 "vpn.example.org";|'
+check_rejects "a keepalive that is not a number" 's|^\( *PersistentKeepalive *=\).*|\1 "soon";|'
+check_rejects "an MTU that is not a number"     's|^\( *MTU *=\).*|\1 "big";|'
+rm -rf "$WGT"
+
+# The whole apply path, against stubbed tools. wg-quick is the only thing that
+# needs root and a kernel, and it is exactly what must not be called twice.
+STUB=$(mktemp -d)
+export WG_LOG="$STUB/calls"
+: > "$WG_LOG"
+cat > "$STUB/wg-quick" <<'STUBEOF'
+#!/bin/bash
+printf 'wg-quick %s\n' "$*" >> "$WG_LOG"
+[ "$1" = up ] && printf '%s\n' "$1" > "$WG_LOG.iface"
+[ "$1" = down ] && rm -f "$WG_LOG.iface"
+exit 0
+STUBEOF
+cat > "$STUB/ip" <<'STUBEOF'
+#!/bin/bash
+# "link show" succeeds only while the stub wg-quick has brought it up.
+case "$*" in *"link show"*) [ -f "$WG_LOG.iface" ] ;; *) exit 0 ;; esac
+STUBEOF
+cat > "$STUB/wg" <<'STUBEOF'
+#!/bin/bash
+printf 'wg %s\n' "$*" >> "$WG_LOG"
+case "$*" in *latest-handshakes*) printf '%s\t0\n' "$WG_PEER" ;; esac
+exit 0
+STUBEOF
+chmod +x "$STUB/wg-quick" "$STUB/ip" "$STUB/wg"
+OLD_PATH="$PATH"; PATH="$STUB:$PATH"
+WG_DIR="$STUB/wireguard"; WG_CONF="$WG_DIR/$WG_IFACE.conf"; WG_MOTD="$STUB/motd"
+
+conf_load tests/fixtures/wireguard.conf
+export WG_PEER="$(conf_get Network.WireGuard.Peer.PublicKey)"
+wireguard_apply >/dev/null 2>&1 && ok "applies cleanly" || bad "applies cleanly"
+grep -q 'wg-quick up' "$WG_LOG" && ok "brings the tunnel up" || bad "brings the tunnel up"
+[ -s "$WG_CONF" ] && ok "writes the wg-quick config" || bad "writes the wg-quick config"
+MODE=$(stat -f '%Lp' "$WG_CONF" 2>/dev/null || stat -c '%a' "$WG_CONF")
+is "and it is readable only by root" "$MODE" "600"
+[ -s "$WG_MOTD" ] && ok "says so in the login banner" || bad "says so in the login banner"
+
+# Applying again must not bounce a working tunnel: this runs every 10 minutes.
+: > "$WG_LOG"
+wireguard_apply >/dev/null 2>&1
+grep -q 'wg-quick up' "$WG_LOG" \
+    && bad "an unchanged, working tunnel is left alone" \
+    || ok "an unchanged, working tunnel is left alone"
+# ... but a peer that has stopped answering gets its endpoint re-resolved,
+# which is what a server on a dynamic address needs.
+grep -q "wg set $WG_IFACE peer .* endpoint vpn.example.org:51820" "$WG_LOG" \
+    && ok "a stale handshake re-resolves the endpoint" \
+    || bad "a stale handshake re-resolves the endpoint" "$(cat "$WG_LOG")"
+
+# A changed setting does bounce it.
+: > "$WG_LOG"
+sed 's|^\( *Address *=\).*|\1 "10.6.0.9/32";|' tests/fixtures/wireguard.conf > "$STUB/changed.conf"
+conf_load "$STUB/changed.conf"
+wireguard_apply >/dev/null 2>&1
+grep -q 'wg-quick up' "$WG_LOG" && ok "a changed address brings it back up" || bad "a changed address brings it back up"
+grep -q 'Address = 10.6.0.9/32' "$WG_CONF" && ok "with the new address" || bad "with the new address"
+
+# Switching it off on the card takes it down and removes the key.
+: > "$WG_LOG"
+conf_load boot/MyReceiver.conf
+wireguard_apply >/dev/null 2>&1 && ok "a card with it switched off applies cleanly" || bad "a card with it switched off applies cleanly"
+grep -q 'wg-quick down' "$WG_LOG" && ok "takes the tunnel down" || bad "takes the tunnel down"
+[ -e "$WG_CONF" ] && bad "and removes the rendered key" || ok "and removes the rendered key"
+[ -e "$WG_MOTD" ] && bad "and the banner with it" || ok "and the banner with it"
+
+# Enabled on a machine with no wireguard-tools: say so, and report failure, so
+# that the unit holding this does not look like it succeeded.
+rm -f "$STUB/wg-quick"
+conf_load tests/fixtures/wireguard.conf
+wireguard_apply >/dev/null 2>&1 \
+    && bad "a missing wireguard-tools is reported, not ignored" \
+    || ok "a missing wireguard-tools is reported, not ignored"
+
+PATH="$OLD_PATH"; rm -rf "$STUB"; unset WG_LOG WG_PEER
+WG_DIR=/etc/wireguard; WG_CONF="$WG_DIR/$WG_IFACE.conf"; WG_MOTD=/etc/motd.d/40-ogn-wireguard
+
+echo "== credentials do not follow the config around =="
+# The card is the only copy that needs any of these. The copy the decoder runs
+# from is 0644, and the decoder reads none of them.
+T=$(mktemp -d)
+sed 's|^\( *PresharedKey *=\).*|\1 "FixturePresharedKeyNotReal00000000000000000=";|' \
+    tests/fixtures/wireguard.conf > "$T/target.conf"
+conf_redact_secrets "$T/target.conf"
+grep -q 'FixturePrivateKey' "$T/target.conf" && bad "the private key is blanked" || ok "the private key is blanked"
+grep -q 'FixturePresharedKey' "$T/target.conf" && bad "so is the preshared key" || ok "so is the preshared key"
+conf_load "$T/target.conf"
+is "and what is left still parses" "$(conf_get Network.WireGuard.Address)" "10.6.0.7/32"
+is "the public key is untouched"   "$(conf_get Network.WireGuard.Peer.PublicKey)" \
+                                   "FixtureServerPublicKeyNotReal00000000000000="
+
+# Every credential the template can hold, filled in on a copy of the real
+# thing: the wifi password and a Connect auth key are secrets too, and were
+# riding along in that world-readable copy until they were named here.
+sed -e 's|^\( *Password *= *\)"";|\1"SECRET-wifi";|' \
+    -e 's|^\( *ConnectAuthKey *= *\)"";|\1"SECRET-connect";|' \
+    -e 's|^\( *PrivateKey *= *\)"";|\1"SECRET-wg";|' \
+    -e 's|^\( *PresharedKey *= *\)"";|\1"SECRET-psk";|' \
+    boot/MyReceiver.conf > "$T/card.conf"
+is "the template holds four credentials" \
+    "$(grep -c 'SECRET-' "$T/card.conf" | tr -d ' ')" "4"
+cp "$T/card.conf" "$T/decoder.conf"
+conf_redact_secrets "$T/decoder.conf"
+is "and the decoder's copy holds none" \
+    "$(grep -c 'SECRET-' "$T/decoder.conf" | tr -d ' ')" "0"
+is "while the card keeps all four" \
+    "$(grep -c 'SECRET-' "$T/card.conf" | tr -d ' ')" "4"
+conf_load "$T/decoder.conf"
+is "the redacted copy still parses"  "$(conf_get HTTP.Port)"        "8080"
+is "and keeps what is not secret"    "$(conf_get RF.OGN.CenterFreq)" "868.8"
+rm -rf "$T"
+grep -q 'conf_redact_secrets "$TARGET_CONF"' src/ogn-install \
+    && ok "the installer redacts the copy it places" \
+    || bad "the installer redacts the copy it places"
+grep -q 'conf_redact_secrets "$target"' src/ogn-maintenance \
+    && ok "and so does every later resync" || bad "and so does every later resync"
+
+echo "== WireGuard plumbing =="
+grep -q 'ogn-wireguard' boot/vendor-data && ok "vendor-data carries ogn-wireguard" || bad "vendor-data carries ogn-wireguard"
+grep -q 'src/ogn-wireguard' tools/build-image.sh && ok "and so does the image build" || bad "and so does the image build"
+grep -q 'wireguard-tools' tools/build-image.sh \
+    && ok "the image ships wireguard-tools, so the card alone can switch it on" \
+    || bad "the image ships wireguard-tools, so the card alone can switch it on"
+grep -q 'systemctl enable ogn-wireguard.service' src/ogn-install \
+    && ok "the service is enabled whatever the card says today" \
+    || bad "the service is enabled whatever the card says today"
+# Unlike the wifi, this one has to wait: wg-quick resolves the server's name.
+python3 - <<'PY' && ok "the tunnel unit waits for the network" || bad "the tunnel unit waits for the network"
+import re
+unit = open("src/ogn-install").read().split("write_unit ogn-wireguard.service <<'EOF'", 1)[1].split("\nEOF", 1)[0]
+assert re.search(r"^After=.*network-online\.target", unit, re.M), "missing After=network-online.target"
+assert re.search(r"^Wants=network-online\.target", unit, re.M), "missing Wants=network-online.target"
+# RemainAfterExit would make the unit unstartable by its own repair timer.
+assert "RemainAfterExit" not in unit, "RemainAfterExit stops the timer re-running it"
+PY
+grep -q 'ogn-wireguard.timer' src/ogn-wireguard \
+    && ok "the repair timer follows the card, not the installer" \
+    || bad "the repair timer follows the card, not the installer"
+grep -q 'wg_up' src/ogn-maintenance \
+    && ok "a live edit is picked up by the config resync" \
+    || bad "a live edit is picked up by the config resync"
+grep -q 'is-system-running' src/ogn-maintenance \
+    && ok "the resync leaves WireGuard and ADS-B alone at boot" \
+    || bad "the resync leaves WireGuard and ADS-B alone at boot"
+
+echo "== ADS-B from the card =="
+# Shipped state: the whole section is commented, so none of it reads back and
+# nothing can be rendered. This is what "ADS-B is off by absence" has to mean.
+conf_load boot/MyReceiver.conf
+is "no ADSB.Enable, so ADS-B is off" "$(conf_get ADSB.Enable '<none>')"          "<none>"
+is "and no DeviceSerial either"      "$(conf_get ADSB.DeviceSerial '<none>')"    "<none>"
+is "and no site is switched on"      "$(conf_get ADSB.Feed.ADSBFi '<none>')"     "<none>"
+adsb_render >/dev/null 2>&1 && bad "the shipped card renders no readsb config" \
+                            || ok  "the shipped card renders no readsb config"
+is "and nothing is being shared"     "$(adsb_feed_summary)"                      "OGN only"
+
+# The instructions on the card say "uncomment this whole section and reboot".
+# This is the assertion that the instructions are true: strip the comment
+# markers off the shipped block, and what is left has to parse, validate and
+# render -- sharing with nobody, because every site ships switched off.
+ADU=$(mktemp -d)
+python3 - "$ADU/c.conf" <<'UNCOMMENT'
+import sys
+lines = open("boot/MyReceiver.conf", encoding="utf-8").read().split("\n")
+start = next(i for i, l in enumerate(lines) if l.strip() == "# ADSB:")
+end = next(i for i, l in enumerate(lines) if i > start and l.strip() == "# } ;")
+block = [l[2:] if l.startswith("# ") else l[1:] if l.startswith("#") else l
+         for l in lines[start:end + 1]]
+open(sys.argv[1], "w", encoding="utf-8").write(
+    'APRS:\n{\n  Call = "TEST1";\n} ;\n\n'
+    'Position:\n{\n  Latitude = +51.1;\n  Longitude = -1.8;\n  Altitude = 128;\n} ;\n\n'
+    'RF:\n{\n  DeviceSerial = "868";\n} ;\n\n' + "\n".join(block) + "\n")
+UNCOMMENT
+conf_load "$ADU/c.conf"
+conf_bool ADSB.Enable false && ok "uncommenting the shipped block switches it on"                             || bad "uncommenting the shipped block switches it on"
+is "and names the 1090 stick"        "$(conf_get ADSB.DeviceSerial)"             "1090"
+is "and hands the decoder the feed"  "$(conf_get ADSB.AVR)"                      "localhost:30002"
+ADUR=$(adsb_render 2>/dev/null) && ok "and renders a usable readsb config"                                 || bad "and renders a usable readsb config"
+# Every site ships false, so switching ADS-B on must not, by itself, start
+# sending what this receiver hears to anybody new.
+case "$ADUR" in
+    *net-connector*) bad "and shares it with nobody until asked" "$ADUR" ;;
+    *)               ok  "and shares it with nobody until asked" ;;
+esac
+rm -rf "$ADU"
+conf_load boot/MyReceiver.conf
+
+# A filled-in card. The identity source is pinned, so the UUID is known.
+ADID=$(mktemp -d)
+printf '100000001234abcd\0' > "$ADID/serial-number"
+ADSB_ID_SOURCES="$ADID/serial-number"
+conf_load tests/fixtures/adsb.conf
+AD=$(adsb_render 2>/dev/null) || bad "the fixture renders"
+for expect in \
+    '--device 1090' \
+    '--device-type rtlsdr' \
+    '--gain auto ' \
+    "--net-ro-port 30002" \
+    "--net-bo-port 30005" \
+    "--net-bi-port 30104" \
+    '--net-connector feed.adsb.fi,30004,beast_reduce_plus_out' \
+    '--net-connector feed.airplanes.live,30004,beast_reduce_plus_out' \
+    'JSON_OPTIONS="--write-json /run/readsb"'
+do
+    case "$AD" in
+        *"$expect"*) ok "renders $expect" ;;
+        *)           bad "renders $expect" "$AD" ;;
+    esac
+done
+# A site that was not ticked must not appear. This is the assertion that says
+# "off" means "no connection", not "a connection nobody looked at".
+case "$AD" in
+    *adsbexchange*) bad "a site left off is not fed" "$AD" ;;
+    *)              ok  "a site left off is not fed" ;;
+esac
+# readsb rewrites its JSON every second. Into /run, which is RAM, that is free;
+# anywhere else it is the card the overlay exists to protect.
+WJ=$(printf '%s\n' "$AD" | grep -o -- '--write-json[= ][^ "]*' | sed 's/^--write-json[= ]//')
+case "$WJ" in
+    /run/*) ok  "nothing is written to disk continuously" ;;
+    *)      bad "nothing is written to disk continuously" "--write-json goes to [$WJ], not /run" ;;
+esac
+is "the summary names who gets it" "$(adsb_feed_summary)" "OGN, feed.adsb.fi, feed.airplanes.live"
+
+# The feed sites are told who is sending, or readsb logs "Not a valid UUID"
+# on every connection and the feed arrives anonymously.
+ADU1=$(adsb_uuid)
+adsb_uuid_ok "$ADU1" && ok "a UUID is derived from the hardware serial" || bad "a UUID is derived from the hardware serial" "$ADU1"
+case "$AD" in
+    *"--uuid $ADU1"*) ok  "and readsb is given it" ;;
+    *)                bad "and readsb is given it" "$AD" ;;
+esac
+is "the same serial gives the same UUID" "$(adsb_uuid)" "$ADU1"
+case "$ADU1" in *1234abcd*) bad "the serial itself is not sent" "$ADU1" ;; *) ok "the serial itself is not sent" ;; esac
+printf 'Serial\t\t: 100000001234abcd\n' > "$ADID/cpuinfo"
+is "cpuinfo gives the same answer as the device tree" \
+   "$(ADSB_ID_SOURCES="$ADID/missing $ADID/cpuinfo"; adsb_uuid)" "$ADU1"
+printf 'Serial\t\t: 0000000000000000\n' > "$ADID/zero"
+printf 'abcdef0123456789abcdef0123456789\n' > "$ADID/machine-id"
+ADU2=$(ADSB_ID_SOURCES="$ADID/zero $ADID/machine-id"; adsb_uuid)
+adsb_uuid_ok "$ADU2" && [ "$ADU2" != "$ADU1" ] \
+    && ok "an all-zero serial falls through to machine-id" || bad "an all-zero serial falls through to machine-id" "$ADU2"
+ADN=$(ADSB_ID_SOURCES="$ADID/missing"; adsb_render 2>/dev/null)
+case "$ADN" in
+    *--uuid*)          bad "with no identity at all it feeds anonymously" "$ADN" ;;
+    *net-connector*)   ok  "with no identity at all it feeds anonymously" ;;
+    *)                 bad "with no identity at all it feeds anonymously" "$ADN" ;;
+esac
+
+# One multilateration environment per site that is on, and none for the rest.
+ML=$(adsb_mlat_render ADSBFi 2>/dev/null) || bad "an mlat environment renders"
+case "$ML" in
+    *"MLAT_SERVER=feed.adsb.fi:31090"*) ok "mlat points at the right server" ;;
+    *) bad "mlat points at the right server" "$ML" ;;
+esac
+case "$ML" in
+    *"MLAT_RESULTS=beast,connect,localhost:30104"*) ok "mlat results come back to readsb" ;;
+    *) bad "mlat results come back to readsb" "$ML" ;;
+esac
+is "mlat instance names are lowercase" "$(adsb_feed_instance ADSBFi)" "adsbfi"
+
+# Required fields, one at a time.
+ADT=$(mktemp -d)
+sed 's/^  DeviceSerial = "1090";/  DeviceSerial = "";/' tests/fixtures/adsb.conf > "$ADT/c.conf"
+conf_load "$ADT/c.conf"
+adsb_render >/dev/null 2>&1 \
+    && bad "an empty ADSB.DeviceSerial is refused" \
+    || ok  "an empty ADSB.DeviceSerial is refused"
+# Gain is different, and deliberately so: conf_get cannot tell an empty value
+# from an absent one, so a blank Gain falls back to readsb's autogain. That is
+# the right answer for a gain, and the wrong one for a serial, which is why
+# only the serial is required above.
+# Captured rather than piped into grep -q: grep exits at the first match and
+# the SIGPIPE that follows becomes a pipeline failure under pipefail.
+check_gain() {
+    sed "s/^  Gain         = \"auto\";/  Gain = $2;/" tests/fixtures/adsb.conf > "$ADT/c.conf"
+    conf_load "$ADT/c.conf"
+    ADG=$(adsb_render 2>/dev/null)
+    case "$ADG" in
+        *"--gain $3 "*) ok  "$1" ;;
+        *)              bad "$1" "$ADG" ;;
+    esac
+}
+check_gain "an empty ADSB.Gain falls back to readsb's autogain" '""'       auto
+check_gain "\"AUTO\" is read as auto"                           '"AUTO"'   auto
+check_gain "-10 still hands the gain to the tuner"              '-10'      -10
+check_gain "a number still fixes the gain"                      '49.6'     49.6
+# The trap the whole two-dongle section exists to avoid: RF.Device is an index
+# and indexes move, so ADS-B without RF.DeviceSerial can hand the OGN decoder
+# the 1090 stick and leave nothing to explain the silence.
+sed 's/^  DeviceSerial = "868";//' tests/fixtures/adsb.conf > "$ADT/c.conf"
+conf_load "$ADT/c.conf"
+adsb_render >/dev/null 2>&1 \
+    && bad "ADS-B without RF.DeviceSerial is refused" \
+    || ok  "ADS-B without RF.DeviceSerial is refused"
+
+check_rejects() {
+    sed "$2" tests/fixtures/adsb.conf > "$ADT/c.conf"
+    conf_load "$ADT/c.conf"
+    adsb_render >/dev/null 2>&1 && bad "$1" || ok "$1"
+}
+check_rejects "both sticks given the same serial is refused" 's/DeviceSerial = "1090"/DeviceSerial = "868"/'
+check_rejects "a gain that is neither auto nor a number is refused" 's/Gain         = "auto"/Gain         = "loud"/'
+check_rejects "a Custom entry with no port is refused"       's|Custom        = ""|Custom = "feed.example.org"|'
+# Multilateration compares arrival times between receivers, so a receiver that
+# is not where it says it is makes everyone else's answers worse.
+check_rejects "mlat with the position still 0,0 is refused"  's/Latitude  = +51.1874/Latitude = 0.0/; s/Longitude =  -1.8340/Longitude = 0.0/'
+check_rejects "mlat with no site to send it to is refused"   's/ADSBFi        = true/ADSBFi = false/; s/AirplanesLive = true/AirplanesLive = false/'
+check_rejects "an ADSB.Feed.UUID that is not a UUID is refused" 's|Custom        = ""|Custom = ""; UUID = "not-a-uuid"|'
+sed 's|Custom        = ""|Custom = ""; UUID = "01234567-89ab-cdef-0123-456789abcdef"|' tests/fixtures/adsb.conf > "$ADT/c.conf"
+conf_load "$ADT/c.conf"
+ADO=$(adsb_render 2>/dev/null)
+case "$ADO" in
+    *"--uuid 01234567-89ab-cdef-0123-456789abcdef"*) ok  "ADSB.Feed.UUID on the card wins" ;;
+    *)                                               bad "ADSB.Feed.UUID on the card wins" "$ADO" ;;
+esac
+# A custom target that IS well formed has to survive all of that.
+sed 's|Custom        = ""|Custom = "feed.example.org:30004"|' tests/fixtures/adsb.conf > "$ADT/c.conf"
+conf_load "$ADT/c.conf"
+ADC=$(adsb_render 2>/dev/null)
+case "$ADC" in
+    *"feed.example.org,30004,beast_reduce_plus_out"*) ok  "a well-formed Custom target is fed" ;;
+    *)                                                bad "a well-formed Custom target is fed" "$ADC" ;;
+esac
+rm -rf "$ADT" "$ADID"
+
+# The whole apply path, against stubs. systemctl is what must not be called
+# twice, and readsb only has to exist for the command -v check.
+STUB=$(mktemp -d)
+export ADSB_LOG="$STUB/calls"
+: > "$ADSB_LOG"; : > "$ADSB_LOG.on"
+printf '#!/bin/bash\nexit 0\n' > "$STUB/readsb"
+cat > "$STUB/systemctl" <<'STUBEOF'
+#!/bin/bash
+printf 'systemctl %s\n' "$*" >> "$ADSB_LOG"
+# Leading options such as --no-block come before the verb.
+while [ $# -gt 0 ]; do case "$1" in --*) shift ;; *) break ;; esac; done
+verb="$1"; shift
+unit=""
+for a in "$@"; do case "$a" in --*) ;; *) unit="$a" ;; esac; done
+case "$verb" in
+    # As the real thing does: a unit with no [Install] section is "static",
+    # and is-enabled calls that success whether or not it is running.
+    is-enabled) case "$unit" in ogn-mlat@*) exit 0 ;; esac
+                grep -qx "$unit" "$ADSB_LOG.on" 2>/dev/null ;;
+    is-active)  grep -qx "$unit" "$ADSB_LOG.on" 2>/dev/null ;;
+    enable|start|restart) printf '%s\n' "$unit" >> "$ADSB_LOG.on"; exit 0 ;;
+    disable)              case " $* " in *" --now "*) ;; *) exit 0 ;; esac
+                          grep -vx "$unit" "$ADSB_LOG.on" > "$ADSB_LOG.on.t" 2>/dev/null
+                          mv "$ADSB_LOG.on.t" "$ADSB_LOG.on" 2>/dev/null; exit 0 ;;
+    stop)                 grep -vx "$unit" "$ADSB_LOG.on" > "$ADSB_LOG.on.t" 2>/dev/null
+                          mv "$ADSB_LOG.on.t" "$ADSB_LOG.on" 2>/dev/null; exit 0 ;;
+    *) exit 0 ;;
+esac
+STUBEOF
+chmod +x "$STUB/readsb" "$STUB/systemctl"
+OLD_PATH="$PATH"; PATH="$STUB:$PATH"
+OLD_DEFAULT="$ADSB_DEFAULT"; OLD_MLAT="$ADSB_MLAT_DIR"; OLD_AMOTD="$ADSB_MOTD"
+ADSB_DEFAULT="$STUB/default-readsb"; ADSB_MLAT_DIR="$STUB/mlat"; ADSB_MOTD="$STUB/motd"
+
+conf_load tests/fixtures/adsb.conf
+adsb_apply >/dev/null 2>&1 && ok "applies cleanly" || bad "applies cleanly"
+[ -f "$ADSB_DEFAULT" ] && ok "writes the readsb defaults" || bad "writes the readsb defaults"
+grep -q 'systemctl restart readsb' "$ADSB_LOG" && ok "starts readsb" || bad "starts readsb"
+# Enabled, readsb starts at boot before the card is read, and an enable made
+# while the root is writable outlives the overlay. ogn-adsb.service starts it.
+grep -q 'systemctl enable readsb' "$ADSB_LOG" \
+    && bad "readsb is started, never enabled" || ok "readsb is started, never enabled"
+grep -q 'systemctl --no-block start ogn-adsb-web.service' "$ADSB_LOG" \
+    && ok "starts the statistics page, without waiting on it" \
+    || bad "starts the statistics page, without waiting on it" "$(cat "$ADSB_LOG")"
+grep -qE 'systemctl (enable|disable).*ogn-adsb-web' "$ADSB_LOG" \
+    && bad "the statistics page is started, never enabled" \
+    || ok  "the statistics page is started, never enabled"
+# The mlat units wait for network-online.target; the config resync runs before
+# it. A blocking restart from there is a boot that never finishes.
+if grep 'ogn-mlat@' "$ADSB_LOG" | grep -E ' (restart|enable) ' | grep -vq -- '--no-block'; then
+    bad "mlat clients are started without waiting on them" "$(cat "$ADSB_LOG")"
+else
+    ok "mlat clients are started without waiting on them"
+fi
+[ -f "$ADSB_MLAT_DIR/adsbfi.env" ] \
+    && ok "an mlat environment for each site that is on" \
+    || bad "an mlat environment for each site that is on"
+[ -f "$ADSB_MLAT_DIR/adsblol.env" ] \
+    && bad "and none for a site that is off" \
+    || ok  "and none for a site that is off"
+# The mlat environment is in /run, not /var/lib: it is a rendering of the card,
+# and must not survive a reboot into disagreeing with it.
+grep -q '/run/ogn-bootstrap/mlat' src/ogn-common.sh \
+    && ok "mlat settings live in /run" || bad "mlat settings live in /run"
+
+# Idempotence. A boot-time re-apply that bounces a working feed would drop
+# every aircraft it is tracking for no reason.
+: > "$ADSB_LOG"
+adsb_apply >/dev/null 2>&1 && ok "a second apply is clean" || bad "a second apply is clean"
+grep -q 'restart readsb' "$ADSB_LOG" \
+    && bad "an unchanged, working feed is left alone" \
+    || ok  "an unchanged, working feed is left alone"
+# enable and disable each daemon-reload systemd. From the 10-minute timer that
+# re-ran every generator (zram among them) once per site switched off.
+grep -qE 'systemctl (enable|disable).*ogn-mlat@' "$ADSB_LOG" \
+    && bad "a re-apply never enables or disables an mlat client" "$(cat "$ADSB_LOG")" \
+    || ok  "a re-apply never enables or disables an mlat client"
+grep -q 'ogn-mlat@adsbfi.service' "$ADSB_LOG.on" \
+    && ok "the mlat client for a site that is on is running" \
+    || bad "the mlat client for a site that is on is running"
+
+# A changed setting must not be left alone.
+sed 's/ADSBLol       = false/ADSBLol = true/' tests/fixtures/adsb.conf > "$STUB/c.conf"
+conf_load "$STUB/c.conf"
+: > "$ADSB_LOG"
+adsb_apply >/dev/null 2>&1
+grep -q 'restart readsb' "$ADSB_LOG" \
+    && ok "adding a site restarts the decoder" || bad "adding a site restarts the decoder"
+[ -f "$ADSB_MLAT_DIR/adsblol.env" ] \
+    && ok "and brings its mlat client with it" || bad "and brings its mlat client with it"
+
+# Switched off on the card: stopped, and the rendering removed with it.
+sed 's/Enable       = true/Enable = false/' tests/fixtures/adsb.conf > "$STUB/c.conf"
+conf_load "$STUB/c.conf"
+adsb_apply >/dev/null 2>&1 && ok "switching it off on the card applies cleanly" \
+                           || bad "switching it off on the card applies cleanly"
+[ -f "$ADSB_DEFAULT" ] && bad "and the readsb defaults are removed" \
+                       || ok  "and the readsb defaults are removed"
+[ -f "$ADSB_MLAT_DIR/adsbfi.env" ] && bad "and every mlat client with them" \
+                                   || ok  "and every mlat client with them"
+
+PATH="$OLD_PATH"
+ADSB_DEFAULT="$OLD_DEFAULT"; ADSB_MLAT_DIR="$OLD_MLAT"; ADSB_MOTD="$OLD_AMOTD"
+rm -rf "$STUB"; unset ADSB_LOG
+
+echo "== ADS-B plumbing =="
+grep -q 'ogn-adsb' boot/vendor-data && ok "vendor-data carries ogn-adsb" || bad "vendor-data carries ogn-adsb"
+grep -q 'src/ogn-adsb' tools/build-image.sh && ok "and so does the image build" || bad "and so does the image build"
+grep -q 'src/ogn-adsb' tools/build-vendor-data \
+    && ok "and the payload generator knows about it" \
+    || bad "and the payload generator knows about it"
+# Shipped in the image for the same reason as wireguard-tools: ADSB is outside
+# the Install section, so a dongle added later never comes back through apt.
+for pkg in readsb mlat-client-adsbfi python3-pyasyncore; do
+    grep -q "$pkg" tools/build-image.sh \
+        && ok "the image ships $pkg, so the card alone can switch it on" \
+        || bad "the image ships $pkg, so the card alone can switch it on"
+done
+# mlat-client-adsbfi imports asyncore but does not depend on python3-pyasyncore.
+grep -q 'PACKAGES+=(mlat-client-adsbfi python3-pyasyncore)' src/ogn-install \
+    && ok "a hand-built Pi gets asyncore along with mlat-client-adsbfi" \
+    || bad "a hand-built Pi gets asyncore along with mlat-client-adsbfi"
+# Everything comes from Debian. A third-party apt source in this file would
+# make the promise at the top of build-image.yml false.
+code_of tools/build-image.sh src/ogn-install src/ogn-adsb src/ogn-common.sh \
+    | grep -qE 'sources\.list|apt-key|add-apt-repository|deb https?:' \
+    && bad "ADS-B adds no third-party apt source" \
+    || ok  "ADS-B adds no third-party apt source"
+grep -q 'systemctl enable ogn-adsb.service' src/ogn-install \
+    && ok "the service is enabled whatever the card says today" \
+    || bad "the service is enabled whatever the card says today"
+python3 - <<'PY' && ok "the ADS-B unit is independent of the OGN group" || bad "the ADS-B unit is independent of the OGN group"
+import re
+src = open("src/ogn-install").read()
+unit = src.split("write_unit ogn-adsb.service <<'EOF'", 1)[1].split("\nEOF", 1)[0]
+# ogn-calibrate stops rtlsdr-ogn to take the OGN stick for a GSM scan. ADS-B is
+# on the other stick and has no business going down with it.
+assert "PartOf" not in unit, "PartOf would stop ADS-B during a calibration run"
+assert re.search(r"^Wants=network-online\.target", unit, re.M), "missing Wants=network-online.target"
+assert "RemainAfterExit" not in unit, "RemainAfterExit stops the timer re-running it"
+mlat = src.split("write_unit ogn-mlat@.service <<'EOF'", 1)[1].split("\nEOF", 1)[0]
+assert "StandardOutput=journal" in mlat, "mlat must log to the journal, not /var/log"
+# The package installs /usr/bin/mlat-client-adsbfi; there is no mlat-client.
+assert re.search(r"^ExecStart=/usr/bin/mlat-client-adsbfi ", mlat, re.M), \
+    "ExecStart must name the binary mlat-client-adsbfi actually ships"
+PY
+python3 - <<'PY' && ok "the statistics page goes with readsb, unprivileged" || bad "the statistics page goes with readsb, unprivileged"
+src = open("src/ogn-install").read()
+unit = src.split("write_unit ogn-adsb-web.service <<EOF", 1)[1].split("\nEOF", 1)[0]
+assert "BindsTo=readsb.service" in unit, "must stop when readsb does"
+assert "DynamicUser=yes" in unit, "must not run as root"
+assert "python3 -I" in unit, "-I keeps the script's directory and the environment out of sys.path"
+assert "[Install]" not in unit, "adsb_apply starts it; enabled, it would outlive ADS-B being switched off"
+PY
+grep -q 'adsb-stats.py' boot/vendor-data && ok "vendor-data carries adsb-stats.py" || bad "vendor-data carries adsb-stats.py"
+grep -q 'src/adsb-stats.py' tools/build-image.sh && ok "and so does the image build" || bad "and so does the image build"
+grep -q 'ogn-adsb.timer' src/ogn-adsb \
+    && ok "the repair timer follows the card, not the installer" \
+    || bad "the repair timer follows the card, not the installer"
+grep -q 'ogn-adsb' src/ogn-maintenance \
+    && ok "a live edit is picked up by the config resync" \
+    || bad "a live edit is picked up by the config resync"
+
+echo "== ADS-B statistics page =="
+# The real server, on a free port, over a directory standing in for
+# /run/readsb. It must serve the page and the three files, and nothing else.
+if python3 -m py_compile src/adsb-stats.py 2>/dev/null; then ok "adsb-stats.py compiles"; else bad "adsb-stats.py compiles"; fi
+rm -rf src/__pycache__
+if command -v curl >/dev/null; then
+    WEB=$(mktemp -d)
+    printf '{"now":1}\n' > "$WEB/stats.json"
+    printf 'secret\n'    > "$WEB/other.json"
+    python3 -I src/adsb-stats.py --port 0 --dir "$WEB" 2> "$WEB.log" &
+    WEBPID=$!
+    WEBPORT=""
+    for _ in $(seq 50); do
+        WEBPORT=$(sed -n 's/.* on port \([0-9]*\)$/\1/p' "$WEB.log")
+        [ -n "$WEBPORT" ] && break
+        sleep 0.1
+    done
+    if [ -z "$WEBPORT" ]; then
+        bad "the statistics server starts" "$(cat "$WEB.log")"
+    else
+        ok "the statistics server starts"
+        code() { curl -s -o /dev/null -w '%{http_code}' --path-as-is "http://127.0.0.1:$WEBPORT$1"; }
+        is "it serves the page"                          "$(code /)"                      "200"
+        is "it serves stats.json"                        "$(curl -s "http://127.0.0.1:$WEBPORT/data/stats.json")" '{"now":1}'
+        is "a file readsb has not written is a 503"      "$(code /data/aircraft.json)"    "503"
+        is "other files in the directory are not served" "$(code /data/other.json)"      "404"
+        is "nor is anything outside it"                  "$(code /data/../../etc/passwd)" "404"
+        is "nor is a listing"                            "$(code /data/)"                 "404"
+    fi
+    kill "$WEBPID" 2>/dev/null; wait "$WEBPID" 2>/dev/null
+    rm -rf "$WEB" "$WEB.log"
+else
+    printf '  skip statistics server: curl not installed\n'
+fi
 
 echo "== config resync =="
 grep -q 'config-sync)     config_sync' src/ogn-maintenance \
@@ -291,6 +1290,17 @@ grep -q 'gsm_scan --ppm' src/ogn-calibrate \
     && ok "gsm_scan is called with flags, as the examples show" \
     || bad "gsm_scan is called with flags, as the examples show"
 
+# gsm_scan defaults to device 0, which may be the ADS-B stick.
+grep -q 'conf_get RF.DeviceSerial' src/ogn-calibrate \
+    && ok "calibration follows DeviceSerial when it is set" \
+    || bad "calibration follows DeviceSerial when it is set"
+grep -q 'conf_get RF.Device 0' src/ogn-calibrate \
+    && ok "and falls back to the Device index" \
+    || bad "and falls back to the Device index"
+grep -q 'gsm_scan --ppm 0 --gain "\$SCAN_GAIN" \$DEV_OPT' src/ogn-calibrate \
+    && ok "and passes that selection to gsm_scan" \
+    || bad "and passes that selection to gsm_scan"
+
 grep -q 'conf_has RF.FreqCorr' src/ogn-install \
     && bad "the installer no longer calibrates unasked" \
     || ok "the installer no longer calibrates unasked"
@@ -362,6 +1372,18 @@ fi
 ./tools/make-os-list --meta "$TMP/meta.json" --url "https://example.com/other.img.xz" --out "$TMP/x.json" >/dev/null 2>&1 \
     && bad "make-os-list rejects a URL the hashes do not describe" \
     || ok "make-os-list rejects a URL the hashes do not describe"
+
+# Imager shows the name and the description and nothing else, so those two
+# fields are the only place a test build can announce itself as one.
+./tools/make-os-list --meta "$TMP/meta.json" --url "$URL" --out "$TMP/test.json" \
+    --name "OGN Receiver TEST somebranch (abc1234)" \
+    --note "TEST BUILD -- not the released receiver image." >/dev/null \
+    && python3 - "$TMP/test.json" <<'PY' && ok "make-os-list labels a test build" || bad "make-os-list labels a test build"
+import json, sys
+e = json.load(open(sys.argv[1]))["os_list"][0]
+assert e["name"] == "OGN Receiver TEST somebranch (abc1234)", e["name"]
+assert e["description"].startswith("TEST BUILD"), e["description"]
+PY
 rm -rf "$TMP"
 
 BEFORE=$(sha256sum doc/ogn-icon.png 2>/dev/null || shasum -a 256 doc/ogn-icon.png)

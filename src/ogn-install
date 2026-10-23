@@ -32,6 +32,74 @@ done
 need_root
 mkdir -p /var/lib/ogn-bootstrap
 
+# The retry timer and a person at the keyboard can both start this.
+exec 9>/run/ogn-install.lock
+flock -w 60 9 || die "another ogn-install is already running"
+
+write_unit() {
+    local name="$1" tmp
+    tmp=$(mktemp)
+    cat > "$tmp"
+    if ! cmp -s "$tmp" "/etc/systemd/system/$name"; then
+        install -m 0644 "$tmp" "/etc/systemd/system/$name"
+        log "updated $name"
+    fi
+    rm -f "$tmp"
+}
+
+# ---------------------------------------------------------------------------
+# 0. Retry a failed first install
+#
+# cloud-init runs this only once, so a first boot without network would leave
+# a dead receiver. The timer reruns it until the "installed" marker exists.
+# Not armed on an installed receiver, so a failed re-run does not loop.
+# ---------------------------------------------------------------------------
+INSTALLED_MARKER="$STATE_DIR/installed"
+FIRST_INSTALL=0
+if [ ! -e "$INSTALLED_MARKER" ]; then
+    FIRST_INSTALL=1
+    install -d -m 0755 /etc/systemd/system
+    write_unit ogn-install-retry.service <<EOF
+[Unit]
+Description=OGN receiver: retry a first install that did not finish
+Documentation=https://github.com/glidernet/ogn-bootstrap
+After=network-online.target cloud-final.service
+Wants=network-online.target
+ConditionPathExists=!$INSTALLED_MARKER
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ogn-install
+TimeoutStartSec=30min
+EOF
+    write_unit ogn-install-retry.timer <<EOF
+[Unit]
+Description=OGN receiver: retry a first install that did not finish
+Documentation=https://github.com/glidernet/ogn-bootstrap
+ConditionPathExists=!$INSTALLED_MARKER
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=15min
+
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl enable ogn-install-retry.timer >/dev/null 2>&1 || true
+fi
+
+install_exit() {
+    local rc=$?
+    conf_cleanup || true
+    # Enabled covers the next boot; started covers this one.
+    if [ "$rc" -ne 0 ] && [ "$FIRST_INSTALL" -eq 1 ] && [ ! -e "$INSTALLED_MARKER" ]; then
+        systemctl start --no-block ogn-install-retry.timer >/dev/null 2>&1 || true
+        printf '%s ogn-bootstrap: install did not finish; retrying every 15 minutes and at every boot (systemctl status ogn-install-retry.timer)\n' "$(date -Is)" >&2
+    fi
+}
+trap install_exit EXIT
+
 # ---------------------------------------------------------------------------
 # 1. Read and sanity-check the configuration
 # ---------------------------------------------------------------------------
@@ -53,7 +121,6 @@ fi
 
 log "reading $BOOT_CONF"
 conf_load "$BOOT_CONF"
-trap conf_cleanup EXIT
 
 OGN_USER=$(detect_ogn_user) || die "could not work out which account to install for; pass OGN_USER_OVERRIDE"
 OGN_HOME=$(user_home "$OGN_USER")
@@ -108,22 +175,30 @@ WINDOW=$(conf_get Install.MaintenanceWindow "")
 # ---------------------------------------------------------------------------
 wifi_apply
 
+# Not fatal: if it never comes, step 4 fails and the retry timer takes over.
+network_wait download.glidernet.org || true
+
 # ---------------------------------------------------------------------------
 # 2. Packages
 #
 # Trixie substitutions worth knowing: libconfig9 -> libconfig11 (and the 0.3.2
 # binaries static-link it anyway), ntp/ntpdate are gone entirely, and the
 # decoder needs libpng16 rather than the libjpeg8 the old guides all mention.
-#
-# procServ and telnet are deliberately absent. The older images ran both
-# binaries inside procServ so you could telnet to ports 50000/50001 and watch
-# the console. Here they are ordinary systemd services, so the same output is
-# in the journal -- which survives, is rotated, and can be read remotely --
-# and there is no console to attach to. `journalctl -u ogn-decode -f`.
+# procserv: see on_procserv.
 # ---------------------------------------------------------------------------
-PACKAGES=(rtl-sdr librtlsdr0 libpng16-16t64 lynx curl ca-certificates unattended-upgrades)
+PACKAGES=(rtl-sdr librtlsdr0 libpng16-16t64 lynx curl ca-certificates unattended-upgrades procserv)
 [ "$READONLY_FS" -eq 1 ] && PACKAGES+=(overlayroot)
 conf_bool Install.RemoteAdmin.OGNTeam && PACKAGES+=(autossh)
+# Network.WireGuard is not in the Install section, so switching it on later
+# never comes back through here. The image ships wireguard-tools for exactly
+# that reason; this line is for a Pi being set up by hand.
+conf_bool Network.WireGuard.Enable && PACKAGES+=(wireguard-tools)
+# Same reasoning for ADS-B: the ADSB section is outside Install, so switching
+# it on later never comes back through here. The image ships both already.
+conf_bool ADSB.Enable && PACKAGES+=(readsb)
+# python3-pyasyncore: mlat-client-adsbfi imports asyncore, which left the
+# standard library in Python 3.12, and the package does not depend on it.
+conf_bool ADSB.Feed.MLAT && PACKAGES+=(mlat-client-adsbfi python3-pyasyncore)
 apt_install "${PACKAGES[@]}"
 
 # ---------------------------------------------------------------------------
@@ -166,8 +241,10 @@ conf_load "$BOOT_CONF"
 # ---------------------------------------------------------------------------
 # 5. Place the configuration
 #
-# Copied, not regenerated: what was edited on the card is what runs. One value
-# is ever rewritten, and only when the operator left it for us.
+# Copied, not regenerated: what was edited on the card is what runs. Two lines
+# are ever rewritten: the receiver name, when the operator left it for us, and
+# the WireGuard private key, which is blanked because this copy is readable by
+# anyone with an account on the Pi.
 # ---------------------------------------------------------------------------
 TARGET_CONF="$REAL_DIR/MyReceiver.conf"
 log "writing $TARGET_CONF"
@@ -176,6 +253,9 @@ install -o "$OGN_USER" -g "$OGN_GROUP" -m 0644 "$BOOT_CONF" "$TARGET_CONF"
 if [ "$CALL_SOURCE" = "hostname" ]; then
     sed -i "s|^\( *Call *= *\)\"\"|\1\"$CALL\"|" "$TARGET_CONF"
 fi
+
+# The decoder's copy is world-readable and has no use for a VPN key.
+conf_redact_secrets "$TARGET_CONF"
 
 # The geoid grid lets the decoder convert between ellipsoid and sea-level
 # heights properly, which is why GeoidSepar is deliberately absent from the
@@ -191,15 +271,13 @@ fi
 # ---------------------------------------------------------------------------
 install -d -m 0755 /etc/systemd/system
 
-write_unit() {
-    local name="$1" tmp
-    tmp=$(mktemp)
-    cat > "$tmp"
-    if ! cmp -s "$tmp" "/etc/systemd/system/$name"; then
-        install -m 0644 "$tmp" "/etc/systemd/system/$name"
-        log "updated $name"
-    fi
-    rm -f "$tmp"
+# on_procserv <port> <name> <command...> — ExecStart running it under procServ.
+# ogn-rf segfaults without a terminal on stdin; procServ provides one, plus the
+# console on localhost:<port>. Logs go to the journal; --oneshot leaves
+# restarts to systemd. Never add --allow: it opens the console to the network.
+on_procserv() {
+    local port="$1" name="$2"; shift 2
+    printf '/usr/bin/procServ --foreground --logfile=- --oneshot --name=%s %s %s' "$name" "$port" "$*"
 }
 
 write_unit ogn-rf.service <<EOF
@@ -214,7 +292,7 @@ Wants=time-sync.target
 Type=simple
 User=$OGN_USER
 WorkingDirectory=$REAL_DIR
-ExecStart=$REAL_DIR/ogn-rf MyReceiver.conf
+ExecStart=$(on_procserv 50000 ogn-rf "$REAL_DIR/ogn-rf" MyReceiver.conf)
 Restart=always
 RestartSec=10
 StandardOutput=journal
@@ -233,11 +311,17 @@ Wants=time-sync.target
 Type=simple
 User=$OGN_USER
 WorkingDirectory=$REAL_DIR
-ExecStart=$REAL_DIR/ogn-decode MyReceiver.conf
+ExecStart=$(on_procserv 50001 ogn-decode "$REAL_DIR/ogn-decode" MyReceiver.conf)
 Restart=always
 RestartSec=10
 StandardOutput=journal
 StandardError=journal
+# ogn-decode echoes every packet it uplinks, each followed by a blank line.
+# With ADS-B on that is several lines a second, enough to push everything
+# else out of the RAM journal within hours. The procServ console
+# (telnet localhost 50001) still shows them.
+LogFilterPatterns=~^APRS <-
+LogFilterPatterns=~^[[:space:]]*\$
 EOF
 
 # The grouping unit exists so that 'systemctl restart rtlsdr-ogn' does the
@@ -292,6 +376,15 @@ RuntimeWatchdogSec=15
 RebootWatchdogSec=3min
 EOF
 
+# systemd-remount-fs fails on an overlay root ("No changes allowed in
+# reconfigure") and leaves the system "degraded". It has nothing to do there.
+install -d -m 0755 /etc/systemd/system/systemd-remount-fs.service.d
+cat > /etc/systemd/system/systemd-remount-fs.service.d/ogn-overlay.conf <<EOF
+# Skipped under the read-only overlay. Installed by ogn-bootstrap.
+[Unit]
+ConditionKernelCommandLine=!$OVERLAY_PARAM
+EOF
+
 # ---------------------------------------------------------------------------
 # 9. Logs
 #
@@ -306,10 +399,8 @@ EOF
 #   RuntimeMaxUse     capped, because the flip side of a journal in RAM is a
 #                     journal competing with the decoder for RAM.
 #
-# This is also why the services log to the journal rather than running under
-# procServ as the older images did: procServ writes plain files under
-# /var/log, which persist whenever the overlay is off, and it never rotates
-# them.
+# Hence procServ logs to the journal, not the unrotated /var/log files the
+# older images used.
 # ---------------------------------------------------------------------------
 install -d -m 0755 /etc/systemd/journald.conf.d
 cat > /etc/systemd/journald.conf.d/10-ogn.conf <<'EOF'
@@ -334,6 +425,137 @@ fi
 # 10. Optional remote administration — all off unless explicitly enabled
 # ---------------------------------------------------------------------------
 ogn-remote-admin --config "$BOOT_CONF" --user "$OGN_USER"
+
+# ---------------------------------------------------------------------------
+# 10a. WireGuard
+#
+# The units are written and the service enabled whatever the card currently
+# says, and ogn-wireguard does nothing at all while Network.WireGuard.Enable
+# is false. That is deliberate: WireGuard lives in the Network section, which
+# is re-read from the card at every boot and never re-runs this installer, so
+# turning the tunnel on later has to work with nothing but an edit on a
+# laptop. The timer, which is the only part with a running cost, is switched
+# on and off by ogn-wireguard itself to match.
+#
+# After network-online, unlike the wifi: wg-quick has to resolve the server's
+# name before it can configure the peer.
+# ---------------------------------------------------------------------------
+write_unit ogn-wireguard.service <<'EOF'
+[Unit]
+Description=OGN receiver WireGuard tunnel
+Documentation=https://github.com/glidernet/ogn-bootstrap
+After=network-online.target nss-lookup.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ogn-wireguard --apply
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Not RemainAfterExit: the timer re-runs this same service, and a service that
+# stays "active" after a successful run cannot be started again.
+write_unit ogn-wireguard.timer <<'EOF'
+[Unit]
+Description=Keep the OGN WireGuard tunnel up
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=10min
+
+[Install]
+WantedBy=timers.target
+EOF
+systemctl enable ogn-wireguard.service >/dev/null
+
+# ---------------------------------------------------------------------------
+# 10b. ADS-B
+#
+# Written and enabled whatever the card says, for the same reason as the
+# WireGuard units above: ADSB lives outside the Install section, so it is
+# re-read at every boot and never re-runs this installer. ogn-adsb does
+# nothing while ADSB.Enable is false, and switches its own timer on and off
+# to match.
+#
+# Deliberately NOT PartOf=rtlsdr-ogn.service. ogn-calibrate stops that group
+# to take the OGN stick for a GSM scan, and ADS-B is on the other stick and
+# has no business going down with it.
+# ---------------------------------------------------------------------------
+write_unit ogn-adsb.service <<'EOF'
+[Unit]
+Description=OGN receiver ADS-B
+Documentation=https://github.com/glidernet/ogn-bootstrap
+After=network-online.target nss-lookup.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ogn-adsb --apply
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Not RemainAfterExit, as above: the timer re-runs this same service.
+write_unit ogn-adsb.timer <<'EOF'
+[Unit]
+Description=Keep ADS-B reception and its feeds up
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=10min
+
+[Install]
+WantedBy=timers.target
+EOF
+
+# One instance per tracking site that multilateration is switched on for.
+# The environment comes from /run, which is where it belongs: it is a
+# rendering of the card, and the root filesystem is RAM under the overlay.
+# Debian's mlat-client-adsbfi names its program after the package, not
+# mlat-client. Its own LSB service stays idle: START_CLIENT defaults to no.
+write_unit ogn-mlat@.service <<'EOF'
+[Unit]
+Description=OGN receiver ADS-B multilateration: %i
+Documentation=https://github.com/glidernet/ogn-bootstrap
+After=readsb.service network-online.target
+Wants=network-online.target
+BindsTo=readsb.service
+
+[Service]
+Type=simple
+EnvironmentFile=/run/ogn-bootstrap/mlat/%i.env
+ExecStart=/usr/bin/mlat-client-adsbfi --input-type beast --input-connect ${MLAT_INPUT} \
+    --server ${MLAT_SERVER} --user ${MLAT_CALL} \
+    --lat ${MLAT_LAT} --lon ${MLAT_LON} --alt ${MLAT_ALT} \
+    --results ${MLAT_RESULTS}
+Restart=always
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+EOF
+
+# readsb's statistics page. Static, like ogn-mlat@: adsb_apply starts it, and
+# BindsTo takes it down whenever readsb goes. A dynamic user that can read
+# /run/readsb and nothing it could write to, on a port above 1024.
+write_unit ogn-adsb-web.service <<EOF
+[Unit]
+Description=OGN receiver ADS-B statistics page
+Documentation=https://github.com/glidernet/ogn-bootstrap
+After=readsb.service
+BindsTo=readsb.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -I $LIBDIR/adsb-stats.py --port $ADSB_WEB_PORT --dir $ADSB_JSON_DIR
+DynamicUser=yes
+NoNewPrivileges=yes
+Restart=always
+RestartSec=15
+EOF
+systemctl enable ogn-adsb.service >/dev/null
 
 # ---------------------------------------------------------------------------
 # 11. Unattended security updates, and the maintenance timer
@@ -422,10 +644,26 @@ systemctl enable ogn-boot-check.service >/dev/null
 
 systemctl daemon-reload
 
+# Now that the units exist, put the tunnel up (or take it down) to match the
+# card. Never fatal: a receiver that cannot reach a VPN server is still a
+# receiver, and the journal says why.
+ogn-wireguard --config "$BOOT_CONF" --apply || warn "the WireGuard tunnel is not up; see journalctl -u ogn-wireguard"
+
+# Same again for ADS-B. Never fatal: a receiver that cannot decode ADS-B is
+# still doing the job it was put on the airfield to do.
+ogn-adsb --config "$BOOT_CONF" --apply || warn "ADS-B is not running; see journalctl -u ogn-adsb"
+
 # ---------------------------------------------------------------------------
 # 12. Start it, or explain why not
 # ---------------------------------------------------------------------------
 VERSION=$(basename "$REAL_DIR")
+
+# The decoder's page is always HTTP.Port + 1 and not separately configurable.
+PORT=$(conf_get HTTP.Port 8080)
+case "$PORT" in
+    ''|*[!0-9]*) warn "HTTP.Port '$PORT' is not a number; assuming 8080"; PORT=8080 ;;
+esac
+
 if [ "$POSITION_OK" -eq 1 ]; then
     systemctl enable rtlsdr-ogn.service >/dev/null
     systemctl restart rtlsdr-ogn.service
@@ -433,7 +671,8 @@ if [ "$POSITION_OK" -eq 1 ]; then
     motd_set <<EOF
 
   OGN receiver $CALL — $VERSION
-  Status page:  http://$(hostname -s).local:$(conf_get HTTP.Port 8080)/
+  RF page:      http://$(hostname -s).local:$PORT/
+  Decoder page: http://$(hostname -s).local:$((PORT + 1))/
   Service:      systemctl status rtlsdr-ogn
   Logs:         journalctl -u ogn-decode -f
   Settings:     $TARGET_CONF
@@ -461,29 +700,95 @@ EOF
 fi
 
 # ---------------------------------------------------------------------------
-# 13. Read-only root, last of all
+# 13. The boot partition, and read-only root, last of all
 # ---------------------------------------------------------------------------
-if [ "$READONLY_FS" -eq 1 ]; then
-    # The boot partition is FAT, and FAT is what corrupts on an unclean power
-    # cycle. raspi-config refuses to change this once the overlay is active,
-    # so it has to happen first.
-    if ! grep -qE '^[^#]*/boot/firmware.*\bro\b' /etc/fstab; then
-        log "mounting the boot partition read-only"
-        raspi-config nonint do_bootro 0 || warn "could not set the boot partition read-only"
+# Two mount options on /boot/firmware, for two different reasons:
+#
+#   ro            FAT is what corrupts on an unclean power cycle, so the
+#                 partition is opened only for the moment it takes to write.
+#                 Tied to ReadOnlyFS, since it is the same argument.
+#   umask=0077    everything on that partition is readable by every account on
+#                 the Pi otherwise -- including the wifi password Imager wrote
+#                 there, a WireGuard private key, and a Connect auth key.
+#                 Nothing but root has any business reading it, so this is set
+#                 whatever else was asked for.
+#
+# The umask takes effect at the NEXT boot and not before: vfat re-reads only
+# the ro flag on a remount, so the live mount keeps the permissions it was
+# mounted with. The ro option is the same, which is why boot_rw/boot_ro drive
+# the live mount directly rather than relying on this.
+#
+# Must run before the overlay goes on: /etc/fstab is on the root filesystem,
+# so an edit made with the overlay active is discarded.
+#
+# boot_partition_options <option...> — ensure each is on the /boot/firmware
+# line in /etc/fstab. An option already present, with any value, is left alone:
+# it was somebody's deliberate choice and this is not the place to overrule it.
+boot_partition_options() {
+    local tmp rc=0
+    if ! grep -qE '^[^#][^[:space:]]*[[:space:]]+/boot/firmware[[:space:]]' /etc/fstab; then
+        warn "no /boot/firmware line in /etc/fstab; leaving the boot partition alone"
+        return 0
     fi
+    tmp=$(mktemp)
+    LC_ALL=C awk -v want="$*" '
+        $1 !~ /^#/ && $2 == "/boot/firmware" {
+            n = split(want, opt, " ")
+            for (i = 1; i <= n; i++) {
+                name = opt[i]; sub(/=.*/, "", name)
+                if ($4 !~ "(^|,)" name "(=|,|$)") { $4 = $4 "," opt[i]; changed = 1 }
+            }
+        }
+        { print }
+        END { exit(changed ? 0 : 1) }
+    ' /etc/fstab > "$tmp" || rc=$?
+    if [ "$rc" -eq 0 ]; then
+        install -m 0644 "$tmp" /etc/fstab
+        log "boot partition options in /etc/fstab: $* (from the next boot)"
+    fi
+    rm -f "$tmp"
+    return 0
+}
 
+BOOT_OPTS=(umask=0077)
+[ "$READONLY_FS" -eq 1 ] && BOOT_OPTS+=(ro)
+boot_partition_options "${BOOT_OPTS[@]}"
+grep -qE '^[^#][^[:space:]]*[[:space:]]+/boot/firmware[[:space:]].*umask=0077' /etc/fstab \
+    || warn "/etc/fstab sets its own umask on /boot/firmware, so the wifi password and any
+     WireGuard key on the card stay readable by every account on this Pi"
+
+ARM_OVERLAY=0
+if [ "$READONLY_FS" -eq 1 ]; then
     if ogn-maintenance --overlay-status | grep -q '^enabled'; then
         log "read-only overlay already enabled"
+    elif [ "$REBOOT_WHEN_DONE" -eq 1 ]; then
+        # Armed by the first reboot itself, once nothing still needs the root
+        # writable -- so a power cut while it waits comes back writable, and
+        # still waiting, rather than read-only with the waiting forgotten.
+        # Checked now all the same, so a missing piece fails the install,
+        # and is retried, rather than surfacing as a writable receiver later.
+        overlay_ensure_initramfs && overlay_preflight \
+            || die "the read-only overlay could not be prepared"
+        log "the read-only overlay is enabled at the reboot"
+        ARM_OVERLAY=1
     else
         log "enabling the read-only overlay (takes effect at the next reboot)"
         ogn-maintenance --overlay-enable
-        if [ "$REBOOT_WHEN_DONE" -eq 0 ]; then
-            warn "the read-only overlay is armed but will not be active until you reboot"
-        fi
+        warn "the read-only overlay is armed but will not be active until you reboot"
     fi
 fi
 
-date -Is | boot_write "$STATE_DIR/installed"
+# After step 13, so both reflect the overlay decision. Refreshed at every boot
+# thereafter by ogn-config-sync.
+overlay_motd_update
+overlay_state_publish
+
+date -Is | boot_write "$INSTALLED_MARKER"
+
+if [ "$FIRST_INSTALL" -eq 1 ]; then
+    systemctl disable ogn-install-retry.timer >/dev/null 2>&1 || true
+    systemctl stop --no-block ogn-install-retry.timer >/dev/null 2>&1 || true
+fi
 
 # What the card said when we last acted on it: ogn-config-sync watches the
 # first, ogn-boot-check the second. Written last, so a failed install does not
@@ -494,6 +799,55 @@ conf_digest Install | boot_write "$INSTALL_APPLIED"
 log "setup complete"
 
 if [ "$REBOOT_WHEN_DONE" -eq 1 ]; then
-    log "rebooting"
-    systemctl reboot
+    # On first boot this runs as cloud-init's scripts_vendor, and Imager's own
+    # settings -- Raspberry Pi Connect, passwordless sudo, SSH -- are runcmd,
+    # which runs in scripts_user, after it. Rebooting from here cut them off,
+    # so they ran instead on the next boot, under the overlay: in RAM, and
+    # again at every boot after, re-presenting a single-use Connect key that
+    # had already been spent.
+    #
+    # So the reboot is handed to a timer, which waits for cloud-init to finish
+    # and for Connect to sign in -- for as long as the network takes, up to
+    # the key's six-hour life -- and only then arms the overlay and reboots.
+    # A unit on disk rather than a transient one, so that it survives a power
+    # cut while it waits.
+    install -d -m 0755 "$FIRST_REBOOT_DIR"
+    if [ "$ARM_OVERLAY" -eq 1 ]; then
+        printf 'overlay\n' > "$FIRST_REBOOT_PENDING"
+    else
+        printf 'reboot\n' > "$FIRST_REBOOT_PENDING"
+    fi
+    write_unit ogn-first-reboot.service <<EOF
+[Unit]
+Description=OGN receiver: the reboot that finishes setup
+Documentation=https://github.com/glidernet/ogn-bootstrap
+After=cloud-final.service
+ConditionPathExists=$FIRST_REBOOT_PENDING
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ogn-maintenance --first-reboot
+EOF
+    write_unit ogn-first-reboot.timer <<EOF
+[Unit]
+Description=OGN receiver: reboot to finish setup, once nothing needs a writable root
+Documentation=https://github.com/glidernet/ogn-bootstrap
+ConditionPathExists=$FIRST_REBOOT_PENDING
+
+[Timer]
+OnBootSec=1min
+OnUnitInactiveSec=1min
+
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl enable ogn-first-reboot.timer >/dev/null 2>&1 || true
+    if cloud_init_running; then
+        log "rebooting once cloud-init has finished and Raspberry Pi Connect, if set up, has signed in"
+    else
+        # Run by hand: usually nothing to wait for, so this reboots now.
+        ogn-maintenance --first-reboot
+    fi
+    systemctl start --no-block ogn-first-reboot.timer >/dev/null 2>&1 || true
 fi

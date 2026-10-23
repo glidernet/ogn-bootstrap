@@ -5,6 +5,7 @@
 # The result is Raspberry Pi OS Lite (64-bit) plus:
 #
 #   * the Debian packages the receiver needs, already installed
+#   * readsb, built from upstream source with RTL-SDR support (see below)
 #   * the ogn-bootstrap scripts, already in /usr/local
 #   * MyReceiver.conf and the first-boot installer on the boot partition
 #
@@ -43,11 +44,27 @@ BASE_NAME="${BASE_NAME:-Raspberry Pi OS Lite (64-bit)}"
 GROW_MB="${GROW_MB:-512}"
 
 OUT_DIR="${OUT_DIR:-$REPO_ROOT/dist}"
+
+# Which versions.json the image trusts: the workflow passes the branch.
+MANIFEST_REPO="${OGN_MANIFEST_REPO:-glidernet/ogn-bootstrap}"
+MANIFEST_REF="${OGN_MANIFEST_REF:-master}"
 WORK_DIR="${WORK_DIR:-$REPO_ROOT/.build}"
 
-# Mirrors the PACKAGES list in src/ogn-install, including both optional ones.
+# Mirrors the PACKAGES list in src/ogn-install, including the optional ones.
 # ogn-install re-runs apt_install on first boot; because that is idempotent,
 # anything already here makes first boot a no-op instead of a download.
+#
+# wireguard-tools is here for a stronger reason than saving a download:
+# Network.WireGuard is read from the card at every boot and never re-runs the
+# installer, so a tunnel switched on later has to work with no network and no
+# apt. The kernel side is a module in the stock Raspberry Pi OS kernel.
+#
+# mlat-client-adsbfi is here for exactly the same reason: ADSB is outside the
+# Install section, so a second dongle added to a receiver in a field has to
+# come up from an edit on the card alone. It is a stock Debian package --
+# nothing here adds an apt source. python3-pyasyncore goes with it: the client
+# imports asyncore, gone from the standard library since Python 3.12, and the
+# package does not depend on it.
 PACKAGES=(
     rtl-sdr
     librtlsdr0
@@ -58,6 +75,34 @@ PACKAGES=(
     unattended-upgrades
     overlayroot
     autossh
+    wireguard-tools
+    mlat-client-adsbfi
+    python3-pyasyncore
+    procserv
+)
+
+# readsb is the one thing NOT taken from the archive. Debian's package is built
+# without RTL-SDR support -- `--device-type` offers only modesbeast, gnshulc,
+# ifile and none -- so it cannot open the ordinary dongles ADSB is written for.
+# It is built here instead, from upstream's own debian/ packaging with the
+# rtlsdr build profile, at a tag pinned to a commit so that a moved tag stops
+# the build rather than changing what ships.
+READSB_REPO="${READSB_REPO:-https://github.com/wiedehopf/readsb.git}"
+READSB_TAG="${READSB_TAG:-v3.16.17}"
+READSB_COMMIT="${READSB_COMMIT:-094720939c01943de82b14df6f42f67fff1cd514}"
+
+# The Build-Depends of that packaging for the rtlsdr profile. Installed for the
+# build and purged straight after, so none of it is left in the image.
+READSB_BUILD_DEPS=(
+    build-essential
+    debhelper
+    pkg-config
+    help2man
+    libncurses-dev
+    zlib1g-dev
+    libzstd-dev
+    libusb-1.0-0-dev
+    librtlsdr-dev
 )
 
 log()  { printf '\n=== %s\n' "$*"; }
@@ -76,7 +121,7 @@ require_linux_root() {
     [ "$(id -u)" -eq 0 ] || die "must run as root (loop devices and chroot)"
 
     local missing=() t
-    for t in curl python3 xz parted losetup mount chroot resize2fs e2fsck sha256sum; do
+    for t in curl git python3 xz parted losetup mount chroot resize2fs e2fsck sha256sum; do
         command -v "$t" >/dev/null 2>&1 || missing+=("$t")
     done
     [ ${#missing[@]} -eq 0 ] || die "missing tools: ${missing[*]}"
@@ -153,6 +198,20 @@ fetch_base() {
        expected $BASE_SHA
        got      $got"
     printf 'ok: %s (%s)\n' "$(basename "$BASE_IMG")" "$BASE_DATE"
+}
+
+# Fetched on the host, where git is, and only copied into the chroot later.
+fetch_readsb() {
+    READSB_SRC="$WORK_DIR/readsb"
+    log "fetching readsb $READSB_TAG"
+    rm -rf "$READSB_SRC"
+    git clone -q --depth 1 --branch "$READSB_TAG" "$READSB_REPO" "$READSB_SRC"
+    local got
+    got=$(git -C "$READSB_SRC" rev-parse HEAD)
+    [ "$got" = "$READSB_COMMIT" ] || die "readsb $READSB_TAG is not the pinned commit
+       expected $READSB_COMMIT
+       got      $got"
+    printf 'ok: readsb %s (%s)\n' "$READSB_TAG" "$got"
 }
 
 # ---------------------------------------------------------------------------
@@ -236,15 +295,94 @@ install_packages() {
     chroot "$MNT" apt-get clean
 }
 
+# Installed packages, one per line, sorted for comm.
+installed_packages() {
+    chroot "$MNT" dpkg-query -W -f='${db:Status-Abbrev} ${binary:Package}\n' \
+        | awk '$1 == "ii" { print $2 }' | sort
+}
+
+# Runs after install_packages, so the apt lists are there for the build
+# dependencies and for readsb's own runtime ones. If anything above pulled in
+# Debian's readsb, the newer upstream version simply replaces it.
+build_readsb() {
+    log "building readsb $READSB_TAG with RTL-SDR support"
+    local before added deb
+    local build="$MNT/usr/src/readsb-build"
+    local apt=(env DEBIAN_FRONTEND=noninteractive apt-get -y -qq
+               -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+
+    before=$(installed_packages)
+    chroot "$MNT" "${apt[@]}" install --no-install-recommends "${READSB_BUILD_DEPS[@]}"
+
+    rm -rf "$build"
+    mkdir -p "$build"
+    git -C "$READSB_SRC" archive --prefix=readsb/ HEAD | tar -x -C "$build"
+    chroot "$MNT" sh -c 'cd /usr/src/readsb-build/readsb &&
+        DEB_BUILD_OPTIONS="noddebs nocheck" dpkg-buildpackage -b -uc -us -Prtlsdr'
+
+    added=$(comm -13 <(printf '%s\n' "$before") <(installed_packages))
+    if [ -n "$added" ]; then
+        # shellcheck disable=SC2086
+        chroot "$MNT" "${apt[@]}" purge $added
+    fi
+
+    deb=$(ls "$build"/readsb_*.deb)
+    chroot "$MNT" "${apt[@]}" install --no-install-recommends "${deb#"$MNT"}"
+    chroot "$MNT" apt-get clean
+
+    # Held, so that apt never "upgrades" it to an archive build that cannot
+    # open the stick.
+    chroot "$MNT" apt-mark hold readsb >/dev/null
+
+    # The package enables readsb, and policy-rc.d only stops it starting now.
+    # Left enabled it would start at every boot on the package's stock
+    # /etc/default/readsb and crash-loop on a receiver with ADS-B off.
+    # adsb_apply enables it once ADSB.Enable asks for it.
+    chroot "$MNT" systemctl disable readsb.service >/dev/null 2>&1 || true
+
+    # Upstream's unit hardcodes --write-json /run/readsb. Stripped here so that
+    # it comes only from JSON_OPTIONS, which adsb_render sets for the
+    # statistics page; a receiver with ADS-B off writes nothing at all.
+    install -d -m 0755 "$MNT/etc/systemd/system/readsb.service.d"
+    cat > "$MNT/etc/systemd/system/readsb.service.d/ogn-bootstrap.conf" <<'EOF'
+# Written by tools/build-image.sh: --write-json comes from JSON_OPTIONS in
+# /etc/default/readsb, which ogn-adsb renders from the card.
+[Service]
+ExecStart=
+ExecStart=/usr/bin/readsb --quiet $RECEIVER_OPTIONS $DECODER_OPTIONS $NET_OPTIONS $JSON_OPTIONS
+EOF
+
+    # GPL-3.0: the corresponding source travels with the binary.
+    install -d -m 0755 "$MNT/usr/share/doc/readsb"
+    git -C "$READSB_SRC" archive --format=tar.gz --prefix="readsb-$READSB_TAG/" HEAD \
+        > "$MNT/usr/share/doc/readsb/readsb-$READSB_TAG.tar.gz"
+
+    rm -rf "$build"
+
+    # The section only exists in a build with ENABLE_RTLSDR. Captured rather
+    # than piped, as --help need not exit 0.
+    local help
+    help=$(chroot "$MNT" readsb --help 2>&1 || true)
+    case "$help" in
+        *"RTL-SDR options:"*) ;;
+        *) die "the readsb just built has no RTL-SDR support" ;;
+    esac
+}
+
 install_scripts() {
     log "installing the ogn-bootstrap scripts"
     install -d -m 0755 "$MNT/usr/local/lib/ogn-bootstrap" "$MNT/usr/local/sbin"
-    install -m 0644 src/ogn-common.sh "$MNT/usr/local/lib/ogn-bootstrap/"
+    install -m 0644 src/ogn-common.sh src/adsb-stats.py "$MNT/usr/local/lib/ogn-bootstrap/"
     local f
     for f in src/ogn-install src/ogn-update src/ogn-maintenance \
-             src/ogn-remote-admin src/ogn-calibrate; do
+             src/ogn-remote-admin src/ogn-calibrate src/ogn-overlay \
+             src/ogn-wireguard src/ogn-adsb; do
         install -m 0755 "$f" "$MNT/usr/local/sbin/"
     done
+
+    # `overlay` is the name the documentation uses and the one anyone logging
+    # in to do a piece of maintenance will actually type.
+    ln -sfn ogn-overlay "$MNT/usr/local/sbin/overlay"
 
     # A snapshot of the release manifest, so a receiver on a slow or blocked
     # link still has something to resolve UpdateChannel against. ogn-update
@@ -267,6 +405,7 @@ OGN_IMAGE_DATE=$BUILD_DATE
 OGN_BASE_IMAGE=$(basename "$BASE_IMG")
 OGN_BASE_DATE=$BASE_DATE
 OGN_BASE_SHA256=$BASE_SHA
+OGN_MANIFEST_URL=https://raw.githubusercontent.com/$MANIFEST_REPO/$MANIFEST_REF/versions.json
 EOF
     chmod 0644 "$MNT/etc/ogn-bootstrap-image"
 }
@@ -277,7 +416,15 @@ tidy() {
     rm -f  "$MNT/var/cache/apt/archives/"*.deb
     find "$MNT/var/log" -type f -exec truncate -s 0 {} + 2>/dev/null || true
     rm -f "$MNT/root/.bash_history" "$MNT/etc/machine-id"
-    : > "$MNT/etc/machine-id"          # regenerated on first boot
+
+    # "uninitialized", exactly as pi-gen leaves it, and NOT an empty file.
+    # systemd treats an empty machine-id as "not the first boot", so every
+    # ConditionFirstBoot=yes unit is skipped -- including Raspberry Pi's
+    # regenerate_ssh_host_keys.service. pi-gen ships no host keys, so sshd
+    # then has none and refuses every connection.
+    echo "uninitialized" > "$MNT/etc/machine-id"
+    [ -z "$(ls "$MNT/etc/ssh/"ssh_host_*_key 2>/dev/null)" ] \
+        || die "/etc/ssh has host keys in it — every card would share them"
 
     # cloud-init must still think it has never run. If this is not empty the
     # image was booted somewhere it should not have been.
@@ -338,6 +485,7 @@ main() {
 
     resolve_base
     fetch_base
+    fetch_readsb
 
     IMG="$WORK_DIR/ogn-receiver-$BUILD_DATE-arm64.img"
     OUT_IMG_XZ="$OUT_DIR/ogn-receiver-$BUILD_DATE-arm64.img.xz"
@@ -348,6 +496,7 @@ main() {
     grow_and_mount
     prepare_chroot
     install_packages
+    build_readsb
     install_scripts
     install_boot_files
     stamp_image

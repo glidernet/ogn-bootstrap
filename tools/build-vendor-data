@@ -13,8 +13,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 OUT=boot/vendor-data
-LIB_FILES=(src/ogn-common.sh)
-BIN_FILES=(src/ogn-install src/ogn-update src/ogn-maintenance src/ogn-remote-admin src/ogn-calibrate)
+LIB_FILES=(src/ogn-common.sh src/adsb-stats.py)
+BIN_FILES=(src/ogn-install src/ogn-update src/ogn-maintenance src/ogn-remote-admin src/ogn-calibrate src/ogn-overlay src/ogn-wireguard src/ogn-adsb)
 
 emit_file() {
     local src="$1" dest="$2" mode="$3" marker
@@ -48,6 +48,10 @@ cat <<'HEADER'
 # It does NOT enable any remote access unless you asked for it in
 # MyReceiver.conf. Everything under Install.RemoteAdmin is off by default.
 #
+# It does NOT send what this receiver hears to anyone except OGN. ADS-B
+# reception is off until you switch it on, and the tracking sites under
+# ADSB.Feed are each off until you pick them.
+#
 # Nothing here needs editing. Your settings all live in MyReceiver.conf,
 # next to this file.
 #
@@ -71,6 +75,14 @@ done
 for f in "${BIN_FILES[@]}"; do
     emit_file "$f" "/usr/local/sbin/$(basename "$f")" 0755
 done
+
+cat <<'SYMLINK'
+# `overlay` is the name the documentation uses, and the one anyone logging in
+# to do a piece of maintenance will actually type. ogn-overlay is the script;
+# this is the name that is memorable at 2am on an airfield.
+ln -sfn ogn-overlay /usr/local/sbin/overlay
+
+SYMLINK
 
 cat <<'FOOTER'
 # Hand over to the installer. Its output goes to the cloud-init log, which is

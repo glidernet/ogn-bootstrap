@@ -49,6 +49,11 @@ if [ -z "$CHANNEL" ]; then
         CHANNEL=$(conf_get Install.UpdateChannel stable)
     else
         CHANNEL=stable
+        # The boot partition is mounted root-only, so this is the ordinary case
+        # for a --check run by hand. Say which channel is being assumed rather
+        # than reporting against one the card may not have asked for.
+        [ "$(id -u)" -eq 0 ] \
+            || warn "cannot read $BOOT_CONF as this user; reporting against the '$CHANNEL' channel"
     fi
 fi
 

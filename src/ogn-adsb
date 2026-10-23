@@ -1,0 +1,135 @@
+#!/bin/bash
+#
+# ogn-adsb — bring ADS-B reception up, down, or into step with whatever the
+# card now says.
+#
+#   sudo ogn-adsb              apply ADSB from the card
+#   sudo ogn-adsb status       is readsb running, and is it hearing aircraft
+#   sudo ogn-adsb down         switch it off until the next boot
+#   sudo ogn-adsb --config X   use a different config file
+#
+# Run at every boot by ogn-adsb.service, and every 10 minutes after that by
+# ogn-adsb.timer — which is what puts a feed back when a tracking site moves
+# to a new address, or when the ADS-B stick is unplugged and returned.
+#
+# Copyright (c) 2026 ifly7charlie. MIT licence, see LICENSE.
+
+set -euo pipefail
+
+LIBDIR="${OGN_LIBDIR:-/usr/local/lib/ogn-bootstrap}"
+# shellcheck source=src/ogn-common.sh
+. "$LIBDIR/ogn-common.sh"
+
+ACTION=apply
+while [ $# -gt 0 ]; do
+    case "$1" in
+        apply|--apply)   ACTION=apply ;;
+        down|--down)     ACTION=down ;;
+        status|--status) ACTION=status ;;
+        --config)        BOOT_CONF="$2"; shift ;;
+        -h|--help)       sed -n '3,15p' "$0"; exit 0 ;;
+        *)               die "unknown argument: $1  (try: ogn-adsb status)" ;;
+    esac
+    shift
+done
+
+need_root
+
+# --------------------------------------------------------------------------
+# status
+# --------------------------------------------------------------------------
+
+# Is anything actually arriving on the AVR port? A listening socket says only
+# that readsb started, which is also what a receiver with the aerial off the
+# back of the stick looks like. /dev/tcp rather than nc, which this image does
+# not ship.
+adsb_frames_seen() {
+    local n=0 line
+    exec 3<>"/dev/tcp/127.0.0.1/$ADSB_AVR_PORT" 2>/dev/null || return 1
+    while [ "$n" -lt 3 ] && read -r -t 8 line <&3; do
+        [ -n "$line" ] && n=$((n + 1))
+    done
+    exec 3<&- 2>/dev/null || true
+    [ "$n" -gt 0 ]
+}
+
+if [ "$ACTION" = status ]; then
+    conf_load "$BOOT_CONF"
+    trap conf_cleanup EXIT
+    if ! conf_bool ADSB.Enable false; then
+        printf 'ADS-B is switched off in %s.\n' "$BOOT_CONF"
+        systemctl is-active --quiet readsb 2>/dev/null \
+            && printf 'readsb is still running; it goes at the next boot.\n'
+        exit 0
+    fi
+
+    printf 'configured:  stick %s, gain %s\n' \
+        "$(conf_get ADSB.DeviceSerial '<unset>')" "$(conf_get ADSB.Gain -10)"
+    printf 'sharing:     %s\n' "$(adsb_feed_summary)"
+
+    if ! systemctl is-active --quiet readsb 2>/dev/null; then
+        printf 'readsb:      STOPPED\n\n'
+        printf 'Start it with:  sudo ogn-adsb\n'
+        printf 'Why it is not: journalctl -u readsb\n'
+        exit 1
+    fi
+    printf 'readsb:      running\n'
+
+    # The distinction worth drawing: running, versus running and hearing
+    # something. Nothing else on this page separates the two.
+    if adsb_frames_seen; then
+        printf 'aircraft:    frames arriving on %s\n' "$ADSB_AVR_PORT"
+    else
+        printf 'aircraft:    NOTHING on %s in 8s\n\n' "$ADSB_AVR_PORT"
+        printf 'readsb is up but decoding nothing. Check the aerial is on the\n'
+        printf '1090 stick, that it is a 1090 aerial, and that ADSB.DeviceSerial\n'
+        printf '(%s) is the right stick:  rtl_test\n' "$(conf_get ADSB.DeviceSerial '<unset>')"
+        exit 1
+    fi
+
+    if conf_bool ADSB.Feed.MLAT false; then
+        printf '\n'
+        for f in $(adsb_enabled_feeds); do
+            inst=$(adsb_feed_instance "$f")
+            if systemctl is-active --quiet "ogn-mlat@$inst.service" 2>/dev/null; then
+                printf 'mlat:        %-14s running\n' "$f"
+            else
+                printf 'mlat:        %-14s STOPPED  (journalctl -u ogn-mlat@%s)\n' "$f" "$inst"
+            fi
+        done
+    fi
+    exit 0
+fi
+
+# --------------------------------------------------------------------------
+# down — by hand, for the length of this boot
+# --------------------------------------------------------------------------
+if [ "$ACTION" = down ]; then
+    conf_load "$BOOT_CONF"
+    trap conf_cleanup EXIT
+    adsb_down
+    conf_bool ADSB.Enable false \
+        && log "still enabled on the card, so it comes back at the next boot"
+    exit 0
+fi
+
+# --------------------------------------------------------------------------
+# apply
+# --------------------------------------------------------------------------
+[ -r "$BOOT_CONF" ] || { log "no $BOOT_CONF on the card; nothing to do"; exit 0; }
+conf_load "$BOOT_CONF"
+trap conf_cleanup EXIT
+
+# The timer is the repair loop, and it is worth having only on a receiver that
+# is actually decoding ADS-B. Enabling it from here rather than from the
+# installer is what lets ADS-B be switched on by editing the card alone, with
+# no re-install and no network.
+if conf_bool ADSB.Enable false; then
+    systemctl is-enabled --quiet ogn-adsb.timer 2>/dev/null \
+        || systemctl enable --now ogn-adsb.timer >/dev/null 2>&1 || true
+else
+    systemctl is-enabled --quiet ogn-adsb.timer 2>/dev/null \
+        && systemctl disable --now ogn-adsb.timer >/dev/null 2>&1 || true
+fi
+
+adsb_apply
