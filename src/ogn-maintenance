@@ -170,6 +170,14 @@ config_sync() {
 
     # An edited card is unreviewed input arriving unattended. Same checks the
     # installer applies, so a typo cannot take a working receiver off the air.
+    # A brace left out is the one the flattener cannot see and the decoder
+    # cannot get past.
+    local syntax
+    if ! syntax=$(conf_syntax_check "$BOOT_CONF"); then
+        warn "the MyReceiver.conf on the card has a mistake at $syntax"
+        warn "keeping the settings that are already installed"
+        return 0
+    fi
     call=$(conf_get APRS.Call "")
     [ -n "$call" ] || call=$(hostname -s)
     if ! printf '%s' "$call" | grep -Eq '^[A-Za-z0-9]{1,9}$'; then

@@ -642,6 +642,33 @@ WantedBy=multi-user.target
 EOF
 systemctl enable ogn-boot-check.service >/dev/null
 
+# Look for the common problems once the receiver has had time to start, and
+# put what was found on the console. Once per boot: nearly everything it finds
+# is fixed by editing the card and rebooting, and `sudo ogn-check` re-runs it.
+# Not tied to the network, unlike ogn-boot-check: a receiver that cannot get
+# online is one of the things worth explaining.
+write_unit ogn-check.service <<'EOF'
+[Unit]
+Description=OGN receiver sanity check (SDR sticks, config, downloads)
+Documentation=https://github.com/glidernet/ogn-bootstrap
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ogn-check
+EOF
+write_unit ogn-check.timer <<'EOF'
+[Unit]
+Description=OGN receiver sanity check, once the receiver has had time to start
+Documentation=https://github.com/glidernet/ogn-bootstrap
+
+[Timer]
+OnBootSec=2min
+
+[Install]
+WantedBy=timers.target
+EOF
+systemctl enable ogn-check.timer >/dev/null
+
 systemctl daemon-reload
 
 # Now that the units exist, put the tunnel up (or take it down) to match the
@@ -777,6 +804,36 @@ if [ "$READONLY_FS" -eq 1 ]; then
         warn "the read-only overlay is armed but will not be active until you reboot"
     fi
 fi
+
+# The login banners are shown by pam_motd, which ssh and the console run and
+# Raspberry Pi Connect's remote shell does not -- so someone working through
+# Connect never saw the overlay warning, or ogn-check's report. A login shell
+# that arrived any other way gets them from here instead.
+#
+# The console and ssh are left out by name, or they would show twice. So is
+# sudo -i, which is a login shell too but not a new arrival.
+install -d -m 0755 /etc/profile.d
+cat > /etc/profile.d/ogn-motd.sh <<'EOF'
+# Show the login banners where pam_motd has not, which is Raspberry Pi
+# Connect's remote shell. Installed by ogn-bootstrap.
+if [ -z "${SSH_CONNECTION:-}" ] && [ -z "${SUDO_USER:-}" ]; then
+    case "$-:$(tty 2>/dev/null)" in
+        *i*:/dev/tty[0-9]*) ;;
+        *i*:*)
+            # Same order and precedence as pam_motd: by name, /etc first.
+            for _ogn_motd in $(ls -1 /etc/motd.d /run/motd.d 2>/dev/null | grep -v -e ':$' -e '^$' | sort -u); do
+                if [ -r "/etc/motd.d/$_ogn_motd" ]; then
+                    cat "/etc/motd.d/$_ogn_motd"
+                elif [ -r "/run/motd.d/$_ogn_motd" ]; then
+                    cat "/run/motd.d/$_ogn_motd"
+                fi
+            done
+            unset _ogn_motd
+            ;;
+    esac
+fi
+EOF
+chmod 0644 /etc/profile.d/ogn-motd.sh
 
 # After step 13, so both reflect the overlay decision. Refreshed at every boot
 # thereafter by ogn-config-sync.

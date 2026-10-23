@@ -376,7 +376,7 @@ install_scripts() {
     local f
     for f in src/ogn-install src/ogn-update src/ogn-maintenance \
              src/ogn-remote-admin src/ogn-calibrate src/ogn-overlay \
-             src/ogn-wireguard src/ogn-adsb; do
+             src/ogn-wireguard src/ogn-adsb src/ogn-check; do
         install -m 0755 "$f" "$MNT/usr/local/sbin/"
     done
 
