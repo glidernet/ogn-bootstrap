@@ -169,6 +169,7 @@ sha256_stdin() {
 }
 
 # conf_digest [section] — digest of everything, or of one top-level section
+# shellcheck disable=SC2120  # the section form is used by ogn-install and ogn-maintenance
 conf_digest() {
     if [ $# -eq 0 ]; then
         LC_ALL=C sort "$OGN_CONF_CACHE" | sha256_stdin
@@ -1402,4 +1403,344 @@ connect_signin_pending() {
 motd_set() {
     mkdir -p "$(dirname "$MOTD_FILE")"
     cat > "$MOTD_FILE"
+}
+
+# --------------------------------------------------------------------------
+# Sanity check
+#
+# The problems that most often leave a receiver off the air, looked for by
+# ogn-check two minutes after every boot. Each check_* prints its findings one
+# per line, and nothing at all when it is happy:
+#
+#   ! <problem>      something that stops the receiver, or part of it
+#   ? <suspicious>   often a mistake, but can be deliberate
+#   - <what to do>   belongs to the finding above it
+#
+# Short lines on purpose: they end up on an 80-column console, above the login
+# prompt, which is where someone who has plugged in a screen will be looking.
+# --------------------------------------------------------------------------
+USB_SYSFS="${OGN_USB_SYSFS:-/sys/bus/usb/devices}"
+MODULE_SYSFS="${OGN_MODULE_SYSFS:-/sys/module}"
+RTLSDR_RULES="${OGN_RTLSDR_RULES:-/usr/lib/udev/rules.d/*rtl*.rules /etc/udev/rules.d/*rtl*.rules}"
+
+# conf_syntax_check <file> — the first mistake that would stop libconfig
+# reading the file at all, as "line N: what", or nothing. The flattener above
+# is forgiving by design and reads straight past these; ogn-rf and ogn-decode
+# do not, and refuse to start.
+conf_syntax_check() {
+    LC_ALL=C awk '
+        function fail(msg) { print msg; bad = 1; exit }
+        {
+            n = length($0); i = 1
+            while (i <= n) {
+                c = substr($0, i, 1)
+                if (incomment) {
+                    if (c == "*" && substr($0, i+1, 1) == "/") { incomment = 0; i += 2; continue }
+                    i++; continue
+                }
+                if (instr) {
+                    if (c == "\\") { i += 2; continue }
+                    if (c == "\"") instr = 0
+                    i++; continue
+                }
+                if (c == "\"") { instr = 1; i++; continue }
+                if (c == "#" || (c == "/" && substr($0, i+1, 1) == "/")) break
+                if (c == "/" && substr($0, i+1, 1) == "*") { incomment = 1; cline = NR; i += 2; continue }
+                if (c == "{" || c == "[" || c == "(") { sp++; st[sp] = c; sl[sp] = NR }
+                else if (c == "}" || c == "]" || c == ")") {
+                    want = (c == "}") ? "{" : ((c == "]") ? "[" : "(")
+                    if (sp == 0) fail("line " NR ": a " c " with nothing before it to close")
+                    if (st[sp] != want) fail("line " NR ": " c " closes the " st[sp] " opened on line " sl[sp])
+                    sp--
+                }
+                i++
+            }
+            if (instr) fail("line " NR ": a quote is opened and never closed")
+        }
+        END {
+            if (bad) exit 1
+            if (incomment) { print "line " cline ": a /* comment is never closed"; exit 1 }
+            if (sp > 0) { print "line " sl[sp] ": this " st[sp] " is never closed"; exit 1 }
+        }' "$1"
+}
+
+# sdr_ids — the USB IDs librtlsdr will open, as vendor:product. Read from the
+# udev rules the rtl-sdr package installs for them, so this agrees with the
+# library about what counts as a stick. The two Realtek IDs cover nearly
+# everything sold as an RTL-SDR, and stand in if the rules are not there.
+sdr_ids() {
+    local f ids=""
+    # shellcheck disable=SC2086  # RTLSDR_RULES is a list of globs
+    for f in $RTLSDR_RULES; do
+        [ -r "$f" ] || continue
+        ids="$ids $(LC_ALL=C sed -n 's/.*idVendor}=="\([0-9a-fA-F]\{4\}\)".*idProduct}=="\([0-9a-fA-F]\{4\}\)".*/\1:\2/p' "$f" | tr 'A-F\n' 'a-f ')"
+    done
+    [ -n "${ids// /}" ] || ids="0bda:2832 0bda:2838"
+    printf '%s\n' $ids | sort -u
+}
+
+# sdr_list — one line per RTL-SDR stick plugged in, in USB port order:
+#
+#   <serial> TAB <manufacturer and product> TAB <USB port>
+#
+# From sysfs, never by opening the sticks: it cannot disturb ogn-rf or readsb,
+# and gives the same answer whether they are running or not. The serial is
+# what RF.DeviceSerial and ADSB.DeviceSerial are matched against.
+sdr_list() {
+    local ids d id serial desc
+    ids=" $(sdr_ids | tr '\n' ' ') "
+    for d in "$USB_SYSFS"/*; do
+        [ -r "$d/idVendor" ] && [ -r "$d/idProduct" ] || continue
+        id="$(cat "$d/idVendor"):$(cat "$d/idProduct")"
+        case "$ids" in *" $id "*) ;; *) continue ;; esac
+        serial=$(cat "$d/serial" 2>/dev/null || true)
+        desc="$(cat "$d/manufacturer" 2>/dev/null || true) $(cat "$d/product" 2>/dev/null || true)"
+        desc=$(printf '%s' "$desc" | sed 's/^ *//; s/ *$//')
+        printf '%s\t%s\t%s\n' "${serial:-<none>}" "${desc:-$id}" "$(basename "$d")"
+    done
+}
+
+# How many of the sticks in an sdr_list have this serial.
+sdr_serial_count() {
+    printf '%s\n' "$1" | cut -f1 | grep -cxF -- "$2" || true
+}
+
+# The way back to a writable root, for a fix that has to outlive a reboot.
+check_persist_hint() {
+    if overlay_active; then printf 'sudo overlay off --reboot, then '; fi
+}
+
+# check_summary <home of the receiver account> — what this receiver is set up
+# to do and what is running, on one line that fits an 80-column console:
+#
+#   0.3.2 stick:0 adsb:off rf:up(11) dec:up ro
+#
+# decoder version; which stick (index, or "serial"); gsm, biasT and cal only
+# when switched on; ADS-B; ogn-rf and ogn-decode, with restarts since boot;
+# and whether the root is read-only. Often the whole report is a photo of the
+# screen, and anything that scrolled off it is lost.
+check_summary() {
+    local home="$1" out serial u state restarts
+    out="no-decoder"
+    [ -n "$home" ] && [ -d "$home/rtlsdr-ogn" ] && out=$(basename "$(readlink -f "$home/rtlsdr-ogn")")
+    out=${out#rtlsdr-ogn-}
+
+    serial=$(conf_get RF.DeviceSerial "")
+    if [ -n "$serial" ]; then
+        out="$out stick:\"$(printf '%s' "$serial" | cut -c1-10)\""
+    else
+        out="$out stick:$(conf_get RF.Device 0)"
+    fi
+    awk "BEGIN{exit !($(conf_get RF.GSM.CenterFreq 0) + 0 != 0)}" 2>/dev/null && out="$out gsm"
+    [ "$(conf_get RF.BiasTee 0)" = 0 ] || out="$out biasT"
+    conf_bool RF.Calibrate false && out="$out cal"
+    if conf_bool ADSB.Enable false; then
+        out="$out adsb:$(unit_word "$(systemctl show -p ActiveState --value readsb.service 2>/dev/null || true)")"
+    else
+        out="$out adsb:off"
+    fi
+
+    if systemctl is-enabled --quiet rtlsdr-ogn.service 2>/dev/null; then
+        for u in rf decode; do
+            state=$(systemctl show -p ActiveState --value "ogn-$u.service" 2>/dev/null || true)
+            restarts=$(systemctl show -p NRestarts --value "ogn-$u.service" 2>/dev/null || true)
+            out="$out $([ "$u" = rf ] && printf rf || printf dec):$(unit_word "$state")"
+            [ "${restarts:-0}" = 0 ] || out="$out($restarts)"
+        done
+    else
+        out="$out rx:off"
+    fi
+    if overlay_active; then out="$out ro"; else out="$out rw"; fi
+    printf '%s\n' "$out" | cut -c1-78
+}
+
+# A systemd ActiveState, in as few letters as will still read.
+unit_word() {
+    case "$1" in
+        active)       printf up ;;
+        inactive)     printf down ;;
+        activating)   printf starting ;;
+        deactivating) printf stopping ;;
+        failed)       printf failed ;;
+        *)            printf '?' ;;
+    esac
+}
+
+# check_config <card file> — what is on the card, read the way the decoder
+# will read it. Expects conf_load to have been run on it, if it is readable.
+check_config() {
+    local file="$1" err dup k call lat lon alt
+    if [ ! -r "$file" ]; then
+        printf '! There is no MyReceiver.conf on the SD card.\n'
+        printf -- '- Copy the template from github.com/glidernet/ogn-bootstrap\n'
+        return 0
+    fi
+    if ! err=$(conf_syntax_check "$file"); then
+        printf '! MyReceiver.conf %s.\n' "$err"
+        printf -- '- The decoder cannot read the file until that is fixed.\n'
+    fi
+    if ! _libconfig_flatten "$file" | grep -q .; then
+        printf '! MyReceiver.conf has no settings in it that can be read.\n'
+        return 0
+    fi
+
+    dup=$(cut -d= -f1 "$OGN_CONF_CACHE" | LC_ALL=C sort | uniq -d)
+    for k in $dup; do
+        printf '! MyReceiver.conf sets %s more than once.\n' "$k"
+    done
+    [ -z "$dup" ] || printf -- '- The decoder refuses a file that does. Delete all but one.\n'
+
+    call=$(conf_get APRS.Call "")
+    if [ -n "$call" ] && ! printf '%s' "$call" | grep -Eq '^[A-Za-z0-9]{1,9}$'; then
+        printf '! APRS.Call "%s" is not a valid name.\n' "$call"
+        printf -- '- Up to 9 letters and digits, nothing else.\n'
+    fi
+
+    lat=$(conf_get Position.Latitude 0)
+    lon=$(conf_get Position.Longitude 0)
+    alt=$(conf_get Position.Altitude 0)
+    if printf '%s\n%s\n' "$lat" "$lon" | grep -Eqv '^[-+]?[0-9]+(\.[0-9]*)?$'; then
+        printf '! The position (%s, %s) is not two numbers.\n' "$lat" "$lon"
+    elif awk "BEGIN{exit !($lat == 0 && $lon == 0)}"; then
+        printf '! The position is still 0, 0, so the receiver is switched off.\n'
+        printf -- '- Set Position.Latitude and Longitude on the card.\n'
+    elif awk "BEGIN{exit !($lat < -90 || $lat > 90 || $lon < -180 || $lon > 180)}"; then
+        printf '! The position %s, %s is out of range.\n' "$lat" "$lon"
+    elif printf '%s' "$alt" | grep -Eq '^[-+]?0*(\.0*)?$'; then
+        printf "? Position.Altitude is 0. It is the aerial's height above sea level.\n"
+    fi
+
+    # adsb_render's own warnings, which are problems when it refused to
+    # render and only worth a look when it went ahead regardless.
+    if conf_bool ADSB.Enable false; then
+        local mark='?' said
+        said=$(adsb_render 2>&1 >/dev/null) || mark='!'
+        printf '%s\n' "$said" | sed -n "s/^.*WARNING: \\(.*\\)\$/$mark \\1/p"
+    fi
+
+    # ogn-config-sync keeps the settings already installed when the card's
+    # are unusable, and says why only in its own log.
+    if [ -e "$STATE_DIR/installed" ] && [ -r "$CONFIG_APPLIED" ] \
+       && [ "$(conf_digest)" != "$(cat "$CONFIG_APPLIED")" ]; then
+        printf '! The receiver is not using the MyReceiver.conf on the card.\n'
+        printf -- '- Why: journalctl -u ogn-config-sync\n'
+    fi
+    return 0
+}
+
+# check_install <home of the receiver account> — did setup finish, and did
+# everything it downloads arrive?
+check_install() {
+    local home="$1" real b
+    if [ ! -e "$STATE_DIR/installed" ]; then
+        printf '! Setup has not finished. It is retried every 15 minutes.\n'
+        printf -- '- Why: journalctl -u ogn-install-retry\n'
+    fi
+    command -v procServ >/dev/null 2>&1 \
+        || printf '! procServ is not installed, and the receiver cannot start without it.\n'
+
+    if [ -z "$home" ] || [ ! -d "$home/rtlsdr-ogn" ]; then
+        printf '! The OGN decoder is not installed: its download failed.\n'
+        printf -- '- It needs the network. To retry: %ssudo ogn-install\n' "$(check_persist_hint)"
+        return 0
+    fi
+    real=$(readlink -f "$home/rtlsdr-ogn")
+    for b in ogn-rf ogn-decode; do
+        [ -x "$real/$b" ] || printf '! %s is missing from %s.\n' "$b" "$real"
+    done
+    [ -s "$real/MyReceiver.conf" ] || printf '! There is no MyReceiver.conf in %s.\n' "$real"
+    if [ ! -s "$real/WW15MGH.DAC" ]; then
+        printf '? The altitude data (WW15MGH.DAC) did not download.\n'
+        printf -- '- Altitudes are less accurate. To retry: %ssudo ogn-install\n' "$(check_persist_hint)"
+    fi
+    return 0
+}
+
+# check_sdr <sdr_list output> — are the sticks the card names plugged in?
+check_sdr() {
+    local list="$1" n serial index c
+    n=$(printf '%s' "$list" | grep -c . || true)
+
+    if [ -d "$MODULE_SYSFS/dvb_usb_rtl28xxu" ]; then
+        printf '! The DVB-T TV driver is loaded, and holds the SDR stick.\n'
+        printf -- '- The installer blacklists it; a reboot after that clears it.\n'
+    fi
+    if [ "$n" -eq 0 ]; then
+        printf '! No RTL-SDR stick can be seen on USB.\n'
+        printf -- '- Check it is plugged in. A stick can drop off the bus on poor power.\n'
+        return 0
+    fi
+
+    serial=$(conf_get RF.DeviceSerial "")
+    if [ -n "$serial" ]; then
+        c=$(sdr_serial_count "$list" "$serial")
+        if [ "$c" -eq 0 ]; then
+            printf '! RF.DeviceSerial is "%s", but no stick has that serial.\n' "$serial"
+            printf -- '- Program it with rtl_eeprom -s %s, or change the card to match.\n' "$serial"
+        elif [ "$c" -gt 1 ]; then
+            printf '! %s sticks have the serial "%s", so RF.DeviceSerial is ambiguous.\n' "$c" "$serial"
+        fi
+    else
+        index=$(conf_get RF.Device 0)
+        if ! printf '%s' "$index" | grep -Eq '^[0-9]+$'; then
+            printf '! RF.Device is "%s", which is not a number.\n' "$index"
+        elif [ "$index" -ge "$n" ]; then
+            printf '! RF.Device is %s, but there %s only %s stick%s, counted from 0.\n' \
+                "$index" "$([ "$n" -eq 1 ] && printf is || printf are)" "$n" "$([ "$n" -eq 1 ] || printf s)"
+        elif [ "$n" -gt 1 ] && ! conf_bool ADSB.Enable false; then
+            printf '? %s sticks, and RF.Device picks by position, which can change.\n' "$n"
+            printf -- '- Set RF.DeviceSerial instead; the template says how.\n'
+        fi
+    fi
+
+    if conf_bool ADSB.Enable false; then
+        serial=$(conf_get ADSB.DeviceSerial "")
+        if [ -n "$serial" ] && [ "$(sdr_serial_count "$list" "$serial")" -eq 0 ]; then
+            printf '! ADSB.DeviceSerial is "%s", but no stick has that serial.\n' "$serial"
+        fi
+    fi
+    return 0
+}
+
+# check_running — is the receiver actually up? Only fair once it has had time
+# to start, which is why ogn-check.timer waits two minutes after boot.
+check_running() {
+    local u state restarts since up age rf_bad=0
+    # Switched off on purpose: check_config has already said why.
+    systemctl is-enabled --quiet rtlsdr-ogn.service 2>/dev/null || return 0
+
+    if [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" != yes ]; then
+        printf '! The clock has not been set from the network yet.\n'
+        printf -- '- The receiver waits until it has. Check the network connection.\n'
+    fi
+
+    up=$(cut -d. -f1 /proc/uptime 2>/dev/null || printf 0)
+    for u in ogn-rf ogn-decode; do
+        # ogn-decode can only run on what ogn-rf gives it, so with ogn-rf down
+        # it fails too, and saying so points at the wrong one.
+        [ "$u" = ogn-decode ] && [ "$rf_bad" -eq 1 ] && continue
+        state=$(systemctl show -p ActiveState --value "$u.service" 2>/dev/null || true)
+        restarts=$(systemctl show -p NRestarts --value "$u.service" 2>/dev/null || true)
+        since=$(systemctl show -p ActiveEnterTimestampMonotonic --value "$u.service" 2>/dev/null || true)
+        age=$(( up - ${since:-0} / 1000000 ))
+        if [ "$state" != active ]; then
+            printf '! %s is not running.\n' "$u"
+        elif [ "${restarts:-0}" -ge 2 ] && [ "$age" -lt 120 ]; then
+            printf '! %s keeps stopping: restarted %s times since boot.\n' "$u" "$restarts"
+        elif [ "${restarts:-0}" -ge 2 ]; then
+            printf '? %s has restarted %s times since boot, but is running now.\n' "$u" "$restarts"
+            printf -- '- Its log: journalctl -u %s\n' "$u"
+            continue
+        else
+            continue
+        fi
+        printf -- '- Its log: journalctl -u %s\n' "$u"
+        [ "$u" = ogn-rf ] && rf_bad=1
+    done
+
+    if conf_bool ADSB.Enable false && ! systemctl is-active --quiet readsb 2>/dev/null; then
+        printf '! ADS-B is switched on, but readsb is not running.\n'
+        printf -- '- Its log: journalctl -u ogn-adsb -u readsb\n'
+    fi
+    return 0
 }

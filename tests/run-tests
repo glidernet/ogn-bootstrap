@@ -1318,6 +1318,191 @@ grep -q 'trap .*restore_receiver. EXIT' src/ogn-calibrate \
 grep -q 'card_writeback "" ' src/ogn-calibrate \
     && ok "a failed scan still disarms itself" || bad "a failed scan still disarms itself"
 
+echo "== boot-time sanity check =="
+CK=$(mktemp -d)
+has()    { case "$2" in *"$3"*) ok "$1" ;; *) bad "$1" "$2" ;; esac; }
+hasnt()  { case "$2" in *"$3"*) bad "$1" "$2" ;; *) ok "$1" ;; esac; }
+
+# Syntax: what the flattener reads straight past and the decoder refuses.
+conf_syntax_check boot/MyReceiver.conf >/dev/null \
+    && ok "the shipped template is well formed" || bad "the shipped template is well formed"
+for f in tests/fixtures/*.conf; do
+    conf_syntax_check "$f" >/dev/null && ok "$f is well formed" || bad "$f is well formed"
+done
+syntax_of() { printf '%s' "$1" > "$CK/s.conf"; conf_syntax_check "$CK/s.conf"; }
+is "a group never closed"      "$(syntax_of $'RF:\n{\n  Device = 0;\n')"        "line 2: this { is never closed"
+is "a brace too many"          "$(syntax_of $'RF:\n{\n};\n};\n')"               "line 4: a } with nothing before it to close"
+is "brackets crossed"          "$(syntax_of $'A = [ 1, 2 );\n')"                "line 1: ) closes the [ opened on line 1"
+is "a quote never closed"      "$(syntax_of $'A = "abc;\nB = 1;\n')"            "line 1: a quote is opened and never closed"
+is "a comment never closed"    "$(syntax_of $'A = 1;\n/* oops\nB = 2;\n')"      "line 2: a /* comment is never closed"
+is "braces in comments and strings do not count" \
+    "$(syntax_of $'# { not this\n// } nor this\nA = "{ or this";\n/* } */\n')" ""
+is "an escaped quote stays in the string" "$(syntax_of $'A = "say \\"hi\\" {";\n')" ""
+
+# The sticks, from a fake sysfs. Two of them sharing the factory serial is
+# exactly the receiver in issue #10.
+USB_SYSFS="$CK/usb"; MODULE_SYSFS="$CK/module"; mkdir -p "$MODULE_SYSFS"
+stick() {  # stick <port> <vendor> <product> [serial]
+    mkdir -p "$USB_SYSFS/$1"
+    printf '%s\n' "$2" > "$USB_SYSFS/$1/idVendor"; printf '%s\n' "$3" > "$USB_SYSFS/$1/idProduct"
+    printf 'Realtek\n' > "$USB_SYSFS/$1/manufacturer"; printf 'RTL2838UHIDIR\n' > "$USB_SYSFS/$1/product"
+    [ -z "${4:-}" ] || printf '%s\n' "$4" > "$USB_SYSFS/$1/serial"
+}
+stick 1-1.2 0bda 2838 00000001
+stick 1-1.3 0bda 2838 00000001
+stick 1-1.4 046d c31c KEYBOARD
+mkdir -p "$USB_SYSFS/1-1.2:1.0"
+RTLSDR_RULES="$CK/none/*.rules"
+is "the Realtek IDs stand in without the udev rules" "$(sdr_ids | tr '\n' ' ')" "0bda:2832 0bda:2838 "
+printf 'SUBSYSTEMS=="usb", ATTRS{idVendor}=="0BDA", ATTRS{idProduct}=="2838", MODE="0660"\nSUBSYSTEMS=="usb", ATTRS{idVendor}=="1d19", ATTRS{idProduct}=="1101", MODE="0660"\n' > "$CK/rtl-sdr.rules"
+RTLSDR_RULES="$CK/*rtl*.rules"
+is "the IDs come from the rtl-sdr udev rules" "$(sdr_ids | tr '\n' ' ')" "0bda:2838 1d19:1101 "
+SDRS=$(sdr_list)
+is "both sticks are listed, and nothing else" "$(printf '%s\n' "$SDRS" | cut -f3 | tr '\n' ' ')" "1-1.2 1-1.3 "
+is "with serial and description" "$(printf '%s\n' "$SDRS" | head -1 | cut -f1,2)" "$(printf '00000001\tRealtek RTL2838UHIDIR')"
+
+conf_load tests/fixtures/adsb.conf
+OUT=$(check_sdr "$SDRS")
+has "a serial that is not plugged in is named"  "$OUT" 'RF.DeviceSerial is "868", but no stick has that serial'
+has "and how to fix it"                         "$OUT" 'rtl_eeprom -s 868'
+has "the ADS-B one too"                         "$OUT" 'ADSB.DeviceSerial is "1090", but no stick has that serial'
+printf '868\n' > "$USB_SYSFS/1-1.2/serial"; printf '1090\n' > "$USB_SYSFS/1-1.3/serial"
+is "the right sticks, the right way round, are fine" "$(check_sdr "$(sdr_list)")" ""
+printf '868\n' > "$USB_SYSFS/1-1.3/serial"
+has "two sticks with the one serial are called out" "$(check_sdr "$(sdr_list)")" '2 sticks have the serial "868"'
+
+conf_load boot/MyReceiver.conf
+rm -rf "$USB_SYSFS/1-1.3"
+is "one stick and the template agree" "$(check_sdr "$(sdr_list)")" ""
+sed 's/^\( *Device *=\).*/\1 1;/' boot/MyReceiver.conf > "$CK/c.conf"; conf_load "$CK/c.conf"
+has "an index past the last stick" "$(check_sdr "$(sdr_list)")" "RF.Device is 1, but there is only 1 stick"
+rm -rf "$USB_SYSFS"; mkdir -p "$USB_SYSFS"
+has "no stick at all" "$(check_sdr "")" "No RTL-SDR stick can be seen"
+mkdir -p "$MODULE_SYSFS/dvb_usb_rtl28xxu"
+has "the TV driver holding the stick" "$(check_sdr "")" "DVB-T TV driver is loaded"
+
+# The card.
+SAVED_STATE_DIR="$STATE_DIR"; SAVED_APPLIED="$CONFIG_APPLIED"
+STATE_DIR="$CK/state"; CONFIG_APPLIED="$STATE_DIR/config.applied"; mkdir -p "$STATE_DIR"
+conf_load boot/MyReceiver.conf
+OUT=$(check_config boot/MyReceiver.conf)
+has "the template's position is a problem" "$OUT" "! The position is still 0, 0"
+has "a missing card is a problem" "$(check_config "$CK/nowhere.conf")" "There is no MyReceiver.conf"
+conf_load tests/fixtures/adsb.conf
+# The fixture's machine has an ID, so feeding is not anonymous and nothing is
+# said about it; on a Mac the stand-in sources are what make that true.
+SAVED_ID_SOURCES="$ADSB_ID_SOURCES"; printf 'fixture-machine\n' > "$CK/machine-id"; ADSB_ID_SOURCES="$CK/machine-id"
+is "a complete card is fine" "$(check_config tests/fixtures/adsb.conf)" ""
+sed 's/^\( *Altitude *=\).*/\1 0;/' tests/fixtures/adsb.conf > "$CK/c.conf"; conf_load "$CK/c.conf"
+has "altitude 0 is worth checking, not a problem" "$(check_config "$CK/c.conf")" "? Position.Altitude is 0"
+sed 's/^\( *Call *=.*\)$/\1\n  Call = "TWICE";/' tests/fixtures/adsb.conf > "$CK/c.conf"; conf_load "$CK/c.conf"
+has "a setting given twice" "$(check_config "$CK/c.conf")" "sets APRS.Call more than once"
+grep -v 'DeviceSerial = "868"' tests/fixtures/adsb.conf > "$CK/c.conf"; conf_load "$CK/c.conf"
+has "ADS-B's own complaints are passed on" "$(check_config "$CK/c.conf")" "needs RF.DeviceSerial set as well"
+sed '$d' tests/fixtures/adsb.conf > "$CK/c.conf"; conf_load "$CK/c.conf"
+has "a brace left out" "$(check_config "$CK/c.conf")" "is never closed"
+conf_load tests/fixtures/adsb.conf
+: > "$STATE_DIR/installed"; printf 'something older\n' > "$CONFIG_APPLIED"
+has "a card the receiver is not using" "$(check_config tests/fixtures/adsb.conf)" "not using the MyReceiver.conf on the card"
+conf_digest > "$CONFIG_APPLIED"
+is "and one it is" "$(check_config tests/fixtures/adsb.conf)" ""
+ADSB_ID_SOURCES="$CK/no-such-id"
+has "ADS-B advice that does not stop it is only worth checking" \
+    "$(check_config tests/fixtures/adsb.conf)" "? no hardware serial or machine-id"
+ADSB_ID_SOURCES="$SAVED_ID_SOURCES"
+
+# What setup downloads.
+mkdir -p "$CK/bin"; printf '#!/bin/sh\n' > "$CK/bin/procServ"; chmod +x "$CK/bin/procServ"
+OLD_PATH="$PATH"; PATH="$CK/bin:$PATH"
+HOMEDIR="$CK/home"; mkdir -p "$HOMEDIR"
+has "no decoder means its download failed" "$(check_install "$HOMEDIR")" "The OGN decoder is not installed"
+mkdir -p "$HOMEDIR/rtlsdr-ogn-0.3.2"; ln -sfn rtlsdr-ogn-0.3.2 "$HOMEDIR/rtlsdr-ogn"
+for b in ogn-rf ogn-decode; do printf '#!/bin/sh\n' > "$HOMEDIR/rtlsdr-ogn-0.3.2/$b"; chmod +x "$HOMEDIR/rtlsdr-ogn-0.3.2/$b"; done
+echo x > "$HOMEDIR/rtlsdr-ogn-0.3.2/MyReceiver.conf"
+has "missing altitude data is worth checking" "$(check_install "$HOMEDIR")" "? The altitude data (WW15MGH.DAC) did not download"
+echo x > "$HOMEDIR/rtlsdr-ogn-0.3.2/WW15MGH.DAC"
+is "a complete install is fine" "$(check_install "$HOMEDIR")" ""
+rm "$HOMEDIR/rtlsdr-ogn-0.3.2/ogn-rf"
+has "a missing binary" "$(check_install "$HOMEDIR")" "ogn-rf is missing"
+rm "$STATE_DIR/installed"
+has "an unfinished setup" "$(check_install "$HOMEDIR")" "Setup has not finished"
+
+# Whether it is actually running, against a stub systemctl.
+cat > "$CK/bin/systemctl" <<'STUBEOF'
+#!/bin/bash
+case "$*" in
+    "is-enabled --quiet rtlsdr-ogn.service") exit 0 ;;
+    *"ActiveState --value ogn-rf.service"*)  printf '%s\n' "${RF_STATE:-active}" ;;
+    *"NRestarts --value ogn-rf.service"*)    printf '%s\n' "${RF_RESTARTS:-0}" ;;
+    *"ActiveState --value ogn-decode"*)      printf 'inactive\n' ;;
+    *"--value"*)                             printf '0\n' ;;
+    *) exit 1 ;;
+esac
+STUBEOF
+printf '#!/bin/sh\necho yes\n' > "$CK/bin/timedatectl"
+chmod +x "$CK/bin/systemctl" "$CK/bin/timedatectl"
+conf_load boot/MyReceiver.conf
+export RF_STATE=active RF_RESTARTS=11
+OUT=$(check_running)
+has "ogn-rf restarting over and over is found" "$OUT" "ogn-rf keeps stopping: restarted 11 times"
+hasnt "and ogn-decode, which needs it, is not blamed" "$OUT" "ogn-decode"
+export RF_RESTARTS=0
+has "a healthy ogn-rf moves on to ogn-decode" "$(check_running)" "ogn-decode is not running"
+printf '#!/bin/sh\necho no\n' > "$CK/bin/timedatectl"
+has "a clock never set" "$(check_running)" "The clock has not been set"
+
+# The one-line summary: what is switched on, and what is running.
+export RF_STATE=activating RF_RESTARTS=11
+is "the summary says what is on and what is running" \
+    "$(check_summary "$HOMEDIR")" "0.3.2 stick:0 adsb:off rf:starting(11) dec:down rw"
+sed -e 's/^ *# DeviceSerial = "868";/  DeviceSerial = "0123456789ABCDEF";/' \
+    -e 's/^\( *CenterFreq *=\) *0;/\1 938.6;/' -e 's/^ *# BiasTee = 1;/  BiasTee = 1;/' \
+    -e 's/^\( *Calibrate *=\).*/\1 true;/' boot/MyReceiver.conf > "$CK/c.conf"
+conf_load "$CK/c.conf"
+export RF_RESTARTS=99999
+OUT=$(check_summary "$HOMEDIR")
+has "a pinned stick is named by serial" "$OUT" 'stick:"0123456789"'
+has "and the settings that also use the stick are shown" "$OUT" "gsm biasT cal"
+[ "${#OUT}" -le 78 ] && ok "even then it fits one console line" || bad "even then it fits one console line" "${#OUT}: $OUT"
+PATH="$OLD_PATH"; unset RF_STATE RF_RESTARTS
+STATE_DIR="$SAVED_STATE_DIR"; CONFIG_APPLIED="$SAVED_APPLIED"
+rm -rf "$CK"
+
+# Seen with a screen plugged in, and over ssh, and gone after a reboot.
+grep -q 'CHECK_ISSUE=/run/' src/ogn-check && ok "the console report is in /run" || bad "the console report is in /run"
+grep -q 'CHECK_ISSUE_LINK=/etc/issue.d/.*\.issue$' src/ogn-check \
+    && ok "and reached from /etc/issue.d, which agetty reads" || bad "and reached from /etc/issue.d, which agetty reads"
+grep -q 'CHECK_MOTD=/run/motd.d/' src/ogn-check && ok "the login banner gets it too" || bad "the login banner gets it too"
+python3 - <<'PY' && ok "the check runs once, after boot" || bad "the check runs once, after boot"
+src = open("src/ogn-install").read()
+timer = src.split("write_unit ogn-check.timer <<'EOF'", 1)[1].split("\nEOF", 1)[0]
+assert "OnBootSec=" in timer, "no OnBootSec"
+assert "OnUnitActiveSec" not in timer and "OnCalendar" not in timer, "it repeats"
+assert "systemctl enable ogn-check.timer" in src, "never enabled"
+PY
+# Connect's remote shell skips pam_motd, so a profile.d script stands in.
+# Run for real, against stand-in banner directories.
+PM=$(mktemp -d); mkdir -p "$PM/etc" "$PM/run"
+printf 'overlay\n' > "$PM/etc/30-ogn-overlay"; printf 'check\n' > "$PM/run/60-ogn-check"
+printf 'shadowed\n' > "$PM/run/30-ogn-overlay"
+python3 - "$PM" <<'PY'
+import sys
+src = open("src/ogn-install").read()
+body = src.split("cat > /etc/profile.d/ogn-motd.sh <<'EOF'\n", 1)[1].split("\nEOF", 1)[0]
+d = sys.argv[1]
+open(d + "/ogn-motd.sh", "w").write(body.replace("/etc/motd.d", d + "/etc").replace("/run/motd.d", d + "/run"))
+PY
+OUT=$(env -u SSH_CONNECTION -u SUDO_USER sh -i -c ". '$PM/ogn-motd.sh'" 2>/dev/null </dev/null)
+is "a Connect shell gets the banners, in pam_motd's order" "$(printf '%s' "$OUT" | tr '\n' ' ')" "overlay check"
+is "an ssh login does not get them twice" \
+    "$(SSH_CONNECTION='1 2 3 4' sh -i -c ". '$PM/ogn-motd.sh'" 2>/dev/null </dev/null)" ""
+is "nor does a script" "$(env -u SSH_CONNECTION -u SUDO_USER sh -c ". '$PM/ogn-motd.sh'" 2>/dev/null)" ""
+rm -rf "$PM"
+
+grep -q 'syntax=$(conf_syntax_check "$BOOT_CONF")' src/ogn-maintenance \
+    && ok "config sync refuses a card the decoder could not read" \
+    || bad "config sync refuses a card the decoder could not read"
+
 echo "== generated vendor-data is in step with src/ =="
 BEFORE=$(sha256sum boot/vendor-data 2>/dev/null || shasum -a 256 boot/vendor-data)
 ./tools/build-vendor-data >/dev/null

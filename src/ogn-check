@@ -1,0 +1,109 @@
+#!/bin/bash
+#
+# ogn-check — look for the problems that most often keep a receiver off the
+# air, and say what they are where somebody will see them.
+#
+#   sudo ogn-check     check now, and print what was found
+#
+# Run two minutes after every boot by ogn-check.timer. The report goes to the
+# journal, to the console above the login prompt, and to the login banner, so
+# a receiver with a screen plugged in explains itself without anyone having
+# to know which log to read. Run it again by hand once something is fixed.
+#
+# Copyright (c) 2026 ifly7charlie. MIT licence, see LICENSE.
+
+set -euo pipefail
+
+LIBDIR="${OGN_LIBDIR:-/usr/local/lib/ogn-bootstrap}"
+# shellcheck source=src/ogn-common.sh
+. "$LIBDIR/ogn-common.sh"
+
+case "${1:-}" in
+    '')        ;;
+    -h|--help) sed -n '3,11p' "$0"; exit 0 ;;
+    *)         die "unknown argument: $1  (try: sudo ogn-check)" ;;
+esac
+
+need_root
+
+# In /run, so a reboot can never leave last boot's report on the screen, and
+# nothing here is ever a write to the card. agetty reads /run/issue.d only
+# when /etc/issue does not exist, which on Raspberry Pi OS it always does, so
+# the console copy is reached through a link from /etc/issue.d.
+CHECK_ISSUE=/run/ogn-bootstrap/check.issue
+CHECK_ISSUE_LINK=/etc/issue.d/50-ogn-check.issue
+CHECK_MOTD=/run/motd.d/60-ogn-check
+
+trap conf_cleanup EXIT
+if [ -r "$BOOT_CONF" ] && _libconfig_flatten "$BOOT_CONF" | grep -q .; then
+    conf_load "$BOOT_CONF"
+fi
+
+HOME_DIR=""
+if user=$(detect_ogn_user 2>/dev/null); then
+    HOME_DIR=$(user_home "$user")
+fi
+
+SDRS=$(sdr_list)
+SETUP=$(check_summary "$HOME_DIR") || true
+FINDINGS=$(
+    check_config "$BOOT_CONF"
+    check_install "$HOME_DIR"
+    check_sdr "$SDRS"
+    check_running
+) || true
+
+PROBLEMS=$(printf '%s\n' "$FINDINGS" | grep -c '^!' || true)
+QUERIES=$(printf '%s\n' "$FINDINGS" | grep -c '^?' || true)
+
+plural() { if [ "$1" -eq 1 ]; then printf '%s %s' "$1" "$2"; else printf '%s %ss' "$1" "$2"; fi; }
+
+report() {
+    local summary
+    if [ -z "$FINDINGS" ]; then
+        summary="nothing wrong found"
+    elif [ "$PROBLEMS" -eq 0 ]; then
+        summary="$(plural "$QUERIES" thing) worth checking"
+    else
+        summary="$(plural "$PROBLEMS" problem)"
+        [ "$QUERIES" -eq 0 ] || summary="$summary, and $(plural "$QUERIES" thing) worth checking"
+    fi
+
+    printf '\n  OGN receiver check, %s: %s\n' "$(date '+%H:%M')" "$summary"
+    printf '  %s\n' "$SETUP"
+    if [ -n "$FINDINGS" ]; then
+        printf '\n'
+        printf '%s\n' "$FINDINGS" | sed 's/^- /    /; s/^/  /'
+    fi
+
+    # Always listed, because "which stick is which" is the question every
+    # two-dongle problem comes down to, and the answer is not on the card.
+    if [ -z "$SDRS" ]; then
+        printf '\n  SDR sticks: none found\n'
+    else
+        printf '\n  SDR sticks, by serial:\n'
+        printf '%s\n' "$SDRS" | awk -F'\t' '{ printf "    %-12s %-30s USB port %s\n", $1, $2, $3 }'
+    fi
+    [ -z "$FINDINGS" ] || printf '\n  Check again once fixed:  sudo ogn-check\n'
+    printf '\n'
+}
+
+# Control characters out: the serials and product names come from whatever is
+# plugged into the USB ports, and this is printed on terminals -- the console,
+# every login, the journal. Tabs and newlines are the report's own.
+REPORT=$(report | LC_ALL=C tr -d '\000-\010\013-\037\177')
+printf '%s\n' "$REPORT"
+
+install -d -m 0755 "$(dirname "$CHECK_ISSUE")" "$(dirname "$CHECK_MOTD")" "$(dirname "$CHECK_ISSUE_LINK")"
+# agetty expands backslash escapes in issue files. None are meant here, and a
+# serial number or a mistyped Call is not somewhere to start.
+printf '%s\n' "$REPORT" | tr -d '\\' > "$CHECK_ISSUE.tmp" && mv "$CHECK_ISSUE.tmp" "$CHECK_ISSUE"
+printf '%s\n' "$REPORT" > "$CHECK_MOTD.tmp" && mv "$CHECK_MOTD.tmp" "$CHECK_MOTD"
+[ -L "$CHECK_ISSUE_LINK" ] || ln -sfn "$CHECK_ISSUE" "$CHECK_ISSUE_LINK"
+# Redraws a login prompt nobody has started typing at, so the report appears
+# without a keypress.
+agetty --reload >/dev/null 2>&1 || true
+
+# A failed unit is what `systemctl status` and `systemctl --failed` show, so
+# a problem is visible there too.
+[ "$PROBLEMS" -eq 0 ]
