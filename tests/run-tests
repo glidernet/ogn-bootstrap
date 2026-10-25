@@ -1464,6 +1464,60 @@ OUT=$(check_summary "$HOMEDIR")
 has "a pinned stick is named by serial" "$OUT" 'stick:"0123456789"'
 has "and the settings that also use the stick are shown" "$OUT" "gsm biasT cal"
 [ "${#OUT}" -le 78 ] && ok "even then it fits one console line" || bad "even then it fits one console line" "${#OUT}: $OUT"
+
+# A restart loop, as the ExecStopPost hook sees it.
+is "the first exit is not a loop"      "$(loop_report_due 0 && echo yes || echo no)"  "no"
+is "the second is reported"            "$(loop_report_due 1 && echo yes || echo no)"  "yes"
+is "the next few are not"              "$(loop_report_due 2 && echo yes || echo no)"  "no"
+is "then every 30th"                   "$(loop_report_due 31 && echo yes || echo no)" "yes"
+is "and nothing that is not a count"   "$(loop_report_due '' && echo yes || echo no)" "no"
+
+cat > "$CK/bin/systemctl" <<'STUBEOF'
+#!/bin/bash
+case "$*" in
+    "list-jobs --no-legend") [ -n "${JOBS:-}" ] && printf '%s\n' "$JOBS" ;;
+    *"NRestarts --value ogn-rf.service"*)                       printf '11\n' ;;
+    *"ExecMainStartTimestampMonotonic --value ogn-rf.service"*) printf '30000000\n' ;;
+    *"ExecMainExitTimestampMonotonic --value ogn-rf.service"*)  printf '34000000\n' ;;
+    *) exit 1 ;;
+esac
+STUBEOF
+JOBS="123 ogn-rf.service stop running" ; export JOBS
+unit_stop_requested ogn-rf && ok "a requested stop is not a loop" || bad "a requested stop is not a loop"
+JOBS="124 ogn-decode.service restart waiting"
+unit_stop_requested ogn-rf && bad "another unit's job is not this one's" || ok "another unit's job is not this one's"
+unset JOBS
+
+# The unit's output, with ogn-check's own lines (it runs inside the unit) out.
+cat > "$CK/bin/journalctl" <<'STUBEOF'
+#!/bin/sh
+cat <<'J'
+2026-10-23T20:04:44+0100 newcut procServ[1380]: @@@ Child "ogn-rf" started
+2026-10-23T20:04:44+0100 newcut ogn-rf[1385]: RTLSDR_Read... can't open device #0
+2026-10-23T20:04:44+0100 newcut ogn-check[1390]: OGN receiver check, 20:04
+2026-10-23T20:04:45+0100 newcut ogn-rf[1385]: usb_claim_interface error -6
+J
+STUBEOF
+chmod +x "$CK/bin/journalctl"
+is "the unit's output, without times or ogn-check" "$(unit_output_tail ogn-rf 8)" \
+    "$(printf '@@@ Child "ogn-rf" started\nRTLSDR_Read... can'"'"'t open device #0\nusb_claim_interface error -6')"
+is "and only the last few lines" "$(unit_output_tail ogn-rf 1)" "usb_claim_interface error -6"
+
+# Whatever else has the stick open.
+stick 1-1.4 0bda 2838 00000001
+printf '1\n' > "$USB_SYSFS/1-1.4/busnum"; printf '5\n' > "$USB_SYSFS/1-1.4/devnum"
+USB_DEV="$CK/dev"; PROC_DIR="$CK/proc"; mkdir -p "$PROC_DIR/4242"; printf 'readsb\n' > "$PROC_DIR/4242/comm"
+printf '#!/bin/sh\n[ "$1" = "%s/001/005" ] && printf " 4242" && printf "%s: m\\n" "$1" >&2\n' "$USB_DEV" '' > "$CK/bin/fuser"
+chmod +x "$CK/bin/fuser"
+is "the process holding the stick is named" "$(sdr_holders 1-1.4)" "readsb (4242)"
+OUT=$(check_exit ogn-rf "$(sdr_list)")
+has "the loop is reported, with how long it lasted" "$OUT" "! ogn-rf keeps stopping: lasted 4s, restarted 11 times since boot."
+has "with the unit's own last words"                "$OUT" "| usb_claim_interface error -6"
+has "and what else has the stick"                   "$OUT" '! Stick "00000001" (USB 1-1.4) is held open by readsb (4242).'
+printf '#!/bin/sh\nexit 1\n' > "$CK/bin/fuser"
+hasnt "a stick nobody holds is not mentioned" "$(check_exit ogn-rf "$(sdr_list)")" "held open"
+USB_DEV=/dev/bus/usb; PROC_DIR=/proc
+
 PATH="$OLD_PATH"; unset RF_STATE RF_RESTARTS
 STATE_DIR="$SAVED_STATE_DIR"; CONFIG_APPLIED="$SAVED_APPLIED"
 rm -rf "$CK"
@@ -1473,12 +1527,26 @@ grep -q 'CHECK_ISSUE=/run/' src/ogn-check && ok "the console report is in /run" 
 grep -q 'CHECK_ISSUE_LINK=/etc/issue.d/.*\.issue$' src/ogn-check \
     && ok "and reached from /etc/issue.d, which agetty reads" || bad "and reached from /etc/issue.d, which agetty reads"
 grep -q 'CHECK_MOTD=/run/motd.d/' src/ogn-check && ok "the login banner gets it too" || bad "the login banner gets it too"
-python3 - <<'PY' && ok "the check runs once, after boot" || bad "the check runs once, after boot"
+python3 - <<'PY' && ok "the check runs at boot, before the login prompt" || bad "the check runs at boot, before the login prompt"
+import re
 src = open("src/ogn-install").read()
-timer = src.split("write_unit ogn-check.timer <<'EOF'", 1)[1].split("\nEOF", 1)[0]
-assert "OnBootSec=" in timer, "no OnBootSec"
-assert "OnUnitActiveSec" not in timer and "OnCalendar" not in timer, "it repeats"
-assert "systemctl enable ogn-check.timer" in src, "never enabled"
+unit = src.split("write_unit ogn-check.service <<'EOF'", 1)[1].split("\nEOF", 1)[0]
+assert re.search(r"^Before=getty-pre\.target$", unit, re.M), "not before the gettys"
+assert re.search(r"^Wants=getty-pre\.target$", unit, re.M), "getty-pre.target not pulled in"
+assert "ExecStart=/usr/local/sbin/ogn-check --boot" in unit, "not in boot mode"
+assert "TimeoutStartSec=" in unit, "could hold up the login prompt for ever"
+# The login prompt must not wait on calibration, or on the network clock.
+assert not re.search(r"^After=.*(ogn-config-sync|rtlsdr-ogn|ogn-rf|time-sync)", unit, re.M), "waits on the receiver"
+assert "systemctl enable ogn-check.service" in src, "never enabled"
+assert "write_unit ogn-check.timer" not in src, "the old timer is still written"
+PY
+python3 - <<'PY' && ok "both decoder units report a restart loop" || bad "both decoder units report a restart loop"
+src = open("src/ogn-install").read()
+hook = 'EXIT_HOOK="ExecStopPost=-+/usr/local/sbin/ogn-check --exited"'
+assert hook in src, "the hook is not ignore-failures and root"
+for name in ("ogn-rf", "ogn-decode"):
+    unit = src.split("write_unit %s.service <<EOF" % name, 1)[1].split("\nEOF", 1)[0]
+    assert "$EXIT_HOOK %s\n" % name in unit, name
 PY
 # Connect's remote shell skips pam_motd, so a profile.d script stands in.
 # Run for real, against stand-in banner directories.

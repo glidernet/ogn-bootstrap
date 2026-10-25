@@ -280,6 +280,12 @@ on_procserv() {
     printf '/usr/bin/procServ --foreground --logfile=- --oneshot --name=%s %s %s' "$name" "$port" "$*"
 }
 
+# After every exit, ogn-check looks at whether the unit is caught in a restart
+# loop and, if it is, puts the reason on the console. "+" because the units run
+# as $OGN_USER and the report is written to /run as root; "-" so that nothing
+# it does can stand in the way of the restart.
+EXIT_HOOK="ExecStopPost=-+/usr/local/sbin/ogn-check --exited"
+
 write_unit ogn-rf.service <<EOF
 [Unit]
 Description=OGN receiver: RF front end
@@ -293,6 +299,7 @@ Type=simple
 User=$OGN_USER
 WorkingDirectory=$REAL_DIR
 ExecStart=$(on_procserv 50000 ogn-rf "$REAL_DIR/ogn-rf" MyReceiver.conf)
+$EXIT_HOOK ogn-rf
 Restart=always
 RestartSec=10
 StandardOutput=journal
@@ -312,6 +319,7 @@ Type=simple
 User=$OGN_USER
 WorkingDirectory=$REAL_DIR
 ExecStart=$(on_procserv 50001 ogn-decode "$REAL_DIR/ogn-decode" MyReceiver.conf)
+$EXIT_HOOK ogn-decode
 Restart=always
 RestartSec=10
 StandardOutput=journal
@@ -642,32 +650,36 @@ WantedBy=multi-user.target
 EOF
 systemctl enable ogn-boot-check.service >/dev/null
 
-# Look for the common problems once the receiver has had time to start, and
-# put what was found on the console. Once per boot: nearly everything it finds
-# is fixed by editing the card and rebooting, and `sudo ogn-check` re-runs it.
-# Not tied to the network, unlike ogn-boot-check: a receiver that cannot get
-# online is one of the things worth explaining.
+# Look for the common problems at boot, and put what was found above the login
+# prompt: ordered before getty-pre.target, so it is there when the first prompt
+# is drawn. Problems that only show once the receiver has run, a restart loop
+# above all, are reported by the ExecStopPost hook on ogn-rf and ogn-decode.
+#
+# Ordered after nothing of ours: ogn-config-sync can spend minutes calibrating,
+# and the receiver waits on the network clock, and the login prompt must wait
+# for neither. ogn-check skips what depends on them not having happened yet.
+# The timeout is for the same reason.
 write_unit ogn-check.service <<'EOF'
 [Unit]
-Description=OGN receiver sanity check (SDR sticks, config, downloads)
+Description=OGN receiver check, shown above the login prompt
 Documentation=https://github.com/glidernet/ogn-bootstrap
+Before=getty-pre.target
+Wants=getty-pre.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/ogn-check
-EOF
-write_unit ogn-check.timer <<'EOF'
-[Unit]
-Description=OGN receiver sanity check, once the receiver has had time to start
-Documentation=https://github.com/glidernet/ogn-bootstrap
-
-[Timer]
-OnBootSec=2min
+ExecStart=/usr/local/sbin/ogn-check --boot
+TimeoutStartSec=30
 
 [Install]
-WantedBy=timers.target
+WantedBy=multi-user.target
 EOF
-systemctl enable ogn-check.timer >/dev/null
+systemctl enable ogn-check.service >/dev/null
+# Earlier builds ran it from a timer, two minutes after boot.
+if [ -e /etc/systemd/system/ogn-check.timer ]; then
+    systemctl disable --now ogn-check.timer >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/ogn-check.timer
+fi
 
 systemctl daemon-reload
 

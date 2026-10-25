@@ -1460,6 +1460,8 @@ motd_set() {
 USB_SYSFS="${OGN_USB_SYSFS:-/sys/bus/usb/devices}"
 MODULE_SYSFS="${OGN_MODULE_SYSFS:-/sys/module}"
 RTLSDR_RULES="${OGN_RTLSDR_RULES:-/usr/lib/udev/rules.d/*rtl*.rules /etc/udev/rules.d/*rtl*.rules}"
+USB_DEV="${OGN_USB_DEV:-/dev/bus/usb}"
+PROC_DIR="${OGN_PROC_DIR:-/proc}"
 
 # conf_syntax_check <file> — the first mistake that would stop libconfig
 # reading the file at all, as "line N: what", or nothing. The flattener above
@@ -1657,8 +1659,10 @@ check_config() {
     fi
 
     # ogn-config-sync keeps the settings already installed when the card's
-    # are unusable, and says why only in its own log.
-    if [ -e "$STATE_DIR/installed" ] && [ -r "$CONFIG_APPLIED" ] \
+    # are unusable, and says why only in its own log. Not asked before it has
+    # finished, as at boot: the card it has yet to copy is not a problem.
+    if [ "${CHECK_CONFIG_SYNCED:-1}" = 1 ] \
+       && [ -e "$STATE_DIR/installed" ] && [ -r "$CONFIG_APPLIED" ] \
        && [ "$(conf_digest)" != "$(cat "$CONFIG_APPLIED")" ]; then
         printf '! The receiver is not using the MyReceiver.conf on the card.\n'
         printf -- '- Why: journalctl -u ogn-config-sync\n'
@@ -1780,6 +1784,83 @@ check_running() {
         printf '! ADS-B is switched on, but readsb is not running.\n'
         printf -- '- Its log: journalctl -u ogn-adsb -u readsb\n'
     fi
+    return 0
+}
+
+# --------------------------------------------------------------------------
+# A unit in a restart loop
+#
+# ogn-rf and ogn-decode run ogn-check --exited from ExecStopPost, after every
+# exit. Restart=always with RestartSec=10 never lets them reach "failed", so
+# OnFailure= would never fire; and procServ --oneshot exits 0 however its
+# child died, so the exit status says nothing either. The restart count is
+# what tells a loop from a single stop.
+# --------------------------------------------------------------------------
+
+# loop_report_due <restarts so far> — whether this exit is one to report: the
+# second, then every 30th, about five minutes apart at RestartSec=10. Every
+# exit would redraw the console every ten seconds and fill the RAM journal
+# with the same report.
+loop_report_due() {
+    case "$1" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$1" -ge 1 ] && [ $(( ($1 - 1) % 30 )) -eq 0 ]
+}
+
+# unit_stop_requested <unit> — whether someone asked for this stop: a
+# systemctl stop or restart, or shutdown. Then it is not a loop, whatever the
+# count says, and nothing is worth reporting.
+unit_stop_requested() {
+    systemctl list-jobs --no-legend 2>/dev/null \
+        | awk -v u="$1.service" '$2 == u && ($3 == "stop" || $3 == "restart") { found = 1 } END { exit !found }'
+}
+
+# unit_output_tail <unit> [lines] — the last things the unit's own programs
+# said this boot, without timestamps. ogn-check's lines are left out: as
+# ExecStopPost it runs inside the same unit, and is logged under its name.
+unit_output_tail() {
+    journalctl -b -q --no-pager -o short-iso _SYSTEMD_UNIT="$1.service" -n 60 2>/dev/null \
+        | awk '$3 ~ /^ogn-check(\[[0-9]+\])?:$/ { next }
+               { for (i = 0; i < 3; i++) sub(/^[^ ]+ +/, ""); print }' \
+        | tail -n "${2:-8}"
+}
+
+# sdr_holders <USB port> — what has that stick's device node open, as
+# "name (pid)" words, or nothing. Run just after ogn-rf has exited, so
+# anything here is what it was fighting for the stick.
+sdr_holders() {
+    local d="$USB_SYSFS/$1" node pid out=""
+    [ -r "$d/busnum" ] && [ -r "$d/devnum" ] || return 0
+    node=$(printf '%s/%03d/%03d' "$USB_DEV" "$(cat "$d/busnum")" "$(cat "$d/devnum")")
+    for pid in $(fuser "$node" 2>/dev/null); do
+        pid=${pid%%[!0-9]*}
+        [ -n "$pid" ] || continue
+        out="$out $(cat "$PROC_DIR/$pid/comm" 2>/dev/null || printf '?') ($pid)"
+    done
+    printf '%s' "${out# }"
+}
+
+# check_exit <unit> <sdr_list output> — why a unit in a restart loop keeps
+# stopping: how long it lasted, the end of what it said, and anything else
+# holding a stick. Lines starting "| " are its output, quoted.
+check_exit() {
+    local u="$1" list="$2" restarts start stop ran port serial holders
+    restarts=$(systemctl show -p NRestarts --value "$u.service" 2>/dev/null || true)
+    start=$(systemctl show -p ExecMainStartTimestampMonotonic --value "$u.service" 2>/dev/null || true)
+    stop=$(systemctl show -p ExecMainExitTimestampMonotonic --value "$u.service" 2>/dev/null || true)
+    ran=$(( (${stop:-0} - ${start:-0}) / 1000000 ))
+    [ "$ran" -ge 0 ] || ran='?'
+    printf '! %s keeps stopping: lasted %ss, restarted %s since boot.\n' "$u" "$ran" \
+        "$([ "${restarts:-}" = 1 ] && printf once || printf '%s times' "${restarts:-?}")"
+    printf -- '- Its last output (all of it: journalctl -u %s):\n' "$u"
+    unit_output_tail "$u" 8 | cut -c1-70 | sed 's/^/| /'
+
+    printf '%s\n' "$list" | while IFS="$(printf '\t')" read -r serial _ port; do
+        [ -n "$port" ] || continue
+        holders=$(sdr_holders "$port")
+        [ -n "$holders" ] || continue
+        printf '! Stick "%s" (USB %s) is held open by %s.\n' "$serial" "$port" "$holders"
+        printf -- '- Only one program can use a stick at a time.\n'
+    done
     return 0
 }
 OGN_PAYLOAD_ogn_common_sh
@@ -2293,6 +2374,12 @@ on_procserv() {
     printf '/usr/bin/procServ --foreground --logfile=- --oneshot --name=%s %s %s' "$name" "$port" "$*"
 }
 
+# After every exit, ogn-check looks at whether the unit is caught in a restart
+# loop and, if it is, puts the reason on the console. "+" because the units run
+# as $OGN_USER and the report is written to /run as root; "-" so that nothing
+# it does can stand in the way of the restart.
+EXIT_HOOK="ExecStopPost=-+/usr/local/sbin/ogn-check --exited"
+
 write_unit ogn-rf.service <<EOF
 [Unit]
 Description=OGN receiver: RF front end
@@ -2306,6 +2393,7 @@ Type=simple
 User=$OGN_USER
 WorkingDirectory=$REAL_DIR
 ExecStart=$(on_procserv 50000 ogn-rf "$REAL_DIR/ogn-rf" MyReceiver.conf)
+$EXIT_HOOK ogn-rf
 Restart=always
 RestartSec=10
 StandardOutput=journal
@@ -2325,6 +2413,7 @@ Type=simple
 User=$OGN_USER
 WorkingDirectory=$REAL_DIR
 ExecStart=$(on_procserv 50001 ogn-decode "$REAL_DIR/ogn-decode" MyReceiver.conf)
+$EXIT_HOOK ogn-decode
 Restart=always
 RestartSec=10
 StandardOutput=journal
@@ -2655,32 +2744,36 @@ WantedBy=multi-user.target
 EOF
 systemctl enable ogn-boot-check.service >/dev/null
 
-# Look for the common problems once the receiver has had time to start, and
-# put what was found on the console. Once per boot: nearly everything it finds
-# is fixed by editing the card and rebooting, and `sudo ogn-check` re-runs it.
-# Not tied to the network, unlike ogn-boot-check: a receiver that cannot get
-# online is one of the things worth explaining.
+# Look for the common problems at boot, and put what was found above the login
+# prompt: ordered before getty-pre.target, so it is there when the first prompt
+# is drawn. Problems that only show once the receiver has run, a restart loop
+# above all, are reported by the ExecStopPost hook on ogn-rf and ogn-decode.
+#
+# Ordered after nothing of ours: ogn-config-sync can spend minutes calibrating,
+# and the receiver waits on the network clock, and the login prompt must wait
+# for neither. ogn-check skips what depends on them not having happened yet.
+# The timeout is for the same reason.
 write_unit ogn-check.service <<'EOF'
 [Unit]
-Description=OGN receiver sanity check (SDR sticks, config, downloads)
+Description=OGN receiver check, shown above the login prompt
 Documentation=https://github.com/glidernet/ogn-bootstrap
+Before=getty-pre.target
+Wants=getty-pre.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/ogn-check
-EOF
-write_unit ogn-check.timer <<'EOF'
-[Unit]
-Description=OGN receiver sanity check, once the receiver has had time to start
-Documentation=https://github.com/glidernet/ogn-bootstrap
-
-[Timer]
-OnBootSec=2min
+ExecStart=/usr/local/sbin/ogn-check --boot
+TimeoutStartSec=30
 
 [Install]
-WantedBy=timers.target
+WantedBy=multi-user.target
 EOF
-systemctl enable ogn-check.timer >/dev/null
+systemctl enable ogn-check.service >/dev/null
+# Earlier builds ran it from a timer, two minutes after boot.
+if [ -e /etc/systemd/system/ogn-check.timer ]; then
+    systemctl disable --now ogn-check.timer >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/ogn-check.timer
+fi
 
 systemctl daemon-reload
 
@@ -4324,12 +4417,18 @@ cat > /usr/local/sbin/ogn-check <<'OGN_PAYLOAD_ogn_check'
 # ogn-check — look for the problems that most often keep a receiver off the
 # air, and say what they are where somebody will see them.
 #
-#   sudo ogn-check     check now, and print what was found
+#   sudo ogn-check                 check now, and print what was found
+#   ogn-check --boot               the same, at boot, before the login prompt
+#   ogn-check --exited <unit>      after ogn-rf or ogn-decode exits
 #
-# Run two minutes after every boot by ogn-check.timer. The report goes to the
-# journal, to the console above the login prompt, and to the login banner, so
-# a receiver with a screen plugged in explains itself without anyone having
-# to know which log to read. Run it again by hand once something is fixed.
+# ogn-check.service runs --boot before any getty starts, so the report is
+# above the first login prompt. ogn-rf and ogn-decode run --exited from
+# ExecStopPost, which reports only when the unit is caught in a restart loop,
+# and adds the end of its output and anything else holding the stick.
+#
+# The report goes to the journal, to the console above the login prompt, and
+# to the login banner, so a receiver with a screen plugged in explains itself
+# without anyone having to know which log to read.
 #
 # Copyright (c) 2026 ifly7charlie. MIT licence, see LICENSE.
 
@@ -4339,9 +4438,14 @@ LIBDIR="${OGN_LIBDIR:-/usr/local/lib/ogn-bootstrap}"
 # shellcheck source=src/ogn-common.sh
 . "$LIBDIR/ogn-common.sh"
 
+MODE=now
+EXITED=""
 case "${1:-}" in
     '')        ;;
-    -h|--help) sed -n '3,11p' "$0"; exit 0 ;;
+    --boot)    MODE=boot ;;
+    --exited)  MODE=exited; EXITED="${2:-}"
+               case "$EXITED" in ogn-rf|ogn-decode) ;; *) die "--exited wants ogn-rf or ogn-decode" ;; esac ;;
+    -h|--help) sed -n '3,17p' "$0"; exit 0 ;;
     *)         die "unknown argument: $1  (try: sudo ogn-check)" ;;
 esac
 
@@ -4354,6 +4458,24 @@ need_root
 CHECK_ISSUE=/run/ogn-bootstrap/check.issue
 CHECK_ISSUE_LINK=/etc/issue.d/50-ogn-check.issue
 CHECK_MOTD=/run/motd.d/60-ogn-check
+
+if [ "$MODE" = exited ]; then
+    # Everything that is not a loop leaves quietly, and before any work: this
+    # runs at every stop of the receiver, shutdown included.
+    unit_stop_requested "$EXITED" && exit 0
+    loop_report_due "$(systemctl show -p NRestarts --value "$EXITED.service" 2>/dev/null || true)" || exit 0
+    # ogn-decode can only run on what ogn-rf gives it. With ogn-rf looping
+    # too, its own report is the one that points at the cause.
+    if [ "$EXITED" = ogn-decode ]; then
+        [ "$(systemctl show -p NRestarts --value ogn-rf.service 2>/dev/null || true)" = 0 ] \
+            && systemctl is-active --quiet ogn-rf.service || exit 0
+    fi
+fi
+
+# At boot ogn-config-sync may not have copied the card into place yet.
+if [ "$(systemctl show -p ActiveState --value ogn-config-sync.service 2>/dev/null || true)" != active ]; then
+    export CHECK_CONFIG_SYNCED=0
+fi
 
 trap conf_cleanup EXIT
 if [ -r "$BOOT_CONF" ] && _libconfig_flatten "$BOOT_CONF" | grep -q .; then
@@ -4368,10 +4490,13 @@ fi
 SDRS=$(sdr_list)
 SETUP=$(check_summary "$HOME_DIR") || true
 FINDINGS=$(
+    [ "$MODE" != exited ] || check_exit "$EXITED" "$SDRS"
     check_config "$BOOT_CONF"
     check_install "$HOME_DIR"
     check_sdr "$SDRS"
-    check_running
+    # At boot nothing has had time to fail yet, and after an exit check_exit
+    # has said it better. The summary line still shows what is running.
+    [ "$MODE" != now ] || check_running
 ) || true
 
 PROBLEMS=$(printf '%s\n' "$FINDINGS" | grep -c '^!' || true)
@@ -4394,7 +4519,7 @@ report() {
     printf '  %s\n' "$SETUP"
     if [ -n "$FINDINGS" ]; then
         printf '\n'
-        printf '%s\n' "$FINDINGS" | sed 's/^- /    /; s/^/  /'
+        printf '%s\n' "$FINDINGS" | sed 's/^- /    /; s/^| /      /; s/^/  /'
     fi
 
     # Always listed, because "which stick is which" is the question every
@@ -4410,8 +4535,9 @@ report() {
 }
 
 # Control characters out: the serials and product names come from whatever is
-# plugged into the USB ports, and this is printed on terminals -- the console,
-# every login, the journal. Tabs and newlines are the report's own.
+# plugged into the USB ports, the quoted output from the decoder, and this is
+# printed on terminals -- the console, every login, the journal. Tabs and
+# newlines are the report's own.
 REPORT=$(report | LC_ALL=C tr -d '\000-\010\013-\037\177')
 printf '%s\n' "$REPORT"
 
@@ -4421,13 +4547,15 @@ install -d -m 0755 "$(dirname "$CHECK_ISSUE")" "$(dirname "$CHECK_MOTD")" "$(dir
 printf '%s\n' "$REPORT" | tr -d '\\' > "$CHECK_ISSUE.tmp" && mv "$CHECK_ISSUE.tmp" "$CHECK_ISSUE"
 printf '%s\n' "$REPORT" > "$CHECK_MOTD.tmp" && mv "$CHECK_MOTD.tmp" "$CHECK_MOTD"
 [ -L "$CHECK_ISSUE_LINK" ] || ln -sfn "$CHECK_ISSUE" "$CHECK_ISSUE_LINK"
-# Redraws a login prompt nobody has started typing at, so the report appears
-# without a keypress.
-agetty --reload >/dev/null 2>&1 || true
+# At boot no getty has started, and the first prompt reads the file anyway.
+# Later, this redraws a prompt nobody has started typing at, so the report
+# appears without a keypress.
+[ "$MODE" = boot ] || agetty --reload >/dev/null 2>&1 || true
 
-# A failed unit is what `systemctl status` and `systemctl --failed` show, so
-# a problem is visible there too.
-[ "$PROBLEMS" -eq 0 ]
+# A failed unit is what `systemctl status` and `systemctl --failed` show, so a
+# problem found at boot is visible there too. After an exit it would only be
+# ExecStopPost failing, which the unit ignores.
+[ "$MODE" = exited ] || [ "$PROBLEMS" -eq 0 ]
 OGN_PAYLOAD_ogn_check
 chmod 0755 /usr/local/sbin/ogn-check
 

@@ -1422,6 +1422,8 @@ motd_set() {
 USB_SYSFS="${OGN_USB_SYSFS:-/sys/bus/usb/devices}"
 MODULE_SYSFS="${OGN_MODULE_SYSFS:-/sys/module}"
 RTLSDR_RULES="${OGN_RTLSDR_RULES:-/usr/lib/udev/rules.d/*rtl*.rules /etc/udev/rules.d/*rtl*.rules}"
+USB_DEV="${OGN_USB_DEV:-/dev/bus/usb}"
+PROC_DIR="${OGN_PROC_DIR:-/proc}"
 
 # conf_syntax_check <file> — the first mistake that would stop libconfig
 # reading the file at all, as "line N: what", or nothing. The flattener above
@@ -1619,8 +1621,10 @@ check_config() {
     fi
 
     # ogn-config-sync keeps the settings already installed when the card's
-    # are unusable, and says why only in its own log.
-    if [ -e "$STATE_DIR/installed" ] && [ -r "$CONFIG_APPLIED" ] \
+    # are unusable, and says why only in its own log. Not asked before it has
+    # finished, as at boot: the card it has yet to copy is not a problem.
+    if [ "${CHECK_CONFIG_SYNCED:-1}" = 1 ] \
+       && [ -e "$STATE_DIR/installed" ] && [ -r "$CONFIG_APPLIED" ] \
        && [ "$(conf_digest)" != "$(cat "$CONFIG_APPLIED")" ]; then
         printf '! The receiver is not using the MyReceiver.conf on the card.\n'
         printf -- '- Why: journalctl -u ogn-config-sync\n'
@@ -1742,5 +1746,82 @@ check_running() {
         printf '! ADS-B is switched on, but readsb is not running.\n'
         printf -- '- Its log: journalctl -u ogn-adsb -u readsb\n'
     fi
+    return 0
+}
+
+# --------------------------------------------------------------------------
+# A unit in a restart loop
+#
+# ogn-rf and ogn-decode run ogn-check --exited from ExecStopPost, after every
+# exit. Restart=always with RestartSec=10 never lets them reach "failed", so
+# OnFailure= would never fire; and procServ --oneshot exits 0 however its
+# child died, so the exit status says nothing either. The restart count is
+# what tells a loop from a single stop.
+# --------------------------------------------------------------------------
+
+# loop_report_due <restarts so far> — whether this exit is one to report: the
+# second, then every 30th, about five minutes apart at RestartSec=10. Every
+# exit would redraw the console every ten seconds and fill the RAM journal
+# with the same report.
+loop_report_due() {
+    case "$1" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$1" -ge 1 ] && [ $(( ($1 - 1) % 30 )) -eq 0 ]
+}
+
+# unit_stop_requested <unit> — whether someone asked for this stop: a
+# systemctl stop or restart, or shutdown. Then it is not a loop, whatever the
+# count says, and nothing is worth reporting.
+unit_stop_requested() {
+    systemctl list-jobs --no-legend 2>/dev/null \
+        | awk -v u="$1.service" '$2 == u && ($3 == "stop" || $3 == "restart") { found = 1 } END { exit !found }'
+}
+
+# unit_output_tail <unit> [lines] — the last things the unit's own programs
+# said this boot, without timestamps. ogn-check's lines are left out: as
+# ExecStopPost it runs inside the same unit, and is logged under its name.
+unit_output_tail() {
+    journalctl -b -q --no-pager -o short-iso _SYSTEMD_UNIT="$1.service" -n 60 2>/dev/null \
+        | awk '$3 ~ /^ogn-check(\[[0-9]+\])?:$/ { next }
+               { for (i = 0; i < 3; i++) sub(/^[^ ]+ +/, ""); print }' \
+        | tail -n "${2:-8}"
+}
+
+# sdr_holders <USB port> — what has that stick's device node open, as
+# "name (pid)" words, or nothing. Run just after ogn-rf has exited, so
+# anything here is what it was fighting for the stick.
+sdr_holders() {
+    local d="$USB_SYSFS/$1" node pid out=""
+    [ -r "$d/busnum" ] && [ -r "$d/devnum" ] || return 0
+    node=$(printf '%s/%03d/%03d' "$USB_DEV" "$(cat "$d/busnum")" "$(cat "$d/devnum")")
+    for pid in $(fuser "$node" 2>/dev/null); do
+        pid=${pid%%[!0-9]*}
+        [ -n "$pid" ] || continue
+        out="$out $(cat "$PROC_DIR/$pid/comm" 2>/dev/null || printf '?') ($pid)"
+    done
+    printf '%s' "${out# }"
+}
+
+# check_exit <unit> <sdr_list output> — why a unit in a restart loop keeps
+# stopping: how long it lasted, the end of what it said, and anything else
+# holding a stick. Lines starting "| " are its output, quoted.
+check_exit() {
+    local u="$1" list="$2" restarts start stop ran port serial holders
+    restarts=$(systemctl show -p NRestarts --value "$u.service" 2>/dev/null || true)
+    start=$(systemctl show -p ExecMainStartTimestampMonotonic --value "$u.service" 2>/dev/null || true)
+    stop=$(systemctl show -p ExecMainExitTimestampMonotonic --value "$u.service" 2>/dev/null || true)
+    ran=$(( (${stop:-0} - ${start:-0}) / 1000000 ))
+    [ "$ran" -ge 0 ] || ran='?'
+    printf '! %s keeps stopping: lasted %ss, restarted %s since boot.\n' "$u" "$ran" \
+        "$([ "${restarts:-}" = 1 ] && printf once || printf '%s times' "${restarts:-?}")"
+    printf -- '- Its last output (all of it: journalctl -u %s):\n' "$u"
+    unit_output_tail "$u" 8 | cut -c1-70 | sed 's/^/| /'
+
+    printf '%s\n' "$list" | while IFS="$(printf '\t')" read -r serial _ port; do
+        [ -n "$port" ] || continue
+        holders=$(sdr_holders "$port")
+        [ -n "$holders" ] || continue
+        printf '! Stick "%s" (USB %s) is held open by %s.\n' "$serial" "$port" "$holders"
+        printf -- '- Only one program can use a stick at a time.\n'
+    done
     return 0
 }
