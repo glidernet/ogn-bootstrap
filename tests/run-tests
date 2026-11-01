@@ -602,6 +602,18 @@ tmr = src.split("write_unit ogn-maintenance.timer <<EOF", 1)[1].split("\nEOF", 1
 assert "OnCalendar=$WINDOW" in tmr
 assert "Persistent=" not in tmr
 PY
+# The kernel on a 64-bit Pi is not in Debian-Security.
+python3 - <<'PY' && ok "unattended upgrades include the Raspberry Pi kernel" || bad "unattended upgrades include the Raspberry Pi kernel"
+src = open("src/ogn-install").read()
+conf = src.split("51ogn-unattended-upgrades <<'EOF'", 1)[1].split("\nEOF", 1)[0]
+assert '"site=archive.raspberrypi.com,codename=${distro_codename}";' in conf
+PY
+# The boot partition is read-only outside this window, so this is the only chance.
+python3 - <<'PY' && ok "bootloader updates are staged while the boot partition is open" || bad "bootloader updates are staged while the boot partition is open"
+src = open("src/ogn-maintenance").read()
+fn = src.split("do_updates() {", 1)[1].split("\n}\n", 1)[0]
+assert fn.index("boot_rw") < fn.index("rpi-eeprom-update -a") < fn.index("boot_ro")
+PY
 python3 - <<'PY' && ok "it waits for cloud-init, then Connect, then arms and reboots" || bad "it waits for cloud-init, then Connect, then arms and reboots"
 src = open("src/ogn-maintenance").read()
 fn = src.split("first_reboot() {", 1)[1].split("\n}\n", 1)[0]

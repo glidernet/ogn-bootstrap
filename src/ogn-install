@@ -572,8 +572,14 @@ cat > /etc/apt/apt.conf.d/51ogn-unattended-upgrades <<'EOF'
 // Security updates only, and never an automatic reboot: the maintenance
 // cycle owns reboots, because it is the only thing that knows when the
 // read-only overlay is out of the way. Installed by ogn-bootstrap.
+//
+// The kernel and firmware on 64-bit Raspberry Pi OS come from
+// archive.raspberrypi.com, not Debian-Security, and its kernel security fixes
+// arrive in the ordinary suite. Matched by host so it cannot be missed by a
+// label that does not say what we expected.
 Unattended-Upgrade::Origins-Pattern {
     "origin=Debian,codename=${distro_codename}-security,label=Debian-Security";
+    "site=archive.raspberrypi.com,codename=${distro_codename}";
     "origin=Raspbian,codename=${distro_codename},label=Raspbian";
 };
 Unattended-Upgrade::Automatic-Reboot "false";

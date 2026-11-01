@@ -67,6 +67,14 @@ do_updates() {
     apt_wait
     unattended-upgrade -v 2>&1 | sed 's/^/  /' || warn "unattended-upgrade reported a problem; continuing"
 
+    # Raspberry Pi OS stages bootloader updates onto /boot/firmware at boot,
+    # where we keep it read-only, so it never manages to. Do it here while the
+    # partition is open; the reboot that ends the cycle applies it.
+    if command -v rpi-eeprom-update >/dev/null 2>&1; then
+        log "checking for a bootloader update"
+        rpi-eeprom-update -a 2>&1 | sed 's/^/  /' || warn "rpi-eeprom-update reported a problem; continuing"
+    fi
+
     log "checking for a new OGN release"
     if ogn-update; then
         log "OGN software is up to date"
