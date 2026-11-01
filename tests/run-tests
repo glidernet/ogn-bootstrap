@@ -595,6 +595,13 @@ tmr = src.split("write_unit ogn-first-reboot.timer <<EOF", 1)[1].split("\nEOF", 
 assert "OnBootSec=" in tmr and "OnUnitInactiveSec=" in tmr
 assert re.search(r"^WantedBy=timers\.target", tmr, re.M)
 PY
+# Its stamp is on the overlaid root, so every read-only boot is a "missed" run.
+python3 - <<'PY' && ok "the maintenance timer does not catch up at boot" || bad "the maintenance timer does not catch up at boot"
+src = open("src/ogn-install").read()
+tmr = src.split("write_unit ogn-maintenance.timer <<EOF", 1)[1].split("\nEOF", 1)[0]
+assert "OnCalendar=$WINDOW" in tmr
+assert "Persistent=" not in tmr
+PY
 python3 - <<'PY' && ok "it waits for cloud-init, then Connect, then arms and reboots" || bad "it waits for cloud-init, then Connect, then arms and reboots"
 src = open("src/ogn-maintenance").read()
 fn = src.split("first_reboot() {", 1)[1].split("\n}\n", 1)[0]

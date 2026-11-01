@@ -2685,6 +2685,11 @@ Documentation=https://github.com/glidernet/ogn-bootstrap
 Type=oneshot
 ExecStart=/usr/local/sbin/ogn-maintenance --scheduled
 EOF
+    # Not Persistent=: its stamp is under /var/lib, which the overlay throws
+    # away, so every read-only boot looks like a missed window and starts a
+    # cycle. The writable boot in the middle reboots before the randomised
+    # catch-up gets to refresh the stamp, and the receiver reboots for ever.
+    # A window missed because the power was off waits for next week.
     write_unit ogn-maintenance.timer <<EOF
 [Unit]
 Description=OGN receiver maintenance window
@@ -2692,7 +2697,6 @@ Description=OGN receiver maintenance window
 [Timer]
 OnCalendar=$WINDOW
 RandomizedDelaySec=30m
-Persistent=true
 
 [Install]
 WantedBy=timers.target
