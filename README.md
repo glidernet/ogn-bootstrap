@@ -1,5 +1,8 @@
 # ogn-bootstrap
 
+> [!NOTE]
+> This is not an official glidernet (OGN) project
+
 ogn-bootstrap turns a Raspberry Pi into a receiver for the
 [Open Glider Network](https://www.glidernet.org) (OGN). It picks up
 aircraft broadcasting FLARM, ADS-B, ADS-L, FANET and other tracking signals
