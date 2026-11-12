@@ -592,6 +592,7 @@ to share it with other websites as well, switch them on here:
     ADSBFi        = false;
     ADSBLol       = false;
     AirplanesLive = false;
+    PlaneTrack    = false;
 
     MLAT          = false;
 
@@ -619,6 +620,11 @@ from the Pi's serial number, so it stays the same even if you rewrite the card,
 and the site keeps your history. Only a scrambled (hashed) version of the
 serial number leaves the Pi. If a site already knows your receiver by a
 different ID, you can set `UUID` in the `Feed` section to use that one instead.
+
+PlaneTrack is a commercial tracker with a free tier. If you feed it, you can
+claim the receiver at `https://planetrack.ai/myip?uuid=<UUID>`, using the
+UUID after `--uuid` in `/etc/default/readsb`, and get PlaneTrack Premium free
+while it feeds.
 
 ### FlightAware, Flightradar24 and Plane Finder
 

@@ -1061,8 +1061,8 @@ ADSB_JSON_DIR=/run/readsb
 # mistyped into a receiver nobody can get back to, and so that what a given
 # setting sends, and to whom, can be read in one place.
 #
-# All four take Beast on 30004 and multilateration on 31090.
-ADSB_FEEDS="ADSBExchange ADSBFi ADSBLol AirplanesLive"
+# All five take Beast on 30004 and multilateration on 31090.
+ADSB_FEEDS="ADSBExchange ADSBFi ADSBLol AirplanesLive PlaneTrack"
 ADSB_FEED_PORT=30004
 ADSB_MLAT_PORT=31090
 
@@ -1072,6 +1072,7 @@ adsb_feed_host() {
         ADSBFi)        printf 'feed.adsb.fi' ;;
         ADSBLol)       printf 'feed.adsb.lol' ;;
         AirplanesLive) printf 'feed.airplanes.live' ;;
+        PlaneTrack)    printf 'feed.planetrack.ai' ;;
         *)             return 1 ;;
     esac
 }

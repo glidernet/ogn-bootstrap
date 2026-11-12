@@ -1016,6 +1016,25 @@ case "$ADC" in
     *"feed.example.org,30004,beast_reduce_plus_out"*) ok  "a well-formed Custom target is fed" ;;
     *)                                                bad "a well-formed Custom target is fed" "$ADC" ;;
 esac
+# PlaneTrack ships off like the rest, and once switched on is fed Beast and
+# multilateration on the same ports as the others.
+case "$AD" in
+    *planetrack*) bad "PlaneTrack is not fed until it is switched on" "$AD" ;;
+    *)            ok  "PlaneTrack is not fed until it is switched on" ;;
+esac
+sed 's/PlaneTrack    = false/PlaneTrack = true/' tests/fixtures/adsb.conf > "$ADT/c.conf"
+conf_load "$ADT/c.conf"
+ADP=$(adsb_render 2>/dev/null)
+case "$ADP" in
+    *"--net-connector feed.planetrack.ai,30004,beast_reduce_plus_out"*) ok  "PlaneTrack is fed once switched on" ;;
+    *)                                                                  bad "PlaneTrack is fed once switched on" "$ADP" ;;
+esac
+ML=$(adsb_mlat_render PlaneTrack 2>/dev/null)
+case "$ML" in
+    *"MLAT_SERVER=feed.planetrack.ai:31090"*) ok  "and its mlat goes to feed.planetrack.ai:31090" ;;
+    *)                                        bad "and its mlat goes to feed.planetrack.ai:31090" "$ML" ;;
+esac
+is "and its mlat client is ogn-mlat@planetrack" "$(adsb_feed_instance PlaneTrack)" "planetrack"
 rm -rf "$ADT" "$ADID"
 
 # The whole apply path, against stubs. systemctl is what must not be called
