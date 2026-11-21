@@ -9,10 +9,9 @@ aircraft broadcasting FLARM, ADS-B, ADS-L, FANET and other tracking signals
 around your airfield and shares them on
 [live.glidernet.org](https://live.glidernet.org).
 
-If you add a second SDR stick, it also simplifies sending ADS-B to tracking
-services such as ADS-B Exchange, adsb.fi, adsb.lol and airplanes.live. Each
-one is a single setting, and you can turn on as many as you like (see
-[ADS-B](#ads-b)).
+If you add a second SDR stick, it also simplifies sending ADS-B to
+tracking various ADSB services. Each one is a single setting, and you
+can turn on as many as you like (see [ADS-B](#ads-b)).
 
 You choose **OGN Receiver** in Raspberry Pi Imager, type in where your aerial
 is, and put the card in the Pi. All the setup happens in Imager and in one
