@@ -1091,6 +1091,27 @@ adsb_uuid() {
     printf '%s-%s-4%s-%s%s-%s' "${h:0:8}" "${h:8:4}" "${h:13:3}" "$v" "${h:17:3}" "${h:20:12}"
 }
 
+# adsb_uuid_describe — the receiver ID as something to read, saying where it
+# came from when that is not the usual answer. The ID is what a site's "my
+# receiver" page asks for, so it has to be legible somewhere other than the
+# --uuid flag in a generated file. One wording, used by `ogn-adsb id`,
+# `ogn-adsb status` and the login banner, so the three cannot drift apart.
+#
+# Needs conf_load first, and prints no newline: the callers lay it out.
+adsb_uuid_describe() {
+    local uuid
+    uuid=$(adsb_uuid)
+    if [ -z "$uuid" ]; then
+        printf 'none — this receiver feeds anonymously'
+    elif ! adsb_uuid_ok "$uuid"; then
+        printf '%s — not a UUID; ADSB.Feed.UUID needs fixing' "$uuid"
+    elif [ -n "$(conf_get ADSB.Feed.UUID "")" ]; then
+        printf '%s (set on the card)' "$uuid"
+    else
+        printf '%s' "$uuid"
+    fi
+}
+
 # adsb_render — print /etc/default/readsb from the loaded card settings.
 #
 # Pure: reads the config (and the hardware serial, for adsb_uuid), writes
@@ -1288,18 +1309,23 @@ adsb_feed_summary() {
 }
 
 ADSB_MOTD_TEMPLATE='
-  ADS-B:       readsb on stick %s, feeding %s
+  ADS-B:       readsb on stick %s, feeding %s%s
                Is it hearing anything?  sudo ogn-adsb status
                Statistics:              http://<this-pi>:%s/
 
 '
 adsb_motd_update() {
-    local tmp
+    local tmp idline=""
     mkdir -p "$(dirname "$ADSB_MOTD")" 2>/dev/null || return 0
     tmp=$(mktemp) || return 0
+    # The ID means nothing until a site is being fed, and the banner is read by
+    # people who are not looking for it. Indented to the template's own column.
+    if [ -n "$(adsb_enabled_feeds)" ]; then
+        idline=$(printf '\n               Receiver ID:             %s' "$(adsb_uuid_describe)")
+    fi
     # shellcheck disable=SC2059
     printf "$ADSB_MOTD_TEMPLATE" \
-        "$(conf_get ADSB.DeviceSerial '?')" "$(adsb_feed_summary)" "$ADSB_WEB_PORT" > "$tmp"
+        "$(conf_get ADSB.DeviceSerial '?')" "$(adsb_feed_summary)" "$idline" "$ADSB_WEB_PORT" > "$tmp"
     cmp -s "$tmp" "$ADSB_MOTD" || install -m 0644 "$tmp" "$ADSB_MOTD" 2>/dev/null || true
     rm -f "$tmp"
     return 0
@@ -1374,10 +1400,17 @@ adsb_apply() {
 # has to happen here or not at all.
 # --------------------------------------------------------------------------
 FIRST_REBOOT_DIR="${OGN_FIRST_REBOOT_DIR:-/var/lib/ogn-bootstrap}"
+# The three below are read by ogn-install and ogn-maintenance, which source
+# this file. shellcheck sees one file at a time, so to it they look unused.
+# Not exported on purpose: these belong to the scripts that source this, not
+# to every process they go on to start.
+# shellcheck disable=SC2034
 FIRST_REBOOT_PENDING="$FIRST_REBOOT_DIR/first-reboot.pending"
+# shellcheck disable=SC2034
 FIRST_REBOOT_MOTD="${OGN_FIRST_REBOOT_MOTD:-/etc/motd.d/15-ogn-first-reboot}"
 # A personal auth key expires six hours after it is made. Past that there is
 # nothing left to wait for.
+# shellcheck disable=SC2034
 FIRST_REBOOT_LIMIT="${OGN_FIRST_REBOOT_LIMIT:-21600}"
 HOME_ROOT="${OGN_HOME_ROOT:-/home}"
 

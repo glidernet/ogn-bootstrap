@@ -600,9 +600,8 @@ to share it with other websites as well, switch them on here:
 ```
 
 Each site you switch on will receive every aircraft your receiver picks up, for
-as long as it's switched on. None of them need an account or a sharing key,
-and none of them can connect back in to your receiver. You can choose each
-site separately.
+as long as it's switched on. None of them can connect back in to your
+receiver. You can choose each site separately.
 
 - **`MLAT`** (multilateration) lets the sites work out the position of
   aircraft that don't broadcast their own, by comparing when the same signal
@@ -620,10 +619,22 @@ and the site keeps your history. Only a scrambled (hashed) version of the
 serial number leaves the Pi. If a site already knows your receiver by a
 different ID, you can set `UUID` in the `Feed` section to use that one instead.
 
-PlaneTrack is a commercial tracker with a free tier. If you feed it, you can
-claim the receiver at `https://planetrack.ai/myip?uuid=<UUID>`, using the
-UUID after `--uuid` in `/etc/default/readsb`, and get PlaneTrack Premium free
-while it feeds.
+The sites' own pages ask for that ID when you want to claim your receiver, so
+you'll need to be able to read it:
+
+```sh
+ogn-adsb id            # just the ID, with nothing around it. No sudo needed
+sudo ogn-adsb status   # the ID, along with everything else about the feed
+```
+
+It's in the message you see when you log in too, once at least one site is
+switched on.
+
+A new Pi means a new ID, though, since nothing is stored: the sites will treat
+it as a new receiver unless you put the old ID in `UUID` on the card.
+
+PlaneTrack is a commercial tracking site. Claim your receiver at
+`https://planetrack.ai/myip?uuid=<ID>`
 
 ### FlightAware, Flightradar24 and Plane Finder
 

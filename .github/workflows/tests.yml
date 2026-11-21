@@ -1,0 +1,52 @@
+name: tests
+
+# Runs tests/run-tests: the offline suite, which needs no Pi, no SDR and no
+# network.
+#
+# The suite is where this repository's rules about itself are written down --
+# that boot/vendor-data is in step with src/, that the image build job holds no
+# write permissions, what the installer must and must not do. Until this
+# workflow existed those rules were only ever checked on whichever machine
+# someone happened to run them on by hand, which is how a shellcheck warning
+# sat in src/ogn-common.sh across several releases without anyone seeing it.
+#
+# Everything the suite needs -- bash, shellcheck, python3, curl -- is already on
+# GitHub's Ubuntu runners, so this installs nothing and downloads nothing. The
+# one script in the repository that does download anything, tools/build-image.sh,
+# refuses to start as a non-root user, which is what the runner is.
+#
+# No token. It reads the checkout and reports a pass or a fail.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # The suite skips its own shellcheck gate when shellcheck is not
+      # installed: it prints "skip" and still passes. On a workstation that is
+      # the right call. Here it is the one outcome worth refusing, because a
+      # green run that quietly checked less than it claims is worse than a red
+      # one. The version is printed because which shellcheck you have decides
+      # which warnings you see.
+      - name: Check the tools the suite expects are present
+        run: |
+          set -euo pipefail
+          for t in shellcheck python3 curl; do
+              command -v "$t" >/dev/null || { printf 'missing: %s\n' "$t" >&2; exit 1; }
+          done
+          shellcheck --version
+
+      - name: Run the suite
+        run: bash tests/run-tests
