@@ -1092,10 +1092,9 @@ adsb_uuid() {
 }
 
 # adsb_uuid_describe — the receiver ID as something to read, saying where it
-# came from when that is not the usual answer. The ID is what a site's "my
-# receiver" page asks for, so it has to be legible somewhere other than the
-# --uuid flag in a generated file. One wording, used by `ogn-adsb id`,
-# `ogn-adsb status` and the login banner, so the three cannot drift apart.
+# came from when that is not the usual answer. One wording for `ogn-adsb
+# status`, the login banner, and what `ogn-adsb id` says when there is no
+# usable ID, so the three cannot drift apart.
 #
 # Needs conf_load first, and prints no newline: the callers lay it out.
 adsb_uuid_describe() {
@@ -1318,9 +1317,10 @@ adsb_motd_update() {
     local tmp idline=""
     mkdir -p "$(dirname "$ADSB_MOTD")" 2>/dev/null || return 0
     tmp=$(mktemp) || return 0
-    # The ID means nothing until a site is being fed, and the banner is read by
-    # people who are not looking for it. Indented to the template's own column.
-    if [ -n "$(adsb_enabled_feeds)" ]; then
+    # No site has the ID until one is being fed, and the banner is read by
+    # people not looking for it. Custom counts: adsb_render sends --uuid for
+    # that too. Indented to the template's own column.
+    if [ -n "$(adsb_enabled_feeds)" ] || [ -n "$(conf_get ADSB.Feed.Custom '')" ]; then
         idline=$(printf '\n               Receiver ID:             %s' "$(adsb_uuid_describe)")
     fi
     # shellcheck disable=SC2059
@@ -1400,10 +1400,10 @@ adsb_apply() {
 # has to happen here or not at all.
 # --------------------------------------------------------------------------
 FIRST_REBOOT_DIR="${OGN_FIRST_REBOOT_DIR:-/var/lib/ogn-bootstrap}"
-# The three below are read by ogn-install and ogn-maintenance, which source
-# this file. shellcheck sees one file at a time, so to it they look unused.
-# Not exported on purpose: these belong to the scripts that source this, not
-# to every process they go on to start.
+# The three below are used by ogn-install and ogn-maintenance, which source
+# this file; shellcheck sees one file at a time, so to it they look unused.
+# Not exported on purpose: they belong to those scripts, not to every process
+# those go on to start.
 # shellcheck disable=SC2034
 FIRST_REBOOT_PENDING="$FIRST_REBOOT_DIR/first-reboot.pending"
 # shellcheck disable=SC2034

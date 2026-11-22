@@ -1130,10 +1130,9 @@ adsb_uuid() {
 }
 
 # adsb_uuid_describe — the receiver ID as something to read, saying where it
-# came from when that is not the usual answer. The ID is what a site's "my
-# receiver" page asks for, so it has to be legible somewhere other than the
-# --uuid flag in a generated file. One wording, used by `ogn-adsb id`,
-# `ogn-adsb status` and the login banner, so the three cannot drift apart.
+# came from when that is not the usual answer. One wording for `ogn-adsb
+# status`, the login banner, and what `ogn-adsb id` says when there is no
+# usable ID, so the three cannot drift apart.
 #
 # Needs conf_load first, and prints no newline: the callers lay it out.
 adsb_uuid_describe() {
@@ -1356,9 +1355,10 @@ adsb_motd_update() {
     local tmp idline=""
     mkdir -p "$(dirname "$ADSB_MOTD")" 2>/dev/null || return 0
     tmp=$(mktemp) || return 0
-    # The ID means nothing until a site is being fed, and the banner is read by
-    # people who are not looking for it. Indented to the template's own column.
-    if [ -n "$(adsb_enabled_feeds)" ]; then
+    # No site has the ID until one is being fed, and the banner is read by
+    # people not looking for it. Custom counts: adsb_render sends --uuid for
+    # that too. Indented to the template's own column.
+    if [ -n "$(adsb_enabled_feeds)" ] || [ -n "$(conf_get ADSB.Feed.Custom '')" ]; then
         idline=$(printf '\n               Receiver ID:             %s' "$(adsb_uuid_describe)")
     fi
     # shellcheck disable=SC2059
@@ -1438,10 +1438,10 @@ adsb_apply() {
 # has to happen here or not at all.
 # --------------------------------------------------------------------------
 FIRST_REBOOT_DIR="${OGN_FIRST_REBOOT_DIR:-/var/lib/ogn-bootstrap}"
-# The three below are read by ogn-install and ogn-maintenance, which source
-# this file. shellcheck sees one file at a time, so to it they look unused.
-# Not exported on purpose: these belong to the scripts that source this, not
-# to every process they go on to start.
+# The three below are used by ogn-install and ogn-maintenance, which source
+# this file; shellcheck sees one file at a time, so to it they look unused.
+# Not exported on purpose: they belong to those scripts, not to every process
+# those go on to start.
 # shellcheck disable=SC2034
 FIRST_REBOOT_PENDING="$FIRST_REBOOT_DIR/first-reboot.pending"
 # shellcheck disable=SC2034
@@ -4332,7 +4332,7 @@ cat > /usr/local/sbin/ogn-adsb <<'OGN_PAYLOAD_ogn_adsb'
 #
 #   sudo ogn-adsb              apply ADSB from the card
 #   sudo ogn-adsb status       is readsb running, and is it hearing aircraft
-#   ogn-adsb id                the ID the tracking sites know this receiver by
+#   sudo ogn-adsb id           the ID the tracking sites know this receiver by
 #   sudo ogn-adsb down         switch it off until the next boot
 #   sudo ogn-adsb --config X   use a different config file
 #
@@ -4362,23 +4362,22 @@ while [ $# -gt 0 ]; do
     shift
 done
 
-# id only reads, and everything it reads — the card, the hardware serial,
-# machine-id — is readable by anyone who can log in. Being able to look the ID
-# up without sudo is the point of having the subcommand at all.
-[ "$ACTION" = id ] || need_root
+# Including id, which only reads: ogn-install mounts the card umask=0077 to
+# keep the wifi password and any WireGuard key on it root-only, so nothing on
+# it is readable without sudo. The banner shows the ID to everyone else.
+need_root
 
 # --------------------------------------------------------------------------
 # id
 #
-# The ID the tracking sites know this receiver by, which is what their "my
-# receiver" pages ask for. Without this it is visible only as the --uuid flag
-# in /etc/default/readsb, which is a generated file nobody should have to read.
+# Without this the ID is visible only as the --uuid flag in
+# /etc/default/readsb, a generated file nobody should have to read.
 # --------------------------------------------------------------------------
 if [ "$ACTION" = id ]; then
     conf_load "$BOOT_CONF"
     trap conf_cleanup EXIT
-    # The ID on stdout and anything else on stderr, so that what comes out can
-    # be pasted into a site's form without a banner to pick it out of.
+    # The ID on stdout, everything else on stderr: what comes out is going to
+    # be pasted into a site's form.
     conf_bool ADSB.Enable false \
         || printf 'ADS-B is switched off in %s, so no site has been given this ID yet.\n' "$BOOT_CONF" >&2
     ID=$(adsb_uuid)
@@ -4386,7 +4385,9 @@ if [ "$ACTION" = id ]; then
         printf '%s\n' "$(adsb_uuid_describe)" >&2
         exit 1
     fi
-    printf '%s\n' "$(adsb_uuid_describe)"
+    printf '%s\n' "$ID"
+    [ -z "$(conf_get ADSB.Feed.UUID '')" ] \
+        || printf 'This is ADSB.Feed.UUID from %s, not an ID derived from this Pi.\n' "$BOOT_CONF" >&2
     exit 0
 fi
 
