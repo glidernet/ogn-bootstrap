@@ -1023,8 +1023,8 @@ ADSB_JSON_DIR=/run/readsb
 # mistyped into a receiver nobody can get back to, and so that what a given
 # setting sends, and to whom, can be read in one place.
 #
-# All four take Beast on 30004 and multilateration on 31090.
-ADSB_FEEDS="ADSBExchange ADSBFi ADSBLol AirplanesLive"
+# All five take Beast on 30004 and multilateration on 31090.
+ADSB_FEEDS="ADSBExchange ADSBFi ADSBLol AirplanesLive PlaneTrack"
 ADSB_FEED_PORT=30004
 ADSB_MLAT_PORT=31090
 
@@ -1034,6 +1034,7 @@ adsb_feed_host() {
         ADSBFi)        printf 'feed.adsb.fi' ;;
         ADSBLol)       printf 'feed.adsb.lol' ;;
         AirplanesLive) printf 'feed.airplanes.live' ;;
+        PlaneTrack)    printf 'feed.planetrack.ai' ;;
         *)             return 1 ;;
     esac
 }
@@ -1088,6 +1089,26 @@ adsb_uuid() {
     # Shaped as a version 4 UUID, which is what the sites' own scripts make.
     v=$(printf '%s' "89ab" | cut -c$(( 0x${h:16:1} % 4 + 1 )))
     printf '%s-%s-4%s-%s%s-%s' "${h:0:8}" "${h:8:4}" "${h:13:3}" "$v" "${h:17:3}" "${h:20:12}"
+}
+
+# adsb_uuid_describe — the receiver ID as something to read, saying where it
+# came from when that is not the usual answer. One wording for `ogn-adsb
+# status`, the login banner, and what `ogn-adsb id` says when there is no
+# usable ID, so the three cannot drift apart.
+#
+# Needs conf_load first, and prints no newline: the callers lay it out.
+adsb_uuid_describe() {
+    local uuid
+    uuid=$(adsb_uuid)
+    if [ -z "$uuid" ]; then
+        printf 'none — this receiver feeds anonymously'
+    elif ! adsb_uuid_ok "$uuid"; then
+        printf '%s — not a UUID; ADSB.Feed.UUID needs fixing' "$uuid"
+    elif [ -n "$(conf_get ADSB.Feed.UUID "")" ]; then
+        printf '%s (set on the card)' "$uuid"
+    else
+        printf '%s' "$uuid"
+    fi
 }
 
 # adsb_render — print /etc/default/readsb from the loaded card settings.
@@ -1287,18 +1308,24 @@ adsb_feed_summary() {
 }
 
 ADSB_MOTD_TEMPLATE='
-  ADS-B:       readsb on stick %s, feeding %s
+  ADS-B:       readsb on stick %s, feeding %s%s
                Is it hearing anything?  sudo ogn-adsb status
                Statistics:              http://<this-pi>:%s/
 
 '
 adsb_motd_update() {
-    local tmp
+    local tmp idline=""
     mkdir -p "$(dirname "$ADSB_MOTD")" 2>/dev/null || return 0
     tmp=$(mktemp) || return 0
+    # No site has the ID until one is being fed, and the banner is read by
+    # people not looking for it. Custom counts: adsb_render sends --uuid for
+    # that too. Indented to the template's own column.
+    if [ -n "$(adsb_enabled_feeds)" ] || [ -n "$(conf_get ADSB.Feed.Custom '')" ]; then
+        idline=$(printf '\n               Receiver ID:             %s' "$(adsb_uuid_describe)")
+    fi
     # shellcheck disable=SC2059
     printf "$ADSB_MOTD_TEMPLATE" \
-        "$(conf_get ADSB.DeviceSerial '?')" "$(adsb_feed_summary)" "$ADSB_WEB_PORT" > "$tmp"
+        "$(conf_get ADSB.DeviceSerial '?')" "$(adsb_feed_summary)" "$idline" "$ADSB_WEB_PORT" > "$tmp"
     cmp -s "$tmp" "$ADSB_MOTD" || install -m 0644 "$tmp" "$ADSB_MOTD" 2>/dev/null || true
     rm -f "$tmp"
     return 0
@@ -1373,10 +1400,17 @@ adsb_apply() {
 # has to happen here or not at all.
 # --------------------------------------------------------------------------
 FIRST_REBOOT_DIR="${OGN_FIRST_REBOOT_DIR:-/var/lib/ogn-bootstrap}"
+# The three below are used by ogn-install and ogn-maintenance, which source
+# this file; shellcheck sees one file at a time, so to it they look unused.
+# Not exported on purpose: they belong to those scripts, not to every process
+# those go on to start.
+# shellcheck disable=SC2034
 FIRST_REBOOT_PENDING="$FIRST_REBOOT_DIR/first-reboot.pending"
+# shellcheck disable=SC2034
 FIRST_REBOOT_MOTD="${OGN_FIRST_REBOOT_MOTD:-/etc/motd.d/15-ogn-first-reboot}"
 # A personal auth key expires six hours after it is made. Past that there is
 # nothing left to wait for.
+# shellcheck disable=SC2034
 FIRST_REBOOT_LIMIT="${OGN_FIRST_REBOOT_LIMIT:-21600}"
 HOME_ROOT="${OGN_HOME_ROOT:-/home}"
 

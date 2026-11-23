@@ -10,9 +10,9 @@ around your airfield and shares them on
 [live.glidernet.org](https://live.glidernet.org).
 
 If you add a second SDR stick, it also simplifies sending ADS-B to tracking
-services such as ADS-B Exchange, adsb.fi, adsb.lol and airplanes.live. Each
-one is a single setting, and you can turn on as many as you like (see
-[ADS-B](#ads-b)).
+services such as ADS-B Exchange, adsb.fi, adsb.lol, airplanes.live and
+PlaneTrack. Each one is a single setting, and you can turn on as many as you
+like (see [ADS-B](#ads-b)).
 
 You choose **OGN Receiver** in Raspberry Pi Imager, type in where your aerial
 is, and put the card in the Pi. All the setup happens in Imager and in one
@@ -592,6 +592,7 @@ to share it with other websites as well, switch them on here:
     ADSBFi        = false;
     ADSBLol       = false;
     AirplanesLive = false;
+    PlaneTrack    = false;
 
     MLAT          = false;
 
@@ -600,9 +601,8 @@ to share it with other websites as well, switch them on here:
 ```
 
 Each site you switch on will receive every aircraft your receiver picks up, for
-as long as it's switched on. None of them need an account or a sharing key,
-and none of them can connect back in to your receiver. You can choose each
-site separately.
+as long as it's switched on. None of them can connect back in to your
+receiver. You can choose each site separately.
 
 - **`MLAT`** (multilateration) lets the sites work out the position of
   aircraft that don't broadcast their own, by comparing when the same signal
@@ -619,6 +619,23 @@ from the Pi's serial number, so it stays the same even if you rewrite the card,
 and the site keeps your history. Only a scrambled (hashed) version of the
 serial number leaves the Pi. If a site already knows your receiver by a
 different ID, you can set `UUID` in the `Feed` section to use that one instead.
+
+The sites' own pages ask for that ID when you want to claim your receiver, so
+you'll need to be able to read it:
+
+```sh
+sudo ogn-adsb id       # just the ID, with nothing around it
+sudo ogn-adsb status   # the ID, along with everything else about the feed
+```
+
+It's in the message you see when you log in too, once at least one site is
+switched on.
+
+A new Pi means a new ID, though, since nothing is stored: the sites will treat
+it as a new receiver unless you put the old ID in `UUID` on the card.
+
+PlaneTrack is a commercial tracking site. Claim your receiver at
+`https://planetrack.ai/myip?uuid=<ID>`
 
 ### FlightAware, Flightradar24 and Plane Finder
 

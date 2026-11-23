@@ -1,0 +1,43 @@
+name: tests
+
+# Runs tests/run-tests: the offline suite, which needs no Pi, no SDR and no
+# network.
+#
+# Everything it needs -- bash, shellcheck, python3, curl -- is already on
+# GitHub's Ubuntu runners, so this installs nothing and downloads nothing. The
+# one script here that downloads anything, tools/build-image.sh, refuses to
+# start as a non-root user, which is what the runner is.
+#
+# No token: it reads the checkout and reports a pass or a fail.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # Without shellcheck the suite skips its own shellcheck gate and still
+      # passes: right on a workstation, wrong here, where a green run that
+      # checked less than it claims is worse than a red one. Which shellcheck
+      # you have decides which warnings you see, so print it.
+      - name: Check the tools the suite expects are present
+        run: |
+          set -euo pipefail
+          for t in shellcheck python3 curl; do
+              command -v "$t" >/dev/null || { printf 'missing: %s\n' "$t" >&2; exit 1; }
+          done
+          shellcheck --version
+
+      - name: Run the suite
+        run: bash tests/run-tests

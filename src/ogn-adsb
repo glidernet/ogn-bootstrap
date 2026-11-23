@@ -5,6 +5,7 @@
 #
 #   sudo ogn-adsb              apply ADSB from the card
 #   sudo ogn-adsb status       is readsb running, and is it hearing aircraft
+#   sudo ogn-adsb id           the ID the tracking sites know this receiver by
 #   sudo ogn-adsb down         switch it off until the next boot
 #   sudo ogn-adsb --config X   use a different config file
 #
@@ -26,14 +27,42 @@ while [ $# -gt 0 ]; do
         apply|--apply)   ACTION=apply ;;
         down|--down)     ACTION=down ;;
         status|--status) ACTION=status ;;
+        id|--id)         ACTION=id ;;
         --config)        BOOT_CONF="$2"; shift ;;
-        -h|--help)       sed -n '3,15p' "$0"; exit 0 ;;
+        -h|--help)       sed -n '3,16p' "$0"; exit 0 ;;
         *)               die "unknown argument: $1  (try: ogn-adsb status)" ;;
     esac
     shift
 done
 
+# Including id, which only reads: ogn-install mounts the card umask=0077 to
+# keep the wifi password and any WireGuard key on it root-only, so nothing on
+# it is readable without sudo. The banner shows the ID to everyone else.
 need_root
+
+# --------------------------------------------------------------------------
+# id
+#
+# Without this the ID is visible only as the --uuid flag in
+# /etc/default/readsb, a generated file nobody should have to read.
+# --------------------------------------------------------------------------
+if [ "$ACTION" = id ]; then
+    conf_load "$BOOT_CONF"
+    trap conf_cleanup EXIT
+    # The ID on stdout, everything else on stderr: what comes out is going to
+    # be pasted into a site's form.
+    conf_bool ADSB.Enable false \
+        || printf 'ADS-B is switched off in %s, so no site has been given this ID yet.\n' "$BOOT_CONF" >&2
+    ID=$(adsb_uuid)
+    if [ -z "$ID" ] || ! adsb_uuid_ok "$ID"; then
+        printf '%s\n' "$(adsb_uuid_describe)" >&2
+        exit 1
+    fi
+    printf '%s\n' "$ID"
+    [ -z "$(conf_get ADSB.Feed.UUID '')" ] \
+        || printf 'This is ADSB.Feed.UUID from %s, not an ID derived from this Pi.\n' "$BOOT_CONF" >&2
+    exit 0
+fi
 
 # --------------------------------------------------------------------------
 # status
@@ -66,6 +95,7 @@ if [ "$ACTION" = status ]; then
     printf 'configured:  stick %s, gain %s\n' \
         "$(conf_get ADSB.DeviceSerial '<unset>')" "$(conf_get ADSB.Gain -10)"
     printf 'sharing:     %s\n' "$(adsb_feed_summary)"
+    printf 'receiver id: %s\n' "$(adsb_uuid_describe)"
 
     if ! systemctl is-active --quiet readsb 2>/dev/null; then
         printf 'readsb:      STOPPED\n\n'

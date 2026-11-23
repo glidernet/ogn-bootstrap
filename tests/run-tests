@@ -902,10 +902,12 @@ do
     esac
 done
 # A site that was not ticked must not appear. This is the assertion that says
-# "off" means "no connection", not "a connection nobody looked at".
+# "off" means "no connection", not "a connection nobody looked at". Every
+# site the fixture leaves off is named here, so adding one to the table
+# without checking that it stays off is a visible omission.
 case "$AD" in
-    *adsbexchange*) bad "a site left off is not fed" "$AD" ;;
-    *)              ok  "a site left off is not fed" ;;
+    *adsbexchange*|*adsb.lol*|*planetrack*) bad "a site left off is not fed" "$AD" ;;
+    *)                                      ok  "a site left off is not fed" ;;
 esac
 # readsb rewrites its JSON every second. Into /run, which is RAM, that is free;
 # anywhere else it is the card the overlay exists to protect.
@@ -941,6 +943,27 @@ case "$ADN" in
     *)                 bad "with no identity at all it feeds anonymously" "$ADN" ;;
 esac
 
+is "the receiver ID reads as just the ID" "$(adsb_uuid_describe)" "$ADU1"
+ADUN=$(ADSB_ID_SOURCES="$ADID/missing"; adsb_uuid_describe)
+case "$ADUN" in
+    none*) ok  "with no identity it says so rather than printing nothing" ;;
+    *)     bad "with no identity it says so rather than printing nothing" "$ADUN" ;;
+esac
+# Which of the two it is matters: one follows the hardware, the other is the
+# operator's own, and only one of them can be changed.
+sed 's|Custom        = ""|Custom = ""; UUID = "01234567-89ab-cdef-0123-456789abcdef"|' tests/fixtures/adsb.conf > "$ADID/card.conf"
+conf_load "$ADID/card.conf"
+is "an ID set on the card says where it came from" \
+   "$(adsb_uuid_describe)" "01234567-89ab-cdef-0123-456789abcdef (set on the card)"
+sed 's|Custom        = ""|Custom = ""; UUID = "not-a-uuid"|' tests/fixtures/adsb.conf > "$ADID/bad.conf"
+conf_load "$ADID/bad.conf"
+ADUB=$(adsb_uuid_describe)
+case "$ADUB" in
+    *"not a UUID"*) ok  "and a mistyped one is called out, not shown as fact" ;;
+    *)              bad "and a mistyped one is called out, not shown as fact" "$ADUB" ;;
+esac
+conf_load tests/fixtures/adsb.conf
+
 # One multilateration environment per site that is on, and none for the rest.
 ML=$(adsb_mlat_render ADSBFi 2>/dev/null) || bad "an mlat environment renders"
 case "$ML" in
@@ -952,6 +975,20 @@ case "$ML" in
     *) bad "mlat results come back to readsb" "$ML" ;;
 esac
 is "mlat instance names are lowercase" "$(adsb_feed_instance ADSBFi)" "adsbfi"
+
+# Every name in the table must resolve to a host. adsb_render skips a site
+# adsb_feed_host cannot resolve, so one added to ADSB_FEEDS without a case arm
+# would be switched on, summarised as shared, and fed nowhere, with nothing
+# said about it.
+FEEDTABLE=ok
+for f in $ADSB_FEEDS; do
+    fh=$(adsb_feed_host "$f") || fh=""
+    case "$fh" in
+        *.*) ;;
+        *)   FEEDTABLE="$f resolves to [$fh]"; break ;;
+    esac
+done
+is "every site in the table has a host" "$FEEDTABLE" ok
 
 # Required fields, one at a time.
 ADT=$(mktemp -d)
@@ -1016,6 +1053,20 @@ case "$ADC" in
     *"feed.example.org,30004,beast_reduce_plus_out"*) ok  "a well-formed Custom target is fed" ;;
     *)                                                bad "a well-formed Custom target is fed" "$ADC" ;;
 esac
+# That PlaneTrack ships switched off is checked with the other off sites above.
+sed 's/PlaneTrack    = false/PlaneTrack = true/' tests/fixtures/adsb.conf > "$ADT/c.conf"
+conf_load "$ADT/c.conf"
+ADP=$(adsb_render 2>/dev/null)
+case "$ADP" in
+    *"--net-connector feed.planetrack.ai,30004,beast_reduce_plus_out"*) ok  "PlaneTrack is fed once switched on" ;;
+    *)                                                                  bad "PlaneTrack is fed once switched on" "$ADP" ;;
+esac
+ML=$(adsb_mlat_render PlaneTrack 2>/dev/null)
+case "$ML" in
+    *"MLAT_SERVER=feed.planetrack.ai:31090"*) ok  "and its mlat goes to feed.planetrack.ai:31090" ;;
+    *)                                        bad "and its mlat goes to feed.planetrack.ai:31090" "$ML" ;;
+esac
+is "and its mlat client is ogn-mlat@planetrack" "$(adsb_feed_instance PlaneTrack)" "planetrack"
 rm -rf "$ADT" "$ADID"
 
 # The whole apply path, against stubs. systemctl is what must not be called
@@ -1051,10 +1102,18 @@ chmod +x "$STUB/readsb" "$STUB/systemctl"
 OLD_PATH="$PATH"; PATH="$STUB:$PATH"
 OLD_DEFAULT="$ADSB_DEFAULT"; OLD_MLAT="$ADSB_MLAT_DIR"; OLD_AMOTD="$ADSB_MOTD"
 ADSB_DEFAULT="$STUB/default-readsb"; ADSB_MLAT_DIR="$STUB/mlat"; ADSB_MOTD="$STUB/motd"
+# The identity source went with $ADID; pin it again, so the banner below has a
+# known ID in it rather than whatever the machine running the tests reports.
+printf '100000001234abcd\0' > "$STUB/serial-number"
+ADSB_ID_SOURCES="$STUB/serial-number"
 
 conf_load tests/fixtures/adsb.conf
 adsb_apply >/dev/null 2>&1 && ok "applies cleanly" || bad "applies cleanly"
 [ -f "$ADSB_DEFAULT" ] && ok "writes the readsb defaults" || bad "writes the readsb defaults"
+# The banner is how someone who never went looking for the ID sees it.
+grep -q "Receiver ID:             $(adsb_uuid)" "$ADSB_MOTD" \
+    && ok "the login banner carries the receiver ID" \
+    || bad "the login banner carries the receiver ID" "$(cat "$ADSB_MOTD" 2>/dev/null)"
 grep -q 'systemctl restart readsb' "$ADSB_LOG" && ok "starts readsb" || bad "starts readsb"
 # Enabled, readsb starts at boot before the card is read, and an enable made
 # while the root is writable outlives the overlay. ogn-adsb.service starts it.
@@ -1109,6 +1168,28 @@ grep -q 'restart readsb' "$ADSB_LOG" \
     && ok "adding a site restarts the decoder" || bad "adding a site restarts the decoder"
 [ -f "$ADSB_MLAT_DIR/adsblol.env" ] \
     && ok "and brings its mlat client with it" || bad "and brings its mlat client with it"
+
+# Nobody is sent the ID until a site is switched on, so until then the banner
+# leaves it out rather than showing a number that means nothing yet.
+sed 's/ADSBFi        = true/ADSBFi = false/; s/AirplanesLive = true/AirplanesLive = false/; s/MLAT          = true/MLAT = false/' \
+    tests/fixtures/adsb.conf > "$STUB/c.conf"
+conf_load "$STUB/c.conf"
+adsb_apply >/dev/null 2>&1 && ok "a receiver sharing with nobody applies cleanly" \
+                           || bad "a receiver sharing with nobody applies cleanly"
+grep -q 'Receiver ID' "$ADSB_MOTD" \
+    && bad "and its banner leaves the receiver ID out" "$(cat "$ADSB_MOTD" 2>/dev/null)" \
+    || ok  "and its banner leaves the receiver ID out"
+
+# A custom Beast target is somebody being fed as well: adsb_render sends
+# --uuid for one, so the banner has to show the ID that went out with it.
+sed 's/ADSBFi        = true/ADSBFi = false/; s/AirplanesLive = true/AirplanesLive = false/; s/MLAT          = true/MLAT = false/; s|Custom        = ""|Custom = "feed.example.org:30004"|' \
+    tests/fixtures/adsb.conf > "$STUB/c.conf"
+conf_load "$STUB/c.conf"
+adsb_apply >/dev/null 2>&1 && ok "a receiver feeding only a custom target applies cleanly" \
+                           || bad "a receiver feeding only a custom target applies cleanly"
+grep -q 'Receiver ID' "$ADSB_MOTD" \
+    && ok  "and its banner shows the receiver ID" \
+    || bad "and its banner shows the receiver ID" "$(cat "$ADSB_MOTD" 2>/dev/null)"
 
 # Switched off on the card: stopped, and the rendering removed with it.
 sed 's/Enable       = true/Enable = false/' tests/fixtures/adsb.conf > "$STUB/c.conf"
@@ -1178,6 +1259,63 @@ grep -q 'src/adsb-stats.py' tools/build-image.sh && ok "and so does the image bu
 grep -q 'ogn-adsb.timer' src/ogn-adsb \
     && ok "the repair timer follows the card, not the installer" \
     || bad "the repair timer follows the card, not the installer"
+
+# `ogn-adsb id` needs sudo like the rest: the card is mounted umask=0077, so
+# nothing on it is readable without root.
+AID=$(mktemp -d)
+printf '100000001234abcd\0' > "$AID/serial-number"
+grep -qE '^need_root$' src/ogn-adsb \
+    && ok "ogn-adsb needs root for every subcommand" \
+    || bad "ogn-adsb needs root for every subcommand"
+if [ "$(id -u)" -ne 0 ]; then
+    OGN_ADSB_ID_SOURCES="$AID/serial-number" bash src/ogn-adsb id --config tests/fixtures/adsb.conf \
+        > "$AID/out" 2> "$AID/err" \
+        && bad "and id says so rather than dying on an unreadable card" "$(cat "$AID/out" "$AID/err")" \
+        || ok  "and id says so rather than dying on an unreadable card"
+    grep -q 'must run as root' "$AID/err" \
+        && ok "with the message that names sudo" \
+        || bad "with the message that names sudo" "$(cat "$AID/err")"
+else
+    printf '  skip id without root (this suite is running as root)\n'
+fi
+
+# Root, stood in for, so that what the subcommand prints can be checked.
+cat > "$AID/id" <<'STUBEOF'
+#!/bin/sh
+[ "$1" = -u ] && { echo 0; exit 0; }
+exec /usr/bin/id "$@"
+STUBEOF
+chmod +x "$AID/id"
+AIDPATH="$PATH"; PATH="$AID:$PATH"
+AIDOUT=$(OGN_ADSB_ID_SOURCES="$AID/serial-number" bash src/ogn-adsb id --config tests/fixtures/adsb.conf 2>/dev/null) \
+    && ok "as root it prints the ID" || bad "as root it prints the ID" "$AIDOUT"
+adsb_uuid_ok "$AIDOUT" \
+    && ok "with nothing around it to pick it out of" \
+    || bad "with nothing around it to pick it out of" "$AIDOUT"
+# Moving to a new Pi is the case the README spells out, so this is the ID most
+# likely to be pasted somewhere: where it came from belongs on stderr.
+sed 's|Custom        = ""|Custom = ""; UUID = "01234567-89ab-cdef-0123-456789abcdef"|' \
+    tests/fixtures/adsb.conf > "$AID/card.conf"
+AIDOUT=$(bash src/ogn-adsb id --config "$AID/card.conf" 2> "$AID/err")
+is "an ID set on the card comes out on its own too" \
+   "$AIDOUT" "01234567-89ab-cdef-0123-456789abcdef"
+grep -q 'ADSB.Feed.UUID' "$AID/err" \
+    && ok "with where it came from on stderr" \
+    || bad "with where it came from on stderr" "$(cat "$AID/err")"
+# An empty line that looks like an answer is worse than a failure: it gets
+# pasted into a site's form.
+OGN_ADSB_ID_SOURCES="$AID/missing" bash src/ogn-adsb id --config tests/fixtures/adsb.conf \
+    > "$AID/out" 2> "$AID/err" \
+    && bad "with no identity to work from it fails" "$(cat "$AID/out" "$AID/err")" \
+    || ok  "with no identity to work from it fails"
+[ -s "$AID/out" ] && bad "saying so on stderr, leaving stdout empty" "$(cat "$AID/out")" \
+                  || ok  "saying so on stderr, leaving stdout empty"
+PATH="$AIDPATH"
+bash src/ogn-adsb --help | grep -q 'ogn-adsb id' \
+    && ok "and --help says it is there" || bad "and --help says it is there" "$(bash src/ogn-adsb --help)"
+grep -q 'receiver id:' src/ogn-adsb \
+    && ok "ogn-adsb status shows the ID as well" || bad "ogn-adsb status shows the ID as well"
+rm -rf "$AID"
 grep -q 'ogn-adsb' src/ogn-maintenance \
     && ok "a live edit is picked up by the config resync" \
     || bad "a live edit is picked up by the config resync"
@@ -1677,6 +1815,30 @@ build = text.split("  build:", 1)[1].split("\n  publish:", 1)[0]
 assert re.search(r"^\s+permissions:\s*\{\}\s*$", build, re.M), "build job is missing 'permissions: {}'"
 assert "contents: write" not in build, "build job grants contents: write"
 PY
+
+# This suite is only a gate if something runs it on every change. Nothing did
+# until .github/workflows/tests.yml, and a shellcheck warning sat in
+# src/ogn-common.sh unnoticed as a result.
+WT=.github/workflows/tests.yml
+if [ -r "$WT" ]; then
+    grep -q 'tests/run-tests' "$WT" \
+        && ok "CI runs this suite" || bad "CI runs this suite"
+    # Without shellcheck the suite skips its own shellcheck gate and still
+    # passes, which in CI would be a green run that checked less than it says.
+    grep -q 'shellcheck' "$WT" \
+        && ok "and will not pass without shellcheck installed" \
+        || bad "and will not pass without shellcheck installed"
+    # It reads the checkout and reports a result. Nothing it does needs a
+    # token. code_of, because the comments in there discuss permissions.
+    code_of "$WT" | grep -q 'permissions: {}' \
+        && ok "and asks for no permissions" \
+        || bad "and asks for no permissions"
+    code_of "$WT" | grep -q 'write' \
+        && bad "nor holds anything it could write with" "$(code_of "$WT" | grep -n 'write')" \
+        || ok  "nor holds anything it could write with"
+else
+    bad "CI runs this suite" "there is no $WT"
+fi
 
 echo
 printf '%s passed, %s failed\n' "$PASS" "$FAIL"
