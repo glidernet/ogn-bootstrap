@@ -20,6 +20,10 @@ is()   { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "expected [$3], got [$2
 # comments on purpose, explaining what is deliberately no longer used, so a
 # plain grep would match the explanation and report the bug it warns about.
 code_of() { sed 's/[[:space:]]#.*$//; /^[[:space:]]*#/d' "$@"; }
+# file_mode <file> — its permission bits, e.g. 644. GNU stat first: on Linux
+# 'stat -f' is a real option (filesystem status), so trying the BSD form
+# first prints filesystem details instead of failing.
+file_mode() { stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"; }
 
 export OGN_LIBDIR="$PWD/src"
 # shellcheck source=src/ogn-common.sh
@@ -244,7 +248,7 @@ cmdline_write "$OVERLAY_PARAM" 1 >/dev/null 2>&1
 is "enabling publishes a readable copy"  "$(cat "$OVERLAY_STATE" 2>/dev/null)" "enabled"
 cmdline_write "$OVERLAY_PARAM" 0 >/dev/null 2>&1
 is "disabling publishes it too"          "$(cat "$OVERLAY_STATE" 2>/dev/null)" "disabled"
-MODE=$(stat -f '%Lp' "$OVERLAY_STATE" 2>/dev/null || stat -c '%a' "$OVERLAY_STATE")
+MODE=$(file_mode "$OVERLAY_STATE")
 is "and anyone can read it"              "$MODE" "644"
 
 # With cmdline.txt readable it stays authoritative; without it, the published
@@ -726,7 +730,7 @@ export WG_PEER="$(conf_get Network.WireGuard.Peer.PublicKey)"
 wireguard_apply >/dev/null 2>&1 && ok "applies cleanly" || bad "applies cleanly"
 grep -q 'wg-quick up' "$WG_LOG" && ok "brings the tunnel up" || bad "brings the tunnel up"
 [ -s "$WG_CONF" ] && ok "writes the wg-quick config" || bad "writes the wg-quick config"
-MODE=$(stat -f '%Lp' "$WG_CONF" 2>/dev/null || stat -c '%a' "$WG_CONF")
+MODE=$(file_mode "$WG_CONF")
 is "and it is readable only by root" "$MODE" "600"
 [ -s "$WG_MOTD" ] && ok "says so in the login banner" || bad "says so in the login banner"
 
