@@ -1591,6 +1591,7 @@ case "$*" in
     "is-enabled --quiet rtlsdr-ogn.service") exit 0 ;;
     *"ActiveState --value ogn-rf.service"*)  printf '%s\n' "${RF_STATE:-active}" ;;
     *"NRestarts --value ogn-rf.service"*)    printf '%s\n' "${RF_RESTARTS:-0}" ;;
+    *"ActiveEnterTimestampMonotonic --value ogn-rf.service"*) printf '%s\n' "${RF_SINCE:-0}" ;;
     *"ActiveState --value ogn-decode"*)      printf 'inactive\n' ;;
     *"--value"*)                             printf '0\n' ;;
     *) exit 1 ;;
@@ -1599,10 +1600,18 @@ STUBEOF
 printf '#!/bin/sh\necho yes\n' > "$CK/bin/timedatectl"
 chmod +x "$CK/bin/systemctl" "$CK/bin/timedatectl"
 conf_load boot/MyReceiver.conf
-export RF_STATE=active RF_RESTARTS=11
+# Uptime is faked too: how long ogn-rf has stayed up is worked out from it,
+# and the real one is whatever the machine running the tests happens to have.
+SAVED_PROC_DIR="$PROC_DIR"; PROC_DIR="$CK/proc"; mkdir -p "$PROC_DIR"
+printf '500.00 1000.00\n' > "$PROC_DIR/uptime"
+export RF_STATE=active RF_RESTARTS=11 RF_SINCE=450000000
 OUT=$(check_running)
 has "ogn-rf restarting over and over is found" "$OUT" "ogn-rf keeps stopping: restarted 11 times"
 hasnt "and ogn-decode, which needs it, is not blamed" "$OUT" "ogn-decode"
+export RF_SINCE=100000000
+has "ogn-rf that restarted but has stayed up since is only worth checking" \
+    "$(check_running)" "? ogn-rf has restarted 11 times since boot, but is running now."
+PROC_DIR="$SAVED_PROC_DIR"; unset RF_SINCE
 export RF_RESTARTS=0
 has "a healthy ogn-rf moves on to ogn-decode" "$(check_running)" "ogn-decode is not running"
 printf '#!/bin/sh\necho no\n' > "$CK/bin/timedatectl"

@@ -1752,7 +1752,7 @@ check_running() {
         printf -- '- The receiver waits until it has. Check the network connection.\n'
     fi
 
-    up=$(cut -d. -f1 /proc/uptime 2>/dev/null || printf 0)
+    up=$(cut -d. -f1 "$PROC_DIR/uptime" 2>/dev/null || printf 0)
     for u in ogn-rf ogn-decode; do
         # ogn-decode can only run on what ogn-rf gives it, so with ogn-rf down
         # it fails too, and saying so points at the wrong one.
